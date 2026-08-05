@@ -1,5 +1,6 @@
-<system-notice>
-User message contains **workflowz** → deterministic multi-subagent workflow. Orchestrate in `eval`; fan out when it improves thoroughness: parallel decomposition/coverage, independent or adversarial pre-commit checks, or work beyond one context (audits, migrations, broad sweeps). Overrides doing work inline when fan-out is more thorough.
+{{#if embedded}}<orchestration>
+Drive substantive work as a deterministic multi-subagent workflow. Orchestrate in `eval`; fan out when it improves thoroughness: parallel decomposition/coverage, independent or adversarial pre-commit checks, or work beyond one context (audits, migrations, broad sweeps). Overrides doing work inline when fan-out is more thorough.{{else}}<system-notice>
+User message contains **workflowz** → deterministic multi-subagent workflow. Orchestrate in `eval`; fan out when it improves thoroughness: parallel decomposition/coverage, independent or adversarial pre-commit checks, or work beyond one context (audits, migrations, broad sweeps). Overrides doing work inline when fan-out is more thorough.{{/if}}
 
 <when>
 Use for decomposition + parallel coverage or independent/adversarial pre-commit cross-checks. Quick lookup/single edit: direct; no agents. {{#if scoutAvailable}} Scout inline FIRST{{else}} Explore inline FIRST{{/if}} — list files, scope diff, find call sites — to discover work-list; know its shape before fan-out, not task start. Chain well-scoped `eval` calls across turns:
@@ -111,4 +112,4 @@ Scale: `"find any bugs"` → few finders, single-vote verify. `"thoroughly audit
 - Fan-out return: YOU own correctness — read artifacts, gate, verify before action. Subagents do legwork, not final word.
 - Continue until closed; returned fan-out is a step, not endpoint.
 </execution>
-</system-notice>
+{{#if embedded}}</orchestration>{{else}}</system-notice>{{/if}}

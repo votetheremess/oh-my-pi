@@ -22,15 +22,30 @@ const WORKFLOW_WORD = magicKeywordRegex("workflowz");
 /** WORKFLOW_NOTICE is the default hidden notice for sessions with batched task calls enabled. */
 export const WORKFLOW_NOTICE: string = renderWorkflowNotice({ taskBatch: true });
 
-/** renderWorkflowNotice renders the workflow notice for the active task schema. */
+/**
+ * renderWorkflowNotice renders the workflow notice for the active task schema.
+ *
+ * `embedded` swaps the standalone `<system-notice>` wrapper and its
+ * workflowz-specific opening line for a plain `<orchestration>` section, so a
+ * host notice (ultracode) can carry the same contract without claiming the user
+ * typed a keyword they never typed, and without nesting two notice blocks.
+ */
 export function renderWorkflowNotice({
 	taskBatch,
 	scoutAvailable,
+	embedded,
 }: {
 	taskBatch: boolean;
 	scoutAvailable?: boolean;
+	embedded?: boolean;
 }): string {
-	return prompt.render(workflowNoticeTemplate, { taskBatch, scoutAvailable: scoutAvailable ?? true }).trim();
+	return prompt
+		.render(workflowNoticeTemplate, {
+			taskBatch,
+			scoutAvailable: scoutAvailable ?? true,
+			embedded: embedded ?? false,
+		})
+		.trim();
 }
 
 /**
