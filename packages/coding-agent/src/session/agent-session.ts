@@ -5650,24 +5650,18 @@ export class AgentSession {
 		const turnBudget = parseTurnBudget(text);
 		this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
 		const keywordNotices: CustomMessage[] = [];
-		// "ultracode" is a standing session opt-in, not a per-turn nudge: the keyword
-		// flips the runtime flag once and every later turn of this session keeps the
-		// notice and the pinned xhigh effort without the user repeating the word.
-		const ultracodeKeyword = this.#magicKeywordEnabled("ultracode") && containsUltracode(text);
-		if (ultracodeKeyword || this.settings.get("ultracode")) {
-			if (ultracodeKeyword) {
-				// Runtime override layer only: the opt-in lives for this session and is
-				// never written to settings.json.
-				this.settings.override("ultracode", true);
-			}
-			// Re-pin every turn, not just the one that carried the keyword: a model
-			// switch or a manual `/effort` in between must not leave the session below
-			// the effort ultracode promised.
-			this.#models.forceUltracodeEffort();
+		// "ultracode" steers only the turn that carries it, like the other three
+		// keywords. Saying it once does not arm the session; the word has to be
+		// repeated on any later message that wants the same treatment.
+		if (this.#magicKeywordEnabled("ultracode") && containsUltracode(text)) {
+			// Runtime override layer only, never written to settings.json. It is how
+			// the task executor learns this turn's spawns run at the ultracode floor.
+			this.settings.override("ultracode", true);
+			this.#models.beginUltracodeTurn();
 			// Ultracode carries the whole workflow contract, not a pointer to it: the
-			// standing instruction is useless without the helper API it orchestrates
-			// through. With `eval` or `task` inactive there is no fan-out mechanism,
-			// so the notice says so instead of prescribing tools that are not there.
+			// instruction is useless without the helper API it orchestrates through.
+			// With `eval` or `task` inactive there is no fan-out mechanism, so the
+			// notice says so instead of prescribing tools that are not there.
 			const ultracodeTools = this.getActiveToolNames();
 			keywordNotices.push({
 				role: "custom",
@@ -5681,6 +5675,13 @@ export class AgentSession {
 				attribution: "user",
 				timestamp,
 			});
+		} else {
+			// A user turn without the word ends any ultracode turn before it: hand the
+			// borrowed effort back and clear the flag. Written unconditionally rather
+			// than cleared, so a persisted `ultracode: true` cannot leak through the
+			// override layer and silently re-arm every turn.
+			this.settings.override("ultracode", false);
+			this.#models.endUltracodeTurn();
 		}
 		if (this.#magicKeywordEnabled("ultrathink") && containsUltrathink(text)) {
 			keywordNotices.push({

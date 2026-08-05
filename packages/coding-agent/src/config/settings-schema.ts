@@ -2256,23 +2256,18 @@ export const SETTINGS_SCHEMA = {
 			group: "Magic Keywords",
 			label: "Ultracode Keyword",
 			description:
-				"Let standalone ultracode turn on xhigh effort and standing workflow orchestration for the session",
+				"Let standalone ultracode run that turn at xhigh effort with multi-subagent workflow orchestration",
 		},
 	},
 
-	// Session state, not a preference: the ultracode keyword flips this through
-	// the runtime override layer (Settings.override), which never reaches disk,
-	// so the opt-in dies with the session.
+	// Turn state, not a preference, and deliberately absent from the settings UI:
+	// the ultracode keyword writes it through the runtime override layer
+	// (Settings.override), which never reaches disk, and the next user turn
+	// without the keyword writes it back to false. It exists so the task executor
+	// can see that this turn's spawns run at the ultracode floor.
 	ultracode: {
 		type: "boolean",
 		default: false,
-		ui: {
-			tab: "interaction",
-			group: "Magic Keywords",
-			label: "Ultracode",
-			description:
-				"Whether ultracode (xhigh effort plus standing workflow orchestration) is active for this session. Set at runtime by the ultracode keyword; never persisted.",
-		},
 	},
 
 	// Notifications
