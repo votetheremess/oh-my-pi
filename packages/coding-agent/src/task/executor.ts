@@ -2974,7 +2974,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// `effort`. The model is the only thing allowed to move it.
 			//
 			// `clampAutoThinkingEffort` is the same helper the session-side pin in
-			// `ModelControls.forceUltracodeEffort` uses, so a subagent and its parent
+			// `ModelControls.beginUltracodeTurn` uses, so a subagent and its parent
 			// resolve xhigh identically. It is used here INSTEAD of
 			// `resolveTaskEffortLevel(model, "hi", Effort.XHigh)`, which throws
 			// `RangeError` when a model's ladder sits entirely above the ceiling: a
