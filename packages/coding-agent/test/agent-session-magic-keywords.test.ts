@@ -242,6 +242,47 @@ describe("AgentSession magic keyword settings", () => {
 		expect(created.settings.get("ultracode")).toBe(true);
 	});
 
+	it("ships the orchestration contract in the ultracode notice when the tools are live", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{
+			content?: string;
+			customType?: string;
+		}>;
+		const notice = promptMessages.find(message => message.customType === "ultracode-notice")?.content ?? "";
+		// The keyword promises a dynamic workflow, so the API to author one has to
+		// be in the notice; naming it without carrying it is the whole defect.
+		expect(notice).toContain("agent(");
+		expect(notice).toContain("parallel(");
+		expect(notice).toContain("standing default for the session");
+	});
+
+	it("keeps ultracode on but drops the fan-out contract when eval is inactive", async () => {
+		const created = await createMagicKeywordSession(root, [mockTaskTool]);
+		session = created.session;
+		authStorage = created.authStorage;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{
+			content?: string;
+			customType?: string;
+		}>;
+		// Unlike workflowz the notice is NOT skipped: the effort pin still applies.
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual(["ultracode-notice"]);
+		const notice = promptMessages.find(message => message.customType === "ultracode-notice")?.content ?? "";
+		expect(notice).toContain("xhigh");
+		expect(notice).not.toContain("agent(");
+		expect(notice).not.toContain("parallel(");
+		expect(created.settings.get("ultracode")).toBe(true);
+	});
+
 	it("keeps appending the ultracode notice on later keyword-free turns", async () => {
 		const created = await createMagicKeywordSession(root);
 		session = created.session;

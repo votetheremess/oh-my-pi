@@ -161,7 +161,7 @@ import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionStat
 import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
 import { theme } from "../modes/theme/theme";
 import { parseTurnBudget } from "../modes/turn-budget";
-import { containsUltracode, ULTRACODE_NOTICE } from "../modes/ultracode";
+import { containsUltracode, renderUltracodeNotice } from "../modes/ultracode";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
 import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
@@ -6060,10 +6060,19 @@ export class AgentSession {
 			// switch or a manual `/effort` in between must not leave the session below
 			// the effort ultracode promised.
 			this.#models.forceUltracodeEffort();
+			// Ultracode carries the whole workflow contract, not a pointer to it: the
+			// standing instruction is useless without the helper API it orchestrates
+			// through. With `eval` or `task` inactive there is no fan-out mechanism,
+			// so the notice says so instead of prescribing tools that are not there.
+			const ultracodeTools = this.getActiveToolNames();
 			keywordNotices.push({
 				role: "custom",
 				customType: "ultracode-notice",
-				content: ULTRACODE_NOTICE,
+				content: renderUltracodeNotice({
+					taskBatch: this.settings.get("task.batch"),
+					scoutAvailable: this.#isScoutAvailable(),
+					workflowAvailable: ultracodeTools.includes("task") && ultracodeTools.includes("eval"),
+				}),
 				display: false,
 				attribution: "user",
 				timestamp,
