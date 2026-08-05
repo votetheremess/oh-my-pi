@@ -22,6 +22,28 @@ describe("highlightMagicKeywords", () => {
 		}
 	});
 
+	it("paints all four magic keywords in one pass, whatever order they appear in", () => {
+		const input = "ultracode then workflowz, orchestrate, and ultrathink";
+		const decorated = highlightMagicKeywords(input);
+		expect(decorated).not.toBe(input);
+		expect(Bun.stripANSI(decorated)).toBe(input);
+		// Each highlighter paints only its own keyword, so chaining them is
+		// order-independent: all four survive as visible text, none as a
+		// contiguous run in the decorated output.
+		for (const keyword of ["ultracode", "workflowz", "orchestrate", "ultrathink"]) {
+			expect(decorated).not.toContain(keyword);
+			expect(Bun.stripANSI(decorated)).toContain(keyword);
+		}
+	});
+
+	it("paints a standalone ultracode keyword", () => {
+		const input = "please ultracode this";
+		const decorated = highlightMagicKeywords(input);
+		expect(decorated).not.toBe(input);
+		expect(decorated).not.toContain("ultracode");
+		expect(Bun.stripANSI(decorated)).toBe(input);
+	});
+
 	it("paints punctuation-adjacent prose keywords without changing visible text", () => {
 		const input = 'first "ultrathink," then orchestrate. Finally workflowz!';
 		const decorated = highlightMagicKeywords(input);
@@ -122,5 +144,16 @@ describe("hasMagicKeyword", () => {
 	it("returns false for empty / keyword-free text", () => {
 		expect(hasMagicKeyword("")).toBe(false);
 		expect(hasMagicKeyword("plain message with no keywords")).toBe(false);
+	});
+
+	it("detects ultracode on the same prose boundaries as the other keywords", () => {
+		expect(hasMagicKeyword("ultracode this")).toBe(true);
+		expect(hasMagicKeyword('say "ultracode" now')).toBe(true);
+		expect(hasMagicKeyword("ultracoded")).toBe(false);
+		expect(hasMagicKeyword("Ultracode")).toBe(false);
+		expect(hasMagicKeyword("ultracode()")).toBe(false);
+		expect(hasMagicKeyword("foo::ultracode")).toBe(false);
+		expect(hasMagicKeyword("src/modes/ultracode.ts")).toBe(false);
+		expect(hasMagicKeyword("`ultracode`")).toBe(false);
 	});
 });
