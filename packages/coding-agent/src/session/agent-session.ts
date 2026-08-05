@@ -5153,8 +5153,6 @@ export class AgentSession {
 				role: "custom",
 				customType: "ultracode-notice",
 				content: renderUltracodeNotice({
-					taskBatch: this.settings.get("task.batch"),
-					scoutAvailable: this.#isScoutAvailable(),
 					workflowAvailable: ultracodeTools.includes("task") && ultracodeTools.includes("eval"),
 				}),
 				display: false,
