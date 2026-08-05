@@ -8,7 +8,7 @@ Settings are stored as plain YAML mappings. Every key, its type, default, and en
 - For custom model definitions in `models.yml`, see [Models](./models.md).
 - For instruction files discovered into the agent context (`AGENTS.md`, `.omp/`, etc.), see [Context files](./context-files.md).
 - For the full catalog of environment variables, see [Environment variables](./environment-variables.md).
-- For prompt words that activate specialized per-turn behavior, see [Magic keywords](./magic-keywords.md).
+- For prompt words that activate specialized per-turn behavior, plus `ultracode`, which stays on for the rest of the session, see [Magic keywords](./magic-keywords.md).
 
 ## Where settings live
 
@@ -406,6 +406,8 @@ thinkingBudgets:
 | `thinkingBudgets.max`             | number  | `32768` | Token budget for `max`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `providers.autoThinkingMaxEffort` | enum    | `xhigh` | Highest effort `defaultThinkingLevel: auto` may resolve. `xhigh` keeps the classifier one tier below the top, so only `ultrathink` reaches `max`; `max` lets the classifier bill the top tier on models that expose it. The local on-device classifier stays capped at `xhigh` either way. This governs what `auto` _resolves_: a model whose ladder offers nothing under the ceiling gets no auto level at all, and one that also sets `thinking.requiresEffort` still receives its lowest supported effort from the transport — on a `["max"]` ladder that is `max`, because the model accepts nothing else. |
 
+While [`ultracode`](./magic-keywords.md) is active it overrides this row: the session is pinned at `xhigh` (clamped to the ladder the active model exposes), the difficulty classifier is bypassed, and `ultrathink` no longer reaches `max`.
+
 ### Sampling
 
 A value of `-1` means "use the provider/model default" — `omp` does not send that parameter.
@@ -754,7 +756,7 @@ Provider credentials and custom model definitions are configured separately — 
 
 ### Other groups
 
-`omp config list` exposes many more grouped settings, including: `task.*` (subagent concurrency, isolation, model overrides), `skills.*` and `commands.*` (discovery toggles), `mcp.*`, `github.*`, `async.*`, `goal.*`, `loop.*`, `todo.*`, `magicKeywords.*`, `ttsr.*` (time-traveling stream rules), `display.*`, `startup.*`, `share.*`, `collab.*`, `stt.*`/`tts.*`, `memories.*`/`hindsight.*`/`mnemopi.*` (memory backends), and `bashInterceptor.*`. Each follows the same type/default rules shown above.
+`omp config list` exposes many more grouped settings, including: `task.*` (subagent concurrency, isolation, model overrides), `skills.*` and `commands.*` (discovery toggles), `mcp.*`, `github.*`, `async.*`, `goal.*`, `loop.*`, `todo.*`, `magicKeywords.*` (four per-keyword switches: `ultrathink`, `orchestrate`, `workflow`, `ultracode`), `ttsr.*` (time-traveling stream rules), `display.*`, `startup.*`, `share.*`, `collab.*`, `stt.*`/`tts.*`, `memories.*`/`hindsight.*`/`mnemopi.*` (memory backends), and `bashInterceptor.*`, plus the top-level session flag `ultracode` (set at runtime by the [ultracode keyword](./magic-keywords.md), never persisted by it). Each follows the same type/default rules shown above.
 
 ## Legacy migration
 

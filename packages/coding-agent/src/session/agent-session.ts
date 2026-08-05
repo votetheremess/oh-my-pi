@@ -151,6 +151,7 @@ import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionStat
 import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
 import { theme } from "../modes/theme/theme";
 import { parseTurnBudget } from "../modes/turn-budget";
+import { containsUltracode, ULTRACODE_NOTICE } from "../modes/ultracode";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
 import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
@@ -5246,7 +5247,7 @@ export class AgentSession {
 		return this.#providerBoundary.normalizeAgentMessageImages(message);
 	}
 
-	#magicKeywordEnabled(keyword: "orchestrate" | "ultrathink" | "workflow"): boolean {
+	#magicKeywordEnabled(keyword: "orchestrate" | "ultracode" | "ultrathink" | "workflow"): boolean {
 		return this.settings.get("magicKeywords.enabled") && this.settings.get(`magicKeywords.${keyword}`);
 	}
 
@@ -5255,6 +5256,29 @@ export class AgentSession {
 		const turnBudget = parseTurnBudget(text);
 		this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
 		const keywordNotices: CustomMessage[] = [];
+		// "ultracode" is a standing session opt-in, not a per-turn nudge: the keyword
+		// flips the runtime flag once and every later turn of this session keeps the
+		// notice and the pinned xhigh effort without the user repeating the word.
+		const ultracodeKeyword = this.#magicKeywordEnabled("ultracode") && containsUltracode(text);
+		if (ultracodeKeyword || this.settings.get("ultracode")) {
+			if (ultracodeKeyword) {
+				// Runtime override layer only: the opt-in lives for this session and is
+				// never written to settings.json.
+				this.settings.override("ultracode", true);
+			}
+			// Re-pin every turn, not just the one that carried the keyword: a model
+			// switch or a manual `/effort` in between must not leave the session below
+			// the effort ultracode promised.
+			this.#models.forceUltracodeEffort();
+			keywordNotices.push({
+				role: "custom",
+				customType: "ultracode-notice",
+				content: ULTRACODE_NOTICE,
+				display: false,
+				attribution: "user",
+				timestamp,
+			});
+		}
 		if (this.#magicKeywordEnabled("ultrathink") && containsUltrathink(text)) {
 			keywordNotices.push({
 				role: "custom",
@@ -5347,9 +5371,9 @@ export class AgentSession {
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
 
-		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
-		// user's message that steer this turn. User-authored prompts only — synthetic /
-		// agent-initiated turns never trigger them.
+		// Magic keywords ("ultracode", "ultrathink", "orchestrate", "workflowz"): append
+		// hidden system notices after the user's message that steer this turn.
+		// User-authored prompts only - synthetic / agent-initiated turns never trigger them.
 		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
 
 		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
