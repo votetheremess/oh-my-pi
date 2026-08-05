@@ -565,6 +565,16 @@ export class ModelControls {
 
 	/**
 	 * Cycle to next thinking level: off → auto → minimal..max → off.
+	 *
+	 * This is the user's own effort control, so it is also the way OUT of an
+	 * ultracode session. Without this, the runtime override armed by the keyword
+	 * would be inescapable: `#overrides` is merged last, so neither
+	 * `omp config set ultracode false` nor the settings panel can beat it, and
+	 * {@link forceUltracodeEffort} re-pins xhigh at the top of every later turn.
+	 * Reaching for the effort control is an unambiguous "I want a different
+	 * effort", so it clears the flag rather than being silently overruled next
+	 * turn.
+	 *
 	 * @returns New selector, or undefined if model doesn't support thinking
 	 */
 	cycleThinkingLevel(): ConfiguredThinkingLevel | undefined {
@@ -582,8 +592,37 @@ export class ModelControls {
 		const nextLevel = levels[nextIndex];
 		if (!nextLevel) return undefined;
 
+		if (this.#host.settings.get("ultracode")) this.#host.settings.clearOverride("ultracode");
 		this.setThinkingLevel(nextLevel);
 		return nextLevel;
+	}
+
+	/**
+	 * Pin this session to the ultracode effort ({@link Effort.XHigh}) and leave
+	 * `auto` behind.
+	 *
+	 * Stronger than "ultrathink" by construction: ultrathink only biases the
+	 * auto-thinking classifier for one turn, so it does nothing when auto-thinking
+	 * is off, and the next turn's classification is free to drop straight back to
+	 * medium. Ultracode pins the level for the whole session, and handing
+	 * `setThinkingLevel` a concrete effort clears `#autoThinking` on purpose: a
+	 * classifier that still runs is a classifier that can still lower the effort.
+	 *
+	 * Session-scoped by design - `setThinkingLevel` is called without `persist`, so
+	 * `defaultThinkingLevel` is never rewritten, and the hard `#thinkingLevelCeiling`
+	 * still wins because that setter re-clamps to it.
+	 */
+	forceUltracodeEffort(): void {
+		const model = this.#model;
+		if (!model?.reasoning) return;
+		// Reasoning models with no controllable effort surface (devin-agent Cascade
+		// routes effort via sibling model ids) have nothing to pin.
+		if (getSupportedEfforts(model).length === 0) return;
+		// XHigh is the target, not an assumption: clamp it onto the ladder this model
+		// actually exposes, so one topping out at `high` pins to high.
+		const effort = clampAutoThinkingEffort(model, Effort.XHigh);
+		if (effort === undefined) return;
+		this.setThinkingLevel(effort);
 	}
 
 	/** Timeout (ms) for per-turn auto-thinking classification before falling back. */
@@ -604,7 +643,13 @@ export class ModelControls {
 		if (getSupportedEfforts(model).length === 0) return;
 
 		let resolved: Effort | undefined;
-		if (this.#host.magicKeywordEnabled("ultrathink") && containsUltrathink(promptText)) {
+		if (this.#host.settings.get("ultracode")) {
+			// Ultracode already pinned this session at xhigh (see
+			// forceUltracodeEffort). If anything re-enabled auto since then, resolve
+			// straight back to that level instead of letting the difficulty classifier
+			// walk the effort down.
+			resolved = clampAutoThinkingEffort(model, Effort.XHigh);
+		} else if (this.#host.magicKeywordEnabled("ultrathink") && containsUltrathink(promptText)) {
 			// The user explicitly asked for maximum thinking; bypass the classifier
 			// (and the `providers.autoThinkingMaxEffort` ceiling) and jump straight
 			// to the highest supported level for this model.
