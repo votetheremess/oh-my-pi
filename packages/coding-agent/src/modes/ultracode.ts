@@ -1,7 +1,9 @@
+import { prompt } from "@oh-my-pi/pi-utils";
 import ultracodeNotice from "../prompts/system/ultracode-notice.md" with { type: "text" };
 import { createGradientHighlighter, type KeywordHighlighter } from "./gradient-highlight";
 import { magicKeywordRegex } from "./magic-keyword-boundary";
 import { keywordInProse } from "./markdown-prose";
+import { renderWorkflowNotice } from "./workflow";
 
 /**
  * "ultracode" keyword support, mirroring Claude Code's affordance.
@@ -18,8 +20,38 @@ import { keywordInProse } from "./markdown-prose";
 // Detection: lowercase keyword flanked by prose punctuation, whitespace, or a string edge.
 const ULTRACODE_WORD = magicKeywordRegex("ultracode");
 
-/** Hidden system notice appended after a user message that mentions "ultracode". */
-export const ULTRACODE_NOTICE: string = ultracodeNotice.trim();
+/**
+ * Hidden system notice appended after a user message that mentions "ultracode".
+ *
+ * When workflow tooling is live this carries the FULL workflow contract - the
+ * same helper signatures, structure and patterns `workflowz` injects - followed
+ * by the ultracode layer that makes it standing rather than per-turn. Naming the
+ * contract without shipping it would tell the model to orchestrate while
+ * withholding the API it must orchestrate with, so the two travel together.
+ *
+ * With `eval` or `task` inactive there is no fan-out mechanism, so the notice
+ * says so plainly and keeps only the effort layer.
+ */
+export function renderUltracodeNotice({
+	taskBatch,
+	scoutAvailable,
+	workflowAvailable,
+}: {
+	taskBatch: boolean;
+	scoutAvailable?: boolean;
+	workflowAvailable: boolean;
+}): string {
+	// The contract is embedded, so it drops its own notice wrapper and its
+	// workflowz-specific opening line: the user typed "ultracode", and one
+	// notice block must not nest another.
+	const workflowContract = workflowAvailable
+		? renderWorkflowNotice({ taskBatch, scoutAvailable, embedded: true })
+		: "";
+	return prompt.render(ultracodeNotice, { workflowAvailable, workflowContract }).trim();
+}
+
+/** ULTRACODE_NOTICE is the default ultracode notice for sessions with workflow tooling live. */
+export const ULTRACODE_NOTICE: string = renderUltracodeNotice({ taskBatch: true, workflowAvailable: true });
 
 /**
  * Whether `text` contains the standalone keyword "ultracode" (lowercase,
