@@ -9,6 +9,7 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import { Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
@@ -54,7 +55,13 @@ import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
-import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
+import {
+	type ConfiguredThinkingLevel,
+	clampAutoThinkingEffort,
+	prewalkWouldBeNoop,
+	resolveTaskEffortLevel,
+	type TaskEffort,
+} from "../thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
 import { isIrcEnabled } from "../tools/hub";
@@ -3310,11 +3317,47 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// through to the normal selectors below.
 			// The ceiling outlives initial resolution: it rides into the session so
 			// retry-fallback recovery can never clamp effort back up past it.
-			const spawnEffortCeiling = options.effort !== undefined ? settings.get("task.maxEffort") : undefined;
+			// Ultracode pins every spawn to xhigh while it is active, deliberately
+			// overriding the agent definition's own pinned effort (scout's `medium`,
+			// task's `auto`), any explicit `:level` suffix, and the caller's
+			// `effort`. The model is the only thing allowed to move it.
+			//
+			// `clampAutoThinkingEffort` is the same helper the session-side pin in
+			// `ModelControls.forceUltracodeEffort` uses, so a subagent and its parent
+			// resolve xhigh identically. It is used here INSTEAD of
+			// `resolveTaskEffortLevel(model, "hi", Effort.XHigh)`, which throws
+			// `RangeError` when a model's ladder sits entirely above the ceiling: a
+			// model exposing only `max` would have crashed the spawn outright, and
+			// the message would have blamed `task.maxEffort` for a ceiling ultracode
+			// supplied. Clamping instead lands that model on `max` and a model
+			// topping out at `high` on `high`, while a model with no controllable
+			// effort surface returns undefined and falls through to the normal
+			// selectors below.
+			//
+			// `task.maxEffort` must not drag the pin down either, so a ceiling below
+			// the pinned level is raised to exactly that level for the ride into the
+			// session. It is raised to `ultracodeEffortLevel` rather than to a
+			// hardcoded xhigh so the ceiling can never sit BELOW the level it is
+			// escorting: on a model whose ladder is entirely above xhigh (max only)
+			// the pin resolves to `max`, and a hardcoded xhigh ceiling would leave
+			// retry-fallback recovery re-clamping that spawn to a level the model
+			// does not expose. Non-ultracode spawns keep their exact previous
+			// ceiling behaviour.
+			const ultracodeEffortLevel = settings.get("ultracode")
+				? clampAutoThinkingEffort(model, Effort.XHigh)
+				: undefined;
+			const configuredEffortCeiling = options.effort !== undefined ? settings.get("task.maxEffort") : undefined;
+			const spawnEffortCeiling =
+				ultracodeEffortLevel !== undefined &&
+				configuredEffortCeiling !== undefined &&
+				THINKING_EFFORTS.indexOf(configuredEffortCeiling) < THINKING_EFFORTS.indexOf(ultracodeEffortLevel)
+					? ultracodeEffortLevel
+					: configuredEffortCeiling;
 			const effortLevel =
-				options.effort !== undefined
+				ultracodeEffortLevel ??
+				(options.effort !== undefined
 					? resolveTaskEffortLevel(model, options.effort, spawnEffortCeiling)
-					: undefined;
+					: undefined);
 			if (model) {
 				const displayLevel = effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : undefined);
 				progress.resolvedModelIdentity = formatModelStringWithRouting(model);
@@ -3324,9 +3367,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						? formatModelSelectorValue(progress.resolvedModelIdentity, displayLevel)
 						: progress.resolvedModelIdentity;
 			}
-			// Precedence: caller `effort` > explicit `:level` suffix on the resolved
-			// model pattern > agent-definition default (e.g. task's `auto`) >
-			// pattern-derived level.
+			// Precedence: ultracode floor > caller `effort` > explicit `:level` suffix
+			// on the resolved model pattern > agent-definition default (e.g. task's
+			// `auto`) > pattern-derived level.
 			const effectiveThinkingLevel =
 				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
 			resolvedAt = performance.now();

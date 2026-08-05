@@ -219,4 +219,93 @@ describe("AgentSession magic keyword settings", () => {
 		expect(userIdx).toBeGreaterThanOrEqual(0);
 		expect(noticeIdx).toBeLessThan(userIdx);
 	});
+
+	it("appends the ultracode notice and turns ultracode on for the session", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		expect(created.settings.get("ultracode")).toBe(false);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{
+			attribution?: string;
+			customType?: string;
+			display?: boolean;
+		}>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual(["ultracode-notice"]);
+		const notice = promptMessages.find(message => message.customType === "ultracode-notice");
+		expect(notice?.display).toBe(false);
+		expect(notice?.attribution).toBe("user");
+		// The keyword is a session opt-in, not a per-turn nudge.
+		expect(created.settings.get("ultracode")).toBe(true);
+	});
+
+	it("keeps appending the ultracode notice on later keyword-free turns", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+		await session.prompt("now do the next step");
+
+		const secondTurn = promptSpy.mock.calls[1]![0] as unknown as Array<{ customType?: string }>;
+		expect(secondTurn.map(message => message.customType).filter(Boolean)).toEqual(["ultracode-notice"]);
+	});
+
+	it("appends a single ultracode notice when the keyword repeats while the flag is set", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		created.settings.override("ultracode", true);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("ultracode this one too");
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual(["ultracode-notice"]);
+	});
+
+	it("honors the per-keyword ultracode toggle", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		created.settings.set("magicKeywords.ultracode", false);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	it("does not turn ultracode on when magic keywords are disabled outright", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		created.settings.set("magicKeywords.enabled", false);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	it("never lets a synthetic turn trigger the ultracode keyword", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor", { synthetic: true });
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
 });
