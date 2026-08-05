@@ -2196,7 +2196,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			group: "Magic Keywords",
 			label: "Magic Keywords",
-			description: "Enable hidden notices for standalone ultrathink, orchestrate, and workflowz keywords",
+			description: "Enable hidden notices for standalone ultrathink, orchestrate, workflowz, and ultracode keywords",
 		},
 	},
 
@@ -2230,6 +2230,33 @@ export const SETTINGS_SCHEMA = {
 			group: "Magic Keywords",
 			label: "Workflow Keyword",
 			description: "Let standalone workflowz append its hidden eval workflow notice",
+		},
+	},
+
+	"magicKeywords.ultracode": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			group: "Magic Keywords",
+			label: "Ultracode Keyword",
+			description:
+				"Let standalone ultracode turn on xhigh effort and standing workflow orchestration for the session",
+		},
+	},
+
+	// Session state, not a preference: the ultracode keyword flips this through
+	// the runtime override layer (Settings.override), which never reaches disk,
+	// so the opt-in dies with the session.
+	ultracode: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			group: "Magic Keywords",
+			label: "Ultracode",
+			description:
+				"Whether ultracode (xhigh effort plus standing workflow orchestration) is active for this session. Set at runtime by the ultracode keyword; never persisted.",
 		},
 	},
 
