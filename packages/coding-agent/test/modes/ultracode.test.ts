@@ -1,7 +1,13 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { containsOrchestrate, highlightOrchestrate } from "@oh-my-pi/pi-coding-agent/modes/orchestrate";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { containsUltracode, highlightUltracode, ULTRACODE_NOTICE } from "@oh-my-pi/pi-coding-agent/modes/ultracode";
+import {
+	containsUltracode,
+	highlightUltracode,
+	renderUltracodeNotice,
+	ULTRACODE_NOTICE,
+} from "@oh-my-pi/pi-coding-agent/modes/ultracode";
+import { renderWorkflowNotice, WORKFLOW_NOTICE } from "@oh-my-pi/pi-coding-agent/modes/workflow";
 
 beforeAll(() => {
 	// highlightUltracode/highlightOrchestrate read the global theme's color mode.
@@ -111,5 +117,56 @@ describe("ultracode notice", () => {
 		expect(ULTRACODE_NOTICE).toContain("standing");
 		// The contract must not retain the slash-command input placeholder.
 		expect(ULTRACODE_NOTICE).not.toContain("$@");
+	});
+});
+
+describe("ultracode orchestration contract", () => {
+	// The whole point of the keyword is that the turn runs as a dynamic workflow.
+	// A notice that only NAMES the helpers tells the model to orchestrate while
+	// withholding the API it must orchestrate with, so these assert the contract
+	// travels with the instruction rather than being referred to.
+	const withTooling = renderUltracodeNotice({ taskBatch: true, workflowAvailable: true });
+	const withoutTooling = renderUltracodeNotice({ taskBatch: true, workflowAvailable: false });
+
+	it("carries the executable helper API, not a pointer to it", () => {
+		for (const helper of ["agent(", "parallel(", "pipeline(", "phase(", "completion("]) {
+			expect(withTooling).toContain(helper);
+		}
+		// Signatures and worked structure, not a passing mention: the standalone
+		// workflowz notice is the source of truth, so the contract must match it.
+		expect(withTooling).toContain(renderWorkflowNotice({ taskBatch: true, embedded: true }));
+	});
+
+	it("is one notice block that names the keyword the user actually typed", () => {
+		expect(withTooling.split("<system-notice>")).toHaveLength(2);
+		expect(withTooling).toContain("**ultracode**");
+		expect(withTooling).not.toContain("**workflowz**");
+	});
+
+	it("makes the contract standing rather than per-turn", () => {
+		expect(withTooling).toContain("standing default for the session");
+		expect(withTooling).toContain("does not expire when this turn does");
+	});
+
+	it("prescribes no fan-out API when the tools to run it are inactive", () => {
+		for (const helper of ["agent(", "parallel(", "pipeline(", "phase("]) {
+			expect(withoutTooling).not.toContain(helper);
+		}
+		// Silence would read as "orchestrate anyway"; the notice must say why not.
+		expect(withoutTooling).toContain("not both active");
+		expect(withoutTooling).toContain("xhigh");
+	});
+
+	it("leaves the standalone workflowz notice unchanged", () => {
+		expect(WORKFLOW_NOTICE.startsWith("<system-notice>")).toBe(true);
+		expect(WORKFLOW_NOTICE.endsWith("</system-notice>")).toBe(true);
+		expect(WORKFLOW_NOTICE).toContain("**workflowz**");
+		expect(renderWorkflowNotice({ taskBatch: true, embedded: true })).not.toContain("system-notice");
+	});
+
+	it("renders every template branch, leaving no handlebars behind", () => {
+		for (const notice of [withTooling, withoutTooling, ULTRACODE_NOTICE]) {
+			expect(notice).not.toContain("{{");
+		}
 	});
 });
