@@ -259,7 +259,7 @@ describe("AgentSession magic keyword settings", () => {
 		// be in the notice; naming it without carrying it is the whole defect.
 		expect(notice).toContain("agent(");
 		expect(notice).toContain("parallel(");
-		expect(notice).toContain("standing default for the session");
+		expect(notice).toContain("THIS TURN");
 	});
 
 	it("keeps ultracode on but drops the fan-out contract when eval is inactive", async () => {
@@ -283,7 +283,7 @@ describe("AgentSession magic keyword settings", () => {
 		expect(created.settings.get("ultracode")).toBe(true);
 	});
 
-	it("keeps appending the ultracode notice on later keyword-free turns", async () => {
+	it("does not carry the ultracode notice into a later keyword-free turn", async () => {
 		const created = await createMagicKeywordSession(root);
 		session = created.session;
 		authStorage = created.authStorage;
@@ -292,8 +292,41 @@ describe("AgentSession magic keyword settings", () => {
 		await session.prompt("please ultracode this refactor");
 		await session.prompt("now do the next step");
 
+		// Per-turn: the word steers the message that carries it and nothing after.
 		const secondTurn = promptSpy.mock.calls[1]![0] as unknown as Array<{ customType?: string }>;
-		expect(secondTurn.map(message => message.customType).filter(Boolean)).toEqual(["ultracode-notice"]);
+		expect(secondTurn.map(message => message.customType).filter(Boolean)).toEqual([]);
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	it("re-arms whenever the word comes back", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+		await session.prompt("now do the next step");
+		await session.prompt("ultracode the follow-up too");
+
+		const thirdTurn = promptSpy.mock.calls[2]![0] as unknown as Array<{ customType?: string }>;
+		expect(thirdTurn.map(message => message.customType).filter(Boolean)).toEqual(["ultracode-notice"]);
+		expect(created.settings.get("ultracode")).toBe(true);
+	});
+
+	it("refuses to let a persisted ultracode:true arm a keyword-free turn", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		created.settings.set("ultracode", true);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("just a normal message");
+
+		// The flag is turn state, not a preference. A stale persisted true must not
+		// silently run every turn at xhigh with a workflow contract attached.
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
+		expect(created.settings.get("ultracode")).toBe(false);
 	});
 
 	it("appends a single ultracode notice when the keyword repeats while the flag is set", async () => {
