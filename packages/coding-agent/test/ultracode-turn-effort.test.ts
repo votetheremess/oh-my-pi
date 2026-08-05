@@ -167,10 +167,10 @@ function createHarness(options: {
 	};
 }
 
-describe("forceUltracodeEffort", () => {
+describe("beginUltracodeTurn", () => {
 	it("pins the session at xhigh on a model whose ladder offers it", () => {
 		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
-		h.controls.forceUltracodeEffort();
+		h.controls.beginUltracodeTurn();
 
 		expect(h.controls.thinkingLevel).toBe(Effort.XHigh);
 		expect(h.agentEfforts.at(-1)).toBe(Effort.XHigh);
@@ -179,7 +179,7 @@ describe("forceUltracodeEffort", () => {
 
 	it("clamps down to the highest supported level when the ladder stops below xhigh", () => {
 		const h = createHarness({ model: TOPS_AT_HIGH, thinkingLevel: Effort.Minimal });
-		h.controls.forceUltracodeEffort();
+		h.controls.beginUltracodeTurn();
 
 		expect(h.controls.thinkingLevel).toBe(Effort.High);
 		// The point of the clamp: never hand the provider an unsupported tier.
@@ -192,7 +192,7 @@ describe("forceUltracodeEffort", () => {
 		// Regression: pinning through `resolveTaskEffortLevel` with an xhigh
 		// ceiling threw RangeError here, because no supported effort is at or
 		// below xhigh. The clamp has to snap to the nearest tier instead.
-		expect(() => h.controls.forceUltracodeEffort()).not.toThrow();
+		expect(() => h.controls.beginUltracodeTurn()).not.toThrow();
 		expect(h.controls.thinkingLevel).toBe(Effort.Max);
 		expect(h.agentEfforts.at(-1)).toBe(Effort.Max);
 	});
@@ -201,7 +201,7 @@ describe("forceUltracodeEffort", () => {
 		const h = createHarness({ model: NO_EFFORT_SURFACE, thinkingLevel: Effort.Medium });
 		const agentCallsBefore = h.agentEfforts.length;
 
-		expect(() => h.controls.forceUltracodeEffort()).not.toThrow();
+		expect(() => h.controls.beginUltracodeTurn()).not.toThrow();
 		// Untouched: still whatever the session was configured with.
 		expect(h.controls.thinkingLevel).toBe(Effort.Medium);
 		expect(h.agentEfforts.length).toBe(agentCallsBefore);
@@ -213,7 +213,7 @@ describe("forceUltracodeEffort", () => {
 		const h = createHarness({ model: NON_REASONING, thinkingLevel: Effort.Medium });
 		const agentCallsBefore = h.agentEfforts.length;
 
-		expect(() => h.controls.forceUltracodeEffort()).not.toThrow();
+		expect(() => h.controls.beginUltracodeTurn()).not.toThrow();
 		expect(h.controls.thinkingLevel).toBe(Effort.Medium);
 		expect(h.agentEfforts.length).toBe(agentCallsBefore);
 		expect(h.events).toEqual([]);
@@ -224,7 +224,7 @@ describe("forceUltracodeEffort", () => {
 		expect(h.controls.configuredThinkingLevel()).toBe(AUTO_THINKING);
 		expect(h.controls.isAutoThinking).toBe(true);
 
-		h.controls.forceUltracodeEffort();
+		h.controls.beginUltracodeTurn();
 
 		// `AgentSession` only calls `applyAutoThinkingLevel` while `isAutoThinking`
 		// is true, so clearing it is what takes the classifier out of the turn.
@@ -234,11 +234,11 @@ describe("forceUltracodeEffort", () => {
 		expect(h.entries.at(-1)).toEqual({ thinkingLevel: Effort.XHigh, configured: Effort.XHigh });
 	});
 
-	it("is session-scoped: it never rewrites the persisted defaultThinkingLevel", () => {
+	it("is turn-scoped: it never rewrites the persisted defaultThinkingLevel", () => {
 		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: AUTO_THINKING });
 		h.settings.set("defaultThinkingLevel", Effort.Medium);
 
-		h.controls.forceUltracodeEffort();
+		h.controls.beginUltracodeTurn();
 
 		expect(h.controls.thinkingLevel).toBe(Effort.XHigh);
 		expect(h.settings.get("defaultThinkingLevel")).toBe(Effort.Medium);
@@ -250,30 +250,68 @@ describe("forceUltracodeEffort", () => {
 			thinkingLevel: Effort.Low,
 			thinkingLevelCeiling: Effort.Medium,
 		});
-		h.controls.forceUltracodeEffort();
+		h.controls.beginUltracodeTurn();
 
 		expect(h.controls.thinkingLevelCeiling).toBe(Effort.Medium);
 		expect(h.controls.thinkingLevel).toBe(Effort.Medium);
 		expect(h.agentEfforts).not.toContain(Effort.XHigh);
 	});
 
-	it("is escapable: cycling the thinking level clears the session override", () => {
-		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low, ultracode: true });
-		h.controls.forceUltracodeEffort();
+	it("hands the borrowed level back when the turn ends", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
+		h.controls.beginUltracodeTurn();
 		expect(h.controls.thinkingLevel).toBe(Effort.XHigh);
-		expect(h.settings.get("ultracode")).toBe(true);
 
-		// The effort control is the one deliberate way out. Without this the
-		// runtime override is inescapable: it is merged last, so no persisted
-		// write can beat it, and forceUltracodeEffort re-pins xhigh at the top of
-		// every later turn.
-		h.controls.cycleThinkingLevel();
+		// The whole point of per-turn: the next keyword-free turn is back to normal.
+		h.controls.endUltracodeTurn();
+		expect(h.controls.configuredThinkingLevel()).toBe(Effort.Low);
+	});
+
+	it("restores auto, not a concrete level, when auto was running before", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: AUTO_THINKING });
+		h.controls.beginUltracodeTurn();
+		expect(h.controls.isAutoThinking).toBe(false);
+
+		h.controls.endUltracodeTurn();
+		expect(h.controls.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(h.controls.isAutoThinking).toBe(true);
+	});
+
+	it("survives the keyword on consecutive turns without stranding the session at xhigh", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
+		h.controls.beginUltracodeTurn();
+		// A second capture must not overwrite the saved level with xhigh itself.
+		h.controls.beginUltracodeTurn();
+		h.controls.endUltracodeTurn();
+
+		expect(h.controls.configuredThinkingLevel()).toBe(Effort.Low);
+	});
+
+	it("ending without a begin is a no-op, so ordinary turns cost nothing", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Medium });
+		const before = h.entries.length;
+		h.controls.endUltracodeTurn();
+
+		expect(h.controls.configuredThinkingLevel()).toBe(Effort.Medium);
+		expect(h.entries.length).toBe(before);
+	});
+
+	it("yields to the user's own effort control instead of overwriting their choice", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low, ultracode: true });
+		h.controls.beginUltracodeTurn();
+		expect(h.controls.thinkingLevel).toBe(Effort.XHigh);
+
+		// Reaching for the effort control mid-turn is explicit. The pending restore
+		// must be dropped, or it would silently discard the level they just picked.
+		const picked = h.controls.cycleThinkingLevel();
+		h.controls.endUltracodeTurn();
 
 		expect(h.settings.get("ultracode")).toBe(false);
+		expect(h.controls.configuredThinkingLevel()).toBe(picked);
 		expect(h.controls.thinkingLevel).not.toBe(Effort.XHigh);
 	});
 
-	it("leaves the override alone when cycling on a session that never armed it", () => {
+	it("leaves the flag alone when cycling on a turn that never used the keyword", () => {
 		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
 		h.controls.cycleThinkingLevel();
 		expect(h.settings.get("ultracode")).toBe(false);

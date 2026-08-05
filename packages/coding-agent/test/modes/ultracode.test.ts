@@ -109,12 +109,12 @@ describe("ultracode keyword highlighting", () => {
 });
 
 describe("ultracode notice", () => {
-	it("is a self-contained system notice carrying the standing session contract", () => {
+	it("is a self-contained system notice scoped to the turn that carries it", () => {
 		expect(ULTRACODE_NOTICE.startsWith("<system-notice>")).toBe(true);
 		expect(ULTRACODE_NOTICE.endsWith("</system-notice>")).toBe(true);
-		// The contract is a session-wide opt-in pinned at xhigh, not a one-turn nudge.
 		expect(ULTRACODE_NOTICE).toContain("xhigh");
-		expect(ULTRACODE_NOTICE).toContain("standing");
+		// Turn-scoped, not a session opt-in: the word steers this message only.
+		expect(ULTRACODE_NOTICE).toContain("THIS TURN");
 		// The contract must not retain the slash-command input placeholder.
 		expect(ULTRACODE_NOTICE).not.toContain("$@");
 	});
@@ -143,9 +143,13 @@ describe("ultracode orchestration contract", () => {
 		expect(withTooling).not.toContain("**workflowz**");
 	});
 
-	it("makes the contract standing rather than per-turn", () => {
-		expect(withTooling).toContain("standing default for the session");
-		expect(withTooling).toContain("does not expire when this turn does");
+	it("scopes the contract to this turn and never claims the session", () => {
+		expect(withTooling).toContain("the shape of THIS request");
+		// The earlier build made the contract standing for the whole session. The
+		// keyword is per-turn now, so nothing may promise it outlives the turn.
+		expect(withTooling).not.toContain("standing default for the session");
+		expect(withTooling).not.toContain("does not expire when this turn does");
+		expect(withTooling).not.toContain("for the rest of the session");
 	});
 
 	it("prescribes no fan-out API when the tools to run it are inactive", () => {

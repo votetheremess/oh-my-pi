@@ -10,9 +10,10 @@ import { renderWorkflowNotice } from "./workflow";
  *
  * Typing the standalone word in the input editor paints it with a violet ->
  * magenta -> gold ripple ({@link highlightUltracode}); submitting a message that
- * mentions it turns ultracode ON for the rest of the session: xhigh reasoning
- * effort on every turn and every subagent, plus the standing workflow
- * orchestration contract carried by {@link ULTRACODE_NOTICE}. Matching is
+ * mentions it runs THAT TURN at xhigh reasoning effort, for the turn and every
+ * subagent it spawns, under the workflow orchestration contract carried by
+ * {@link ULTRACODE_NOTICE}. The word must be repeated on any later message that
+ * wants the same treatment. Matching is
  * prose-delimited and case-sensitive (lowercase only), so "ultracoded",
  * "Ultracode", or "ultracode.ts" never trigger either behavior.
  */
@@ -25,7 +26,7 @@ const ULTRACODE_WORD = magicKeywordRegex("ultracode");
  *
  * When workflow tooling is live this carries the FULL workflow contract - the
  * same helper signatures, structure and patterns `workflowz` injects - followed
- * by the ultracode layer that makes it standing rather than per-turn. Naming the
+ * by the ultracode layer that pins the effort and commits to it. Naming the
  * contract without shipping it would tell the model to orchestrate while
  * withholding the API it must orchestrate with, so the two travel together.
  *
