@@ -125,16 +125,35 @@ describe("ultracode orchestration contract", () => {
 	// A notice that only NAMES the helpers tells the model to orchestrate while
 	// withholding the API it must orchestrate with, so these assert the contract
 	// travels with the instruction rather than being referred to.
-	const withTooling = renderUltracodeNotice({ taskBatch: true, workflowAvailable: true });
-	const withoutTooling = renderUltracodeNotice({ taskBatch: true, workflowAvailable: false });
+	const withTooling = renderUltracodeNotice({ workflowAvailable: true });
+	const withoutTooling = renderUltracodeNotice({ workflowAvailable: false });
 
 	it("carries the executable helper API, not a pointer to it", () => {
-		for (const helper of ["agent(", "parallel(", "pipeline(", "phase(", "completion("]) {
+		for (const helper of ["agent(", "parallel(", "pipeline(", "phase(", "log(", "budget.total"]) {
 			expect(withTooling).toContain(helper);
 		}
-		// Signatures and worked structure, not a passing mention: the standalone
-		// workflowz notice is the source of truth, so the contract must match it.
-		expect(withTooling).toContain(renderWorkflowNotice({ taskBatch: true, embedded: true }));
+		// Worked scripts, not a list of names: the model has to see the shape.
+		expect(withTooling).toContain("await pipeline(");
+		expect(withTooling).toContain("await parallel(");
+	});
+
+	it("teaches pipeline over barrier, which is the costly mistake", () => {
+		expect(withTooling).toContain("DEFAULT TO pipeline()");
+		expect(withTooling).toContain("BARRIER");
+	});
+
+	it("carries the three-verdict adjudication, not a refute boolean", () => {
+		for (const verdict of ["CONFIRMED", "PLAUSIBLE", "REFUTED"]) {
+			expect(withTooling).toContain(verdict);
+		}
+		// The calibration IS the mechanism: a panel that refutes anything
+		// speculative deletes the real findings and reports a clean bill.
+		expect(withTooling).toContain("PLAUSIBLE by default");
+		expect(withTooling).toContain("REFUTED only when constructible from the code");
+	});
+
+	it("keeps deterministic glue out of the model", () => {
+		expect(withTooling).toContain("Zero-token glue");
 	});
 
 	it("is one notice block that names the keyword the user actually typed", () => {
@@ -144,11 +163,10 @@ describe("ultracode orchestration contract", () => {
 	});
 
 	it("scopes the contract to this turn and never claims the session", () => {
-		expect(withTooling).toContain("the shape of THIS request");
-		// The earlier build made the contract standing for the whole session. The
+		expect(withTooling).toContain("THIS TURN");
+		// The first build made the contract standing for the whole session. The
 		// keyword is per-turn now, so nothing may promise it outlives the turn.
 		expect(withTooling).not.toContain("standing default for the session");
-		expect(withTooling).not.toContain("does not expire when this turn does");
 		expect(withTooling).not.toContain("for the rest of the session");
 	});
 
