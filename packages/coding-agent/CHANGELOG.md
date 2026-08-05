@@ -246,6 +246,9 @@
 - Fixed parsing of POSIX `$EDITOR` commands that contain quoted arguments or executable paths with spaces.
 - Fixed persisted Agent Hub rows losing the explicit caller model role when a subagent used a model override, preserving role provenance across restarts.
 - Fixed unobserved promise rejections in browser helpers (such as `tab.waitForResponse()`) causing tab workers to hang or crash.
+### Added
+
+- Added `ultracode`, a fourth magic keyword alongside `ultrathink`/`orchestrate`/`workflowz` and the only session-scoped one: `AgentSession.#createMagicKeywordNotices` flips the new top-level `ultracode` setting through the never-persisted runtime override layer, so the opt-in dies with the session. While on, `ModelControls.forceUltracodeEffort()` re-pins the session to `Effort.XHigh` every user turn and `src/task/executor.ts` applies the same floor to every spawn, outranking the caller's `effort`, an agent's own pinned level (`scout`'s `medium`), and `task.maxEffort`; the hidden user-attributed `ultracode-notice` makes multi-subagent workflow orchestration the standing default. Gated by `magicKeywords.ultracode` (default `true`); the session flag `ultracode` defaults to `false`.
 
 ## [17.2.9] - 2026-08-05
 
