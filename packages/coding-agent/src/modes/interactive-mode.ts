@@ -319,7 +319,18 @@ function formatHudNoteMarker(count: number): string {
 type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop", "budget"]);
-const PLAN_KEEP_CONTEXT_OPTION_INDEX = 2;
+/**
+ * Execute the approved plan as an ultracode turn.
+ *
+ * Plan approval dispatches a synthetic prompt, and synthetic turns never scan for
+ * magic keywords, so an `ultracode` typed into the PLANNING turn cannot reach the
+ * EXECUTION turn -- the phase that actually spawns the subagents. This option is
+ * how the operator carries it across that boundary.
+ */
+const PLAN_EXECUTE_ULTRACODE_LABEL = "Approve and execute with ultracode";
+// Index of `keepContextLabel` in the plan-review option array below. Keep in sync
+// when reordering the options.
+const PLAN_KEEP_CONTEXT_OPTION_INDEX = 3;
 const PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT = 95;
 const PLAN_SAVE_AND_QUIT_OPTION = "Save and quit";
 const PLAN_SAVE_TITLE_LINE_LIMIT = 6;
@@ -3730,6 +3741,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			preserveContext?: boolean;
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
+			/** Run the execution turn as an ultracode turn (see PLAN_EXECUTE_ULTRACODE_LABEL). */
+			executionUltracode?: boolean;
 		},
 	): Promise<boolean> {
 		const previousTools = this.#planModePreviousTools ?? this.session.getEnabledToolNames();
@@ -3846,10 +3859,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		// markPlanReferenceSent fires only on the dispatch path so the synthetic
 		// plan-approved prompt is the source of the reference injection.
 		this.session.markPlanReferenceSent();
-		const planModePrompt = prompt.render(planModeApprovedPrompt, {
+		const planModeDirective = prompt.render(planModeApprovedPrompt, {
 			planFilePath: options.planFilePath,
 			contextPreserved: options.preserveContext === true,
 		});
+		// Arm ultracode LAST, after #exitPlanMode and any executionModel application:
+		// #exitPlanMode restores the pre-plan model state, which would revert the
+		// pinned thinking level, exactly as documented for executionModel above. The
+		// notice rides on the synthetic directive because the synthetic path does not
+		// build keyword notices; the turn stays synthetic, so nothing disarms it, and
+		// the next keyword-free user turn hands the borrowed effort back.
+		const planModePrompt = options.executionUltracode
+			? `${this.session.armUltracodeTurn()}\n\n${planModeDirective}`
+			: planModeDirective;
 		// Close the review overlay only now — after the async title write and plan
 		// prompt are prepared, immediately before the execution turn is queued. The
 		// synthetic prompt below blocks in `session.prompt` for the whole run, so
@@ -4501,6 +4523,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			"Plan mode - next step",
 			[
 				"Approve and execute",
+				PLAN_EXECUTE_ULTRACODE_LABEL,
 				"Approve and compact context",
 				keepContextLabel,
 				"Refine plan",
@@ -4545,7 +4568,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
+		if (
+			choice === "Approve and execute" ||
+			choice === PLAN_EXECUTE_ULTRACODE_LABEL ||
+			choice === "Approve and compact context" ||
+			choice === keepContextLabel
+		) {
 			try {
 				// Prefer in-overlay edits (already in memory) over a disk re-read. The
 				// overlay mirrors edits as they happen, and approval awaits one final
@@ -4590,8 +4618,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				const executionDispatched = await this.#approvePlan(latestPlanContent, {
 					planFilePath,
 					title: details.title,
-					preserveContext: choice !== "Approve and execute",
+					preserveContext: choice !== "Approve and execute" && choice !== PLAN_EXECUTE_ULTRACODE_LABEL,
 					compactBeforeExecute: choice === "Approve and compact context",
+					executionUltracode: choice === PLAN_EXECUTE_ULTRACODE_LABEL,
 					executionModel,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
