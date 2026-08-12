@@ -334,3 +334,59 @@ Location: `packages/*/CHANGELOG.md` (per package).
 2. Run `bun run release`.
 
 The script handles version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
+
+<!-- FORK-LOCAL: not upstream's. Strip this section before any upstream PR. -->
+
+## Local ultracode fork (this checkout only)
+
+This checkout is not a plain clone: `origin` is upstream (`can1357/oh-my-pi`) and the
+branch `feat/ultracode-keyword` carries a local `ultracode` magic keyword rebased onto
+each release tag. Nothing here exists upstream.
+
+**How it reaches the running binary.** `~/.omp/omp-sync.sh` (invoked by `omp update`
+through a fish function in `~/.config/fish/functions/omp.fish`) rebases the branch onto
+the newest release tag, runs omp's own updater with `--force`, rebuilds via
+`bun run gen:bundle`, and copies `dist/cli.js` over the installed npm bundle. Plain
+`omp update` would install the unpatched npm bundle and silently delete the feature,
+which is the only reason the wrapper exists.
+
+**Rules that are load-bearing, learned the hard way:**
+
+- `--force` is mandatory when calling omp's updater from the script. The patched bundle
+  bakes in the upstream version, so the updater's own check reports "already up to date"
+  and installs nothing. The bypass is `comparison <= 0 && !opts.force` in
+  `src/cli/update-cli.ts`.
+- Patch detection greps the identifiers in `packages/coding-agent/scripts/ultracode-markers.txt`.
+  Never use prose as a marker: the original markers were two sentences inside
+  `ultracode-notice.md` and a copy edit nearly broke installation, with a message
+  claiming the feature was missing. `test/ultracode-markers.test.ts` enforces the
+  contract — it strips comment lines first, because the bundler strips comments and a
+  marker surviving only in a doc comment is absent from the shipped bundle.
+- Bundling preserves string literals but mangles local identifiers, so markers must be
+  settings paths, `customType` values, or UI labels — never internal symbol names.
+- Keep the branch's footprint out of files upstream churns. Measure before adding a
+  hunk: `git log --oneline <prev-tag>..<tag> -- <file> | wc -l`. `CHANGELOG.md` saw 23
+  commits in a single release window and is deliberately left untouched;
+  `docs/magic-keywords.md` is the feature's documentation instead.
+- `rerere` is enabled in this checkout, so a conflict resolved once replays on later rebases.
+- Ultracode's subagent floor lives in `src/task/executor.ts` and reads
+  `settings.get("ultracode")`. An out-of-tree extension can NOT replace it: extensions
+  cannot register settings keys, and plan-mode subagents load no extensions at all
+  (`structured-subagent.ts`: `preloadedExtensionPaths: restrictToolNames ? [] : …`).
+  This is why the feature stays in-tree.
+- Plan approval dispatches a SYNTHETIC prompt, and synthetic turns never scan for magic
+  keywords, so a typed keyword cannot reach the execution turn. That is what
+  "Approve and execute with ultracode" in the plan review exists for. Arm effort only
+  AFTER `#exitPlanMode`, which restores the pre-plan model and would revert the pin.
+
+**Known expiry.** `shouldForceBinaryUpdate` in `src/cli/update-cli.ts` returns true when
+the new release's major version exceeds the current one, or when a release is marked
+binary-only. At omp 18 the updater replaces the bun script launcher with a standalone
+binary and there is no `dist/cli.js` to patch. The bundle-swap approach ends there;
+`bun run build` (compiled binary) is the migration path. `omp-sync.sh` detects this and
+says so rather than failing obscurely.
+
+**Recovery refs.** `ultracode-verified-2026-08-12` tags a fully verified state. The
+branch `feat/ultracode-keyword-pre-sync` is NOT a backup of latest work — the script
+moves it only when a rebase actually runs, so it can lag many commits. Check
+`git log --oneline <ref>..HEAD` before trusting either.
