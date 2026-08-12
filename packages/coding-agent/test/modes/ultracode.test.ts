@@ -7,7 +7,7 @@ import {
 	renderUltracodeNotice,
 	ULTRACODE_NOTICE,
 } from "@oh-my-pi/pi-coding-agent/modes/ultracode";
-import { renderWorkflowNotice, WORKFLOW_NOTICE } from "@oh-my-pi/pi-coding-agent/modes/workflow";
+import { WORKFLOW_NOTICE } from "@oh-my-pi/pi-coding-agent/modes/workflow";
 
 beforeAll(() => {
 	// highlightUltracode/highlightOrchestrate read the global theme's color mode.
@@ -183,7 +183,12 @@ describe("ultracode orchestration contract", () => {
 		expect(WORKFLOW_NOTICE.startsWith("<system-notice>")).toBe(true);
 		expect(WORKFLOW_NOTICE.endsWith("</system-notice>")).toBe(true);
 		expect(WORKFLOW_NOTICE).toContain("**workflowz**");
-		expect(renderWorkflowNotice({ taskBatch: true, embedded: true })).not.toContain("system-notice");
+		// ultracode ships its own fuller contract. It must never splice in or
+		// re-render the workflowz notice, which announces a keyword the user did
+		// not type — that coupling is what kept this branch diverging from
+		// upstream's copy of workflow-notice.md and caused the only rebase conflict.
+		expect(ULTRACODE_NOTICE).not.toContain(WORKFLOW_NOTICE);
+		expect(ULTRACODE_NOTICE).not.toContain("**workflowz**");
 	});
 
 	it("renders every template branch, leaving no handlebars behind", () => {
