@@ -1,10 +1,11 @@
 /**
- * Ultracode's session-level effort pin.
+ * Ultracode's per-turn effort pin.
  *
  * Keyword detection, highlighting and the notice are covered elsewhere
  * (test/modes/ultracode.test.ts, test/modes/magic-keywords.test.ts). This file
- * covers the thing the keyword exists for: `ModelControls.forceUltracodeEffort()`
- * pinning the session at xhigh, and the ultracode branch of
+ * covers the thing the keyword exists for: `ModelControls.beginUltracodeTurn()`
+ * pinning the turn at xhigh, `endUltracodeTurn()` handing the borrowed level
+ * back on the next turn without the word, and the ultracode branch of
  * `applyAutoThinkingLevel` refusing to let the difficulty classifier walk that
  * pin back down.
  *
