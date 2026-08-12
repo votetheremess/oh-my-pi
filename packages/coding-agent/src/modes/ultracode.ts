@@ -50,11 +50,13 @@ export function renderUltracodeNotice({
 	scoutAvailable,
 	effortApplied,
 	maxConcurrency,
+	viaPlanApproval,
 }: {
 	workflowAvailable: boolean;
 	scoutAvailable?: boolean;
 	effortApplied?: boolean;
 	maxConcurrency?: number;
+	viaPlanApproval?: boolean;
 }): string {
 	return prompt
 		.render(ultracodeNotice, {
@@ -62,6 +64,7 @@ export function renderUltracodeNotice({
 			scoutAvailable: scoutAvailable ?? true,
 			effortApplied: effortApplied ?? true,
 			MAX_CONCURRENCY: normalizeConcurrencyLimit(maxConcurrency ?? 0),
+			viaPlanApproval: viaPlanApproval ?? false,
 		})
 		.trim();
 }
