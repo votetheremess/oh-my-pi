@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
@@ -11,6 +11,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { isHiddenUserCompanion, MAGIC_KEYWORD_NOTICE_TYPES } from "@oh-my-pi/pi-coding-agent/session/queued-messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -381,5 +383,82 @@ describe("AgentSession magic keyword settings", () => {
 		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
 		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
 		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	// `synthetic` was the only gate, but three agent-initiated callers reach
+	// prompt() with `attribution: "agent"` and no synthetic flag -- notably a
+	// subagent's own task text in task/executor.ts.
+	it("never lets an agent-authored turn trigger the ultracode keyword", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor", { attribution: "agent" });
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	// The depth-2 effort bug: a subagent inherits `ultracode: true`, then its own
+	// task prompt (agent-authored, no keyword in the text) hit the disarm branch
+	// and cleared the flag before the subagent could spawn anything -- so
+	// grandchild spawns silently dropped off the xhigh floor the notice promises.
+	it("leaves an inherited ultracode flag alone on an agent-authored turn", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		created.settings.override("ultracode", true);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("implement the thing described in the task brief", { attribution: "agent" });
+
+		expect(promptSpy).toHaveBeenCalled();
+		expect(created.settings.get("ultracode")).toBe(true);
+	});
+
+	// A keyword-free USER turn must still disarm, or the keyword would silently
+	// become session-scoped again.
+	it("still disarms ultracode on a keyword-free user turn", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		created.settings.override("ultracode", true);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("just a normal follow-up question");
+
+		expect(promptSpy).toHaveBeenCalled();
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	// Every notice the session queues MUST be a recognized hidden companion, or
+	// dequeue/clear walk past it: the user's prompt leaves and the hidden notice
+	// stays behind, uncounted, to be delivered ahead of a later unrelated turn.
+	// `ultracode-notice` was missing from that table while the other three were
+	// registered, so this enumerates from the session rather than hardcoding.
+	it("registers every queued keyword notice as a hidden user companion", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("ultracode and ultrathink and orchestrate and workflowz this");
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as AgentMessage[];
+		const notices = promptMessages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.display === false,
+		);
+		expect(notices.map(notice => notice.customType).sort()).toEqual([
+			"orchestrate-notice",
+			"ultracode-notice",
+			"ultrathink-notice",
+			"workflow-notice",
+		]);
+		for (const notice of notices) {
+			expect(MAGIC_KEYWORD_NOTICE_TYPES[notice.customType]).toBe(true);
+			expect(isHiddenUserCompanion(notice)).toBe(true);
+		}
 	});
 });
