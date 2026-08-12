@@ -1,6 +1,5 @@
-{{#if embedded}}<orchestration>
-Drive substantive work as a deterministic multi-subagent workflow. Default to `workpool()` for 2+ independent items; use individual `agent()` handles only for dependency-coupled or schema-returning calls.{{else}}<system-notice>
-User message contains **workflowz** → deterministic multi-subagent workflow. Default to `workpool()` for 2+ independent items; use individual `agent()` handles only for dependency-coupled or schema-returning calls.{{/if}}
+<system-notice>
+User message contains **workflowz** → deterministic multi-subagent workflow. Default to `workpool()` for 2+ independent items; use individual `agent()` handles only for dependency-coupled or schema-returning calls.
 
 <when>
 Use for broad research, reviews, migrations, adversarial coverage, and open-ended work lists. Quick lookup/single edit: direct; no agents. {{#if scoutAvailable}}Scout inline FIRST{{else}}Explore inline FIRST{{/if}} — scope files, call sites, and contracts before creating the pool.
@@ -107,4 +106,4 @@ Scale: `"find any bugs"` → small pool. `"thoroughly audit"` → broad pool + a
 - Pool output is evidence, not truth. Read artifacts, gate findings, run final verification yourself.
 - Continue until closed; a drained pool is a phase boundary, not task completion.
 </execution>
-{{#if embedded}}</orchestration>{{else}}</system-notice>{{/if}}
+</system-notice>
