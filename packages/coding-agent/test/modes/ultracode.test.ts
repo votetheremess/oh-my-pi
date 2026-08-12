@@ -133,13 +133,46 @@ describe("ultracode orchestration contract", () => {
 			expect(withTooling).toContain(helper);
 		}
 		// Worked scripts, not a list of names: the model has to see the shape.
-		expect(withTooling).toContain("await pipeline(");
 		expect(withTooling).toContain("await parallel(");
+		expect(withTooling).toContain("```js");
 	});
 
-	it("teaches pipeline over barrier, which is the costly mistake", () => {
-		expect(withTooling).toContain("DEFAULT TO pipeline()");
-		expect(withTooling).toContain("BARRIER");
+	it("describes both helpers as barriers, because both are", () => {
+		// The first build inherited Claude Code's claim that pipeline() streams
+		// items independently. In THIS runtime pipeline() runs one bounded pool per
+		// stage (src/eval/js/shared/prelude.txt), and prelude.py says so outright:
+		// "Every item clears stage N before any item enters stage N+1". Telling the
+		// model to reach for pipeline() to AVOID a barrier buys the barrier.
+		expect(withTooling).toContain("BARRIER PER STAGE");
+		expect(withTooling).not.toContain("DEFAULT TO pipeline()");
+		expect(withTooling).not.toContain("NO barrier between stages");
+		// The shape that does give independent per-item progress.
+		expect(withTooling).toContain("put the WHOLE per-item chain in one thunk");
+	});
+
+	it("tells the truth about failure propagation, which decides whether a fan-out survives", () => {
+		// agent() throws a ToolError on every failure path (src/eval/agent-bridge.ts)
+		// and parallel() re-raises the lowest-index error, discarding every result
+		// that succeeded (prelude.txt __pool). The notice used to promise null plus
+		// `.filter(Boolean)`, a defence that can never fire.
+		expect(withTooling).toContain("it never returns null");
+		expect(withTooling).toContain("discards the entire results array");
+		expect(withTooling).toContain("put the try/catch INSIDE each risky thunk");
+	});
+
+	it("documents the budget members in their real, awaitable form", () => {
+		// Every JS budget member is async: `budget.total` is a function object
+		// (always truthy) and remaining() returns a Promise, so the old guard
+		// `while (budget.total && budget.remaining() > 50_000)` never looped once.
+		expect(withTooling).toContain("await budget.total()");
+		expect(withTooling).toContain("await budget.remaining()");
+		expect(withTooling).not.toContain("while (budget.total && budget.remaining()");
+	});
+
+	it("spells the option name Python actually accepts", () => {
+		// prelude.py's agent() is keyword-only with no **kwargs, so schemaMode=...
+		// raises TypeError; the wire name is translated from schema_mode.
+		expect(withTooling).toContain("schema_mode");
 	});
 
 	it("carries the three-verdict adjudication, not a refute boolean", () => {
@@ -195,5 +228,59 @@ describe("ultracode orchestration contract", () => {
 		for (const notice of [withTooling, withoutTooling, ULTRACODE_NOTICE]) {
 			expect(notice).not.toContain("{{");
 		}
+	});
+});
+
+// A notice that misdescribes the runtime is worse than no notice: the model
+// writes code against it and the code fails. Everything the notice asserts
+// about this session has to come from this session.
+describe("ultracode notice renders live session facts", () => {
+	it("names scout only when scout can actually be spawned", () => {
+		expect(renderUltracodeNotice({ workflowAvailable: true, scoutAvailable: true })).toContain("`scout`");
+		// With task.disabledAgents: ["scout"] or a spawn policy that excludes it,
+		// naming scout hands the model an agent type that throws at preflight
+		// (src/task/structured-subagent.ts). Every sibling prompt gates it.
+		expect(renderUltracodeNotice({ workflowAvailable: true, scoutAvailable: false })).not.toContain("`scout`");
+	});
+
+	it("states the live concurrency cap instead of a hardcoded default", () => {
+		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 8 })).toContain(
+			"at most 8 thunks at once",
+		);
+		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 32 })).toContain(
+			"at most 32 thunks at once",
+		);
+		// 0 is "unlimited" for task.maxConcurrency, so any stated cap would be a
+		// lie -- and the system prompt in the same context window omits it too.
+		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 0 })).not.toContain("at most");
+	});
+
+	it("stops asserting the effort pin when the transport will discard it", () => {
+		const applied = renderUltracodeNotice({ workflowAvailable: true, effortApplied: true });
+		expect(applied).toContain("The harness has already applied it");
+		// With externalThinking on, upstream's forceReasoningOff strips reasoning
+		// before the request leaves, so the pin never reaches the wire. Asserting
+		// it anyway makes the failure unobservable from inside the turn -- the
+		// notice also forbids commenting on effort.
+		const suppressed = renderUltracodeNotice({ workflowAvailable: true, effortApplied: false });
+		expect(suppressed).not.toContain("The harness has already applied it");
+		expect(suppressed).toContain("externalThinking");
+		expect(suppressed).toContain("`think`");
+	});
+
+	it("leaves no handlebars behind in any combination of live facts", () => {
+		for (const scoutAvailable of [true, false])
+			for (const effortApplied of [true, false])
+				for (const maxConcurrency of [0, 8, 32])
+					for (const workflowAvailable of [true, false]) {
+						const notice = renderUltracodeNotice({
+							workflowAvailable,
+							scoutAvailable,
+							effortApplied,
+							maxConcurrency,
+						});
+						expect(notice).not.toContain("{{");
+						expect(notice).not.toContain("}}");
+					}
 	});
 });
