@@ -5251,10 +5251,30 @@ export class AgentSession {
 		return this.settings.get("magicKeywords.enabled") && this.settings.get(`magicKeywords.${keyword}`);
 	}
 
-	#createMagicKeywordNotices(text: string): CustomMessage[] {
-		const timestamp = Date.now();
+	/**
+	 * Apply any turn budget directive (`+50k`, `+50k!`) carried by `text`.
+	 *
+	 * Separate from `#createMagicKeywordNotices` because the two have different
+	 * gates: a budget directive is honored on any non-synthetic turn, while the
+	 * keywords are restricted to genuinely user-authored ones. Both call sites of
+	 * the keyword builder must call this too, or a budget typed into skill args
+	 * silently stops applying.
+	 */
+	#beginTurnBudgetFrom(text: string): void {
 		const turnBudget = parseTurnBudget(text);
 		this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
+	}
+
+	/**
+	 * Build the hidden steering notices for whichever magic keywords `text` carries.
+	 *
+	 * Callers MUST restrict this to genuinely user-authored turns. The ultracode
+	 * branch below has an unconditional `else` that disarms the keyword, so running
+	 * it on an agent-initiated prompt clears an inherited `ultracode: true` before
+	 * the subagent holding it can spawn anything.
+	 */
+	#createMagicKeywordNotices(text: string): CustomMessage[] {
+		const timestamp = Date.now();
 		const keywordNotices: CustomMessage[] = [];
 		// "ultracode" steers only the turn that carries it, like the other three
 		// keywords. Saying it once does not arm the session; the word has to be
@@ -5266,14 +5286,26 @@ export class AgentSession {
 			this.#models.beginUltracodeTurn();
 			// Ultracode carries the whole workflow contract, not a pointer to it: the
 			// instruction is useless without the helper API it orchestrates through.
-			// With `eval` or `task` inactive there is no fan-out mechanism, so the
-			// notice says so instead of prescribing tools that are not there.
+			// Every runtime fact the notice states is rendered from this session, so
+			// it cannot promise an agent type, a concurrency cap, or an effort level
+			// that this session will not actually deliver.
 			const ultracodeTools = this.getActiveToolNames();
+			// `externalThinking` swaps native reasoning for the think tool, and the
+			// transport now honors that via `forceReasoningOff`, so the xhigh pin set
+			// just above never reaches the wire. Say so rather than asserting it.
+			const ultracodeEffortApplied = !(
+				this.settings.get("externalThinking") &&
+				this.getEnabledToolNames().includes("think") &&
+				supportsExternalThinking(this.agent.state.model)
+			);
 			keywordNotices.push({
 				role: "custom",
 				customType: "ultracode-notice",
 				content: renderUltracodeNotice({
 					workflowAvailable: ultracodeTools.includes("task") && ultracodeTools.includes("eval"),
+					scoutAvailable: this.#isScoutAvailable(),
+					effortApplied: ultracodeEffortApplied,
+					maxConcurrency: this.settings.get("task.maxConcurrency"),
 				}),
 				display: false,
 				attribution: "user",
@@ -5379,10 +5411,21 @@ export class AgentSession {
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
 
+		// Turn budget directives (`+50k`, `+50k!`) are honored on every non-synthetic
+		// turn. They are not keywords and are deliberately outside the gate below.
+		if (!options?.synthetic) this.#beginTurnBudgetFrom(expandedText);
+
 		// Magic keywords ("ultracode", "ultrathink", "orchestrate", "workflowz"): append
 		// hidden system notices after the user's message that steer this turn.
-		// User-authored prompts only - synthetic / agent-initiated turns never trigger them.
-		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
+		// User-authored prompts only -- and `synthetic` alone does not express that.
+		// Three agent-initiated callers reach prompt() with `attribution: "agent"` and
+		// no `synthetic` flag: a subagent's own task text (task/executor.ts), the
+		// agentic commit session, and the agent dashboard. Running keywords there arms
+		// a turn the user never marked, and runs ultracode's disarm `else` on a
+		// subagent that inherited `ultracode: true`, silently dropping the xhigh floor
+		// for everything it goes on to spawn.
+		const userAuthoredTurn = !options?.synthetic && options?.attribution !== "agent";
+		const keywordNotices = userAuthoredTurn ? this.#createMagicKeywordNotices(expandedText) : [];
 
 		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
 		// re-enables advisor auto-resume that a prior user interrupt suppressed.
@@ -5515,6 +5558,9 @@ export class AgentSession {
 				if ("name" in details && typeof details.name === "string") skillName = details.name;
 				if ("args" in details && typeof details.args === "string") skillArgs = details.args;
 			}
+			// This branch already restricts itself to user-attributed skill prompts,
+			// so it is a user-authored turn by construction.
+			this.#beginTurnBudgetFrom(skillArgs);
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
 			this.maybeStartTitleGeneration(
 				skillPromptTitleInput({
