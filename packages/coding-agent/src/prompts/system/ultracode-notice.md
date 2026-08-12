@@ -1,5 +1,5 @@
 <system-notice>
-The user's message above contains the **ultracode** keyword, which applies to THIS TURN.
+{{#if viaPlanApproval}}You approved a plan for execution with **ultracode**, which applies to THIS TURN. The user chose it from the plan review rather than typing the word, so do not tell them to say it.{{else}}The user's message above contains the **ultracode** keyword, which applies to THIS TURN.{{/if}}
 
 <effort>
 {{#if effortApplied}}This turn and every subagent it spawns run at xhigh reasoning effort. The harness has already applied it. Do not try to lower it, do not budget around it, and do not comment on it in your output.{{else}}This turn is pinned to xhigh reasoning effort, but `externalThinking` is on: native reasoning is switched off at the transport and the `think` tool is your reasoning surface instead. So spend the effort deliberately through that tool rather than assuming a hidden reasoning pass happened. Do not comment on this in your output.{{/if}}

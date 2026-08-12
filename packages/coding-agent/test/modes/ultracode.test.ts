@@ -284,3 +284,46 @@ describe("ultracode notice renders live session facts", () => {
 					}
 	});
 });
+
+// Plan approval dispatches a SYNTHETIC prompt, and synthetic turns never scan for
+// keywords -- so an `ultracode` typed into the planning turn cannot reach the
+// execution turn, which is the phase that actually spawns subagents. The plan
+// review's "Approve and execute with ultracode" carries it across that boundary.
+describe("ultracode notice for an approved plan", () => {
+	const typed = renderUltracodeNotice({ workflowAvailable: true });
+	const approved = renderUltracodeNotice({ workflowAvailable: true, viaPlanApproval: true });
+
+	it("does not claim the user typed a word they picked from a menu", () => {
+		expect(typed).toContain("contains the **ultracode** keyword");
+		expect(approved).not.toContain("contains the **ultracode** keyword");
+		expect(approved).toContain("approved a plan");
+	});
+
+	it("still scopes itself to this turn, and still names the keyword", () => {
+		// Both paths are per-turn. Neither may imply the session is armed.
+		for (const notice of [typed, approved]) {
+			expect(notice).toContain("THIS TURN");
+			expect(notice).toContain("**ultracode**");
+			expect(notice).not.toContain("for the rest of the session");
+		}
+	});
+
+	it("tells the model not to ask the user to type the word", () => {
+		// The operator already opted in; "say ultracode" advice would be nonsense.
+		expect(approved).toContain("do not tell them to say it");
+	});
+
+	it("carries the identical contract on both paths, differing only in the trigger line", () => {
+		// The orchestration contract must not silently diverge between entry points.
+		const body = (notice: string): string => notice.split("\n").slice(2).join("\n");
+		expect(body(approved)).toBe(body(typed));
+	});
+
+	it("leaves no handlebars behind on the approval path", () => {
+		for (const workflowAvailable of [true, false]) {
+			const notice = renderUltracodeNotice({ workflowAvailable, viaPlanApproval: true });
+			expect(notice).not.toContain("{{");
+			expect(notice).not.toContain("}}");
+		}
+	});
+});
