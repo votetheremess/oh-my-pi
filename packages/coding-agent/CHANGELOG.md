@@ -63,6 +63,9 @@
 - Fixed retry-fallback selection switching to a fallback model with a context window too small to hold the current session context.
 - Fixed OpenCode discovery ignoring `opencode.jsonc` files and rejecting comments in `opencode.json`.
 - Fixed WSL2 startup hanging forever when the Windows interop pipe is wedged: the WSL host-home discovery probes (`cmd.exe`, `wslpath`) now run under a 500ms hard timeout and fall back to the Linux `$HOME`/`~/.omp` candidates ([#8402](https://github.com/can1357/oh-my-pi/issues/8402)).
+### Added
+
+- Added `ultracode`, a fourth magic keyword mirroring `ultrathink`/`orchestrate`/`workflowz` and turn-scoped like all three: the standalone word glows violet→magenta→gold in the editor, and it runs that turn, and every subagent it spawns, at xhigh reasoning effort. `ModelControls.beginUltracodeTurn()` pins the turn and the task executor pins its spawns, outranking the caller's `effort`, an agent's own pinned level (`scout`'s `medium`), and `task.maxEffort`; the hidden user-attributed `ultracode-notice` steers that turn into a multi-subagent workflow, carrying its own fuller port of the orchestration contract, not the `workflowz` notice. The next user turn without the word clears the never-persisted `ultracode` turn flag and `endUltracodeTurn()` hands the borrowed effort back, so the word must be repeated on any later message that wants the same treatment. The notice and the effort pin are gated by `magicKeywords.enabled` and `magicKeywords.ultracode` (both default `true`).
 
 ## [17.2.15] - 2026-08-12
 
@@ -246,9 +249,6 @@
 - Fixed parsing of POSIX `$EDITOR` commands that contain quoted arguments or executable paths with spaces.
 - Fixed persisted Agent Hub rows losing the explicit caller model role when a subagent used a model override, preserving role provenance across restarts.
 - Fixed unobserved promise rejections in browser helpers (such as `tab.waitForResponse()`) causing tab workers to hang or crash.
-### Added
-
-- Added `ultracode`, a fourth magic keyword alongside `ultrathink`/`orchestrate`/`workflowz` and the only session-scoped one: `AgentSession.#createMagicKeywordNotices` flips the new top-level `ultracode` setting through the never-persisted runtime override layer, so the opt-in dies with the session. While on, `ModelControls.forceUltracodeEffort()` re-pins the session to `Effort.XHigh` every user turn and `src/task/executor.ts` applies the same floor to every spawn, outranking the caller's `effort`, an agent's own pinned level (`scout`'s `medium`), and `task.maxEffort`; the hidden user-attributed `ultracode-notice` makes multi-subagent workflow orchestration the standing default. Gated by `magicKeywords.ultracode` (default `true`); the session flag `ultracode` defaults to `false`.
 
 ## [17.2.9] - 2026-08-05
 
