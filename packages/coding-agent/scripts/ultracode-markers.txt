@@ -1,0 +1,27 @@
+# Strings that prove a built bundle carries the local ultracode feature.
+#
+# ~/.omp/omp-sync.sh greps EVERY one of these in the bundle it just built and
+# refuses to install when any is missing; the shell wrapper greps them to decide
+# whether an `omp update` (or a stray `bun install -g`) has silently reverted the
+# patch. test/ultracode-markers.test.ts asserts each one still exists in src/, so
+# removing a marker fails here instead of quietly breaking the installer.
+#
+# Pick identifiers, never prose. The original markers were two English sentences
+# inside ultracode-notice.md; rewriting that prose came within one line of
+# breaking installation, with a failure message claiming the feature was absent.
+# Bundling preserves string literals but mangles local variable names, so a
+# settings path, a wire-level customType, or a user-visible label all survive --
+# an internal identifier would not.
+#
+# Blank lines and `#` comments are ignored.
+
+# Settings path. Changes only if the keyword's setting is renamed.
+magicKeywords.ultracode
+
+# Wire-level customType of the hidden notice, and the key that must appear in
+# MAGIC_KEYWORD_NOTICE_TYPES for dequeue/clear to see it.
+ultracode-notice
+
+# The plan-review option. Carries ultracode across the plan -> execute boundary,
+# which a synthetic execution turn cannot do via the keyword.
+Approve and execute with ultracode
