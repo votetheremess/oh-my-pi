@@ -1,5 +1,6 @@
 import { prompt } from "@oh-my-pi/pi-utils";
 import ultracodeNotice from "../prompts/system/ultracode-notice.md" with { type: "text" };
+import { normalizeConcurrencyLimit } from "../task/parallel";
 import { createGradientHighlighter, type KeywordHighlighter } from "./gradient-highlight";
 import { magicKeywordRegex } from "./magic-keyword-boundary";
 import { keywordInProse } from "./markdown-prose";
@@ -25,16 +26,44 @@ const ULTRACODE_WORD = magicKeywordRegex("ultracode");
  *
  * Carries a port of Claude Code's Workflow tool contract: the orchestration
  * doctrine, the script API mapped onto this harness's `eval` helpers, the
- * pipeline-over-barrier rules, the quality patterns, and the three-verdict
- * adjudication that keeps adversarial verification from destroying real
- * findings. Deliberately NOT the `workflowz` notice: that is this project's own
- * shorter prose, and the point of ultracode is the fuller contract.
+ * barrier rules, the quality patterns, and the three-verdict adjudication that
+ * keeps adversarial verification from destroying real findings. Deliberately
+ * NOT the `workflowz` notice: that is this project's own shorter prose, and the
+ * point of ultracode is the fuller contract.
  *
- * With `eval` or `task` inactive there is no fan-out mechanism, so the notice
- * says so plainly and keeps only the effort layer.
+ * Every claim the notice makes about the runtime is rendered from the live
+ * session, never hardcoded, because a notice that misdescribes the API is worse
+ * than no notice: the model writes code against it and the code fails.
+ * - `workflowAvailable` false: no `eval`/`task`, so no fan-out mechanism exists.
+ *   The notice says so and keeps only the effort layer.
+ * - `scoutAvailable` false: `scout` is disabled or outside the spawn policy, so
+ *   naming it would hand the model an agent type that throws at preflight.
+ * - `effortApplied` false: `externalThinking` has replaced native reasoning with
+ *   the think tool, and the transport honors that (`forceReasoningOff`), so the
+ *   xhigh pin never reaches the wire. The notice must not assert an effort the
+ *   request will not carry.
+ * - `maxConcurrency` is the live `task.maxConcurrency`; 0 means unbounded and
+ *   the cap sentence is omitted entirely, matching the system prompt.
  */
-export function renderUltracodeNotice({ workflowAvailable }: { workflowAvailable: boolean }): string {
-	return prompt.render(ultracodeNotice, { workflowAvailable }).trim();
+export function renderUltracodeNotice({
+	workflowAvailable,
+	scoutAvailable,
+	effortApplied,
+	maxConcurrency,
+}: {
+	workflowAvailable: boolean;
+	scoutAvailable?: boolean;
+	effortApplied?: boolean;
+	maxConcurrency?: number;
+}): string {
+	return prompt
+		.render(ultracodeNotice, {
+			workflowAvailable,
+			scoutAvailable: scoutAvailable ?? true,
+			effortApplied: effortApplied ?? true,
+			MAX_CONCURRENCY: normalizeConcurrencyLimit(maxConcurrency ?? 0),
+		})
+		.trim();
 }
 
 /** ULTRACODE_NOTICE is the default ultracode notice for sessions with workflow tooling live. */
