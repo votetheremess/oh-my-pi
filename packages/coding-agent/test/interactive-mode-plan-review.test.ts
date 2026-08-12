@@ -38,6 +38,21 @@ const isPlanApprovedCall = (args: unknown[]): boolean =>
 	args[1] !== null &&
 	(args[1] as { synthetic?: boolean }).synthetic === true;
 
+/**
+ * Pick a plan-review option by label prefix.
+ *
+ * Selecting by index silently re-targets a different branch whenever the menu
+ * gains an entry, which is exactly what happened when "Approve and execute with
+ * ultracode" was inserted. Prefix, because the keep-context label carries a
+ * live token count.
+ */
+const pickPlanOption = (options: readonly string[], prefix: string): string => {
+	const match = options.find(option => option.startsWith(prefix));
+	if (!match)
+		throw new Error(`no plan-review option starting with ${JSON.stringify(prefix)} in ${JSON.stringify(options)}`);
+	return match;
+};
+
 function usageWithInput(input: number): Usage {
 	return {
 		input,
@@ -740,6 +755,7 @@ describe("InteractiveMode plan review rendering", () => {
 			"Plan mode - next step",
 			[
 				"Approve and execute",
+				"Approve and execute with ultracode",
 				"Approve and compact context",
 				"Approve and keep context (~7.3k / 10k)",
 				"Refine plan",
@@ -815,6 +831,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(contextSpy).toHaveBeenCalledWith({ contextWindow: executionModel.contextWindow });
 		expect(selector.mock.calls[0]?.[2]).toEqual([
 			"Approve and execute",
+			"Approve and execute with ultracode",
 			"Approve and compact context",
 			`Approve and keep context (~${compactNumber(tokens)} / ${compactNumber(executionModel.contextWindow)})`,
 			"Refine plan",
@@ -841,9 +858,16 @@ describe("InteractiveMode plan review rendering", () => {
 			title: "PLAN",
 		});
 
-		expect(selector.mock.calls[0]?.[3]).toEqual(
+		// Assert the INVARIANT -- the disabled entry is the keep-context option --
+		// rather than a literal index, which silently re-targets a different option
+		// whenever the menu gains an entry.
+		const call = selector.mock.calls[0];
+		const menu = call?.[2] ?? [];
+		const keepContextIndex = menu.findIndex(option => option.startsWith("Approve and keep context"));
+		expect(keepContextIndex).toBeGreaterThanOrEqual(0);
+		expect(call?.[3]).toEqual(
 			expect.objectContaining({
-				disabledIndices: [2],
+				disabledIndices: [keepContextIndex],
 			}),
 		);
 	});
@@ -899,6 +923,7 @@ describe("InteractiveMode plan review rendering", () => {
 			"Plan mode - next step",
 			[
 				"Approve and execute",
+				"Approve and execute with ultracode",
 				"Approve and compact context",
 				"Approve and keep context",
 				"Refine plan",
@@ -1023,12 +1048,12 @@ describe("InteractiveMode plan review rendering", () => {
 			return true;
 		});
 		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
-		// Simulate a re-stream landing during the overlay, then pick keep-context
-		// (options[2]) — that branch skips clear/compact so `this.session` stays the
-		// instance the spies are on.
+		// Simulate a re-stream landing during the overlay, then pick keep-context —
+		// that branch skips clear/compact so `this.session` stays the instance the
+		// spies are on.
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => {
 			streaming = true;
-			return options[2];
+			return pickPlanOption(options, "Approve and keep context");
 		});
 		const errorSpy = vi.spyOn(mode, "showError");
 
@@ -1068,7 +1093,9 @@ describe("InteractiveMode plan review rendering", () => {
 			throw new AgentBusyError();
 		});
 		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
-		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => options[2]);
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
+			pickPlanOption(options, "Approve and keep context"),
+		);
 		const errorSpy = vi.spyOn(mode, "showError");
 
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
@@ -1130,7 +1157,9 @@ describe("InteractiveMode plan review rendering", () => {
 			mode.queueCompactionMessage("queued message", "followUp");
 			return undefined as never;
 		});
-		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => options[1]);
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
+			pickPlanOption(options, "Approve and compact context"),
+		);
 		const errorSpy = vi.spyOn(mode, "showError");
 
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
@@ -1176,6 +1205,62 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
 			synthetic: true,
 		});
+	});
+
+	// The execution turn is the phase that actually spawns subagents, and it is
+	// dispatched as a SYNTHETIC prompt — which never scans for magic keywords. So an
+	// `ultracode` typed into the planning turn cannot reach it; this option is the
+	// only way across that boundary.
+	it("arms ultracode for the execution turn when the operator picks it", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the work.");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
+			pickPlanOption(options, "Approve and execute with ultracode"),
+		);
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		// This is the flag src/task/executor.ts reads to floor every spawn of this
+		// turn at xhigh. Without it the approved plan executes cold.
+		expect(session.settings.get("ultracode")).toBe(true);
+
+		const [text, opts] = prompt.mock.calls[0] ?? [];
+		expect(opts).toEqual({ synthetic: true });
+		// The notice must lead, so the model reads the contract before the directive.
+		expect(text?.startsWith("<system-notice>")).toBe(true);
+		// And it must not claim the user typed a word they picked from a menu.
+		expect(text).toContain("approved a plan");
+		expect(text).not.toContain("contains the **ultracode** keyword");
+	});
+
+	it("leaves ultracode off on the plain approve-and-execute path", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the work.");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(session.settings.get("ultracode")).toBe(false);
+		const [text] = prompt.mock.calls[0] ?? [];
+		expect(text?.startsWith("<system-notice>")).toBe(false);
 	});
 
 	it("executes on the slider-selected tier, surviving #exitPlanMode's model restore", async () => {

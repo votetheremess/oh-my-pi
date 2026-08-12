@@ -5646,6 +5646,61 @@ export class AgentSession {
 	}
 
 	/**
+	 * Live session facts the ultracode notice renders from.
+	 *
+	 * Ultracode carries the whole workflow contract, not a pointer to it, so the
+	 * notice states concrete API facts. Every one is read from THIS session rather
+	 * than hardcoded, because a notice that promises an agent type, a concurrency
+	 * cap, or an effort level the session will not deliver is worse than no notice:
+	 * the model writes code against it and the code fails.
+	 */
+	#ultracodeNoticeFacts(): {
+		workflowAvailable: boolean;
+		scoutAvailable: boolean;
+		effortApplied: boolean;
+		maxConcurrency: number;
+	} {
+		const tools = this.getActiveToolNames();
+		return {
+			workflowAvailable: tools.includes("task") && tools.includes("eval"),
+			scoutAvailable: this.#isScoutAvailable(),
+			// `externalThinking` swaps native reasoning for the think tool, and the
+			// transport honors that via `forceReasoningOff`, so the xhigh pin never
+			// reaches the wire. Say so rather than asserting it was applied.
+			effortApplied: !(
+				this.settings.get("externalThinking") &&
+				this.getEnabledToolNames().includes("think") &&
+				supportsExternalThinking(this.agent.state.model)
+			),
+			maxConcurrency: this.settings.get("task.maxConcurrency"),
+		};
+	}
+
+	/**
+	 * Arm ultracode for a turn the user opted into WITHOUT typing the word, and
+	 * return the notice to carry on that turn.
+	 *
+	 * The only caller is the plan review's "Approve and execute with ultracode".
+	 * Plan approval dispatches a SYNTHETIC prompt, and synthetic turns never run
+	 * `#createMagicKeywordNotices`, so a typed keyword cannot reach the execution
+	 * turn: without this, approving an ultracode-planned task silently executes at
+	 * normal effort, which is the phase that actually spawns the subagents.
+	 *
+	 * Two ordering constraints, both load-bearing:
+	 * - Call AFTER any model restore. `#exitPlanMode` restores the pre-plan model
+	 *   state, which would revert the pinned level (the same hazard documented for
+	 *   `executionModel` in interactive-mode).
+	 * - The armed turn MUST be synthetic, so the disarm `else` branch never runs
+	 *   against it. The next keyword-free USER turn hands the borrowed effort back,
+	 *   exactly as it would for a typed `ultracode` turn.
+	 */
+	armUltracodeTurn(): string {
+		this.settings.override("ultracode", true);
+		this.#models.beginUltracodeTurn();
+		return renderUltracodeNotice({ ...this.#ultracodeNoticeFacts(), viaPlanApproval: true });
+	}
+
+	/**
 	 * Apply any turn budget directive (`+50k`, `+50k!`) carried by `text`.
 	 *
 	 * Separate from `#createMagicKeywordNotices` because the two have different
@@ -5678,29 +5733,10 @@ export class AgentSession {
 			// the task executor learns this turn's spawns run at the ultracode floor.
 			this.settings.override("ultracode", true);
 			this.#models.beginUltracodeTurn();
-			// Ultracode carries the whole workflow contract, not a pointer to it: the
-			// instruction is useless without the helper API it orchestrates through.
-			// Every runtime fact the notice states is rendered from this session, so
-			// it cannot promise an agent type, a concurrency cap, or an effort level
-			// that this session will not actually deliver.
-			const ultracodeTools = this.getActiveToolNames();
-			// `externalThinking` swaps native reasoning for the think tool, and the
-			// transport now honors that via `forceReasoningOff`, so the xhigh pin set
-			// just above never reaches the wire. Say so rather than asserting it.
-			const ultracodeEffortApplied = !(
-				this.settings.get("externalThinking") &&
-				this.getEnabledToolNames().includes("think") &&
-				supportsExternalThinking(this.agent.state.model)
-			);
 			keywordNotices.push({
 				role: "custom",
 				customType: "ultracode-notice",
-				content: renderUltracodeNotice({
-					workflowAvailable: ultracodeTools.includes("task") && ultracodeTools.includes("eval"),
-					scoutAvailable: this.#isScoutAvailable(),
-					effortApplied: ultracodeEffortApplied,
-					maxConcurrency: this.settings.get("task.maxConcurrency"),
-				}),
+				content: renderUltracodeNotice(this.#ultracodeNoticeFacts()),
 				display: false,
 				attribution: "user",
 				timestamp,
