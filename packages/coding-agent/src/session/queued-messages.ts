@@ -62,8 +62,18 @@ export function isUserQueuedMessage(message: AgentMessage): boolean {
 	return message.role === "custom" && message.attribution === "user" && message.display !== false;
 }
 
-/** Hidden magic-keyword notices queued alongside a user prompt. */
+/**
+ * Hidden magic-keyword notices queued alongside a user prompt.
+ *
+ * Every `customType` pushed by `#createMagicKeywordNotices` MUST appear here.
+ * A notice that is missing is invisible to both `isHiddenUserCompanion` and
+ * `isUserQueuedMessage` (which requires `display !== false`), so dequeue and
+ * clear walk straight past it: the user's prompt leaves the queue and the
+ * hidden notice stays behind, uncounted, to be delivered ahead of some later
+ * unrelated turn.
+ */
 export const MAGIC_KEYWORD_NOTICE_TYPES: Record<string, true> = {
+	"ultracode-notice": true,
 	"ultrathink-notice": true,
 	"orchestrate-notice": true,
 	"workflow-notice": true,
