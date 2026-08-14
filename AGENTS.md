@@ -308,7 +308,8 @@ each release tag. Nothing here exists upstream.
 
 **How it reaches the running binary.** `~/.omp/omp-sync.sh` (invoked by `omp update`
 through a fish function in `~/.config/fish/functions/omp.fish`) rebases the branch onto
-the newest release tag, runs omp's own updater with `--force`, rebuilds via
+the newest release tag, runs omp's own updater with `--force`, typechecks and runs the
+test files named in `packages/coding-agent/scripts/ultracode-tests.txt`, rebuilds via
 `bun run gen:bundle`, and copies `dist/cli.js` over the installed npm bundle. Plain
 `omp update` would install the unpatched npm bundle and silently delete the feature,
 which is the only reason the wrapper exists.
@@ -327,6 +328,17 @@ which is the only reason the wrapper exists.
   marker surviving only in a doc comment is absent from the shipped bundle.
 - Bundling preserves string literals but mangles local identifiers, so markers must be
   settings paths, `customType` values, or UI labels — never internal symbol names.
+- **Markers prove the strings shipped, never that the feature works.** A textually clean
+  rebase can still break the fork: on v17.3.2 upstream changed
+  `createMagicKeywordSession` to take a `ModelRegistry` instead of a temp-dir path and
+  stopped returning `authStorage`, the fork's added tests kept passing the old argument,
+  and 15 tests failed while all three markers sat present in the installed bundle. So
+  installs are gated on `check:types` plus `scripts/ultracode-tests.txt`. That list is
+  repo-owned and `test/ultracode-markers.test.ts` fails when a listed path is missing or
+  when an ultracode-named test file is absent from the list — a hand-maintained gate that
+  quietly stops covering things is worse than no gate. `omp-sync.sh` likewise refuses an
+  empty list. Keep the list narrow: upstream ships test files that already fail on a
+  clean checkout, so gating on the full suite would block updates on someone else's red.
 - Keep the branch's footprint out of files upstream churns. Measure before adding a
   hunk: `git log --oneline <prev-tag>..<tag> -- <file> | wc -l`. `CHANGELOG.md` saw 23
   commits in a single release window and is deliberately left untouched;
@@ -349,7 +361,8 @@ binary and there is no `dist/cli.js` to patch. The bundle-swap approach ends the
 `bun run build` (compiled binary) is the migration path. `omp-sync.sh` detects this and
 says so rather than failing obscurely.
 
-**Recovery refs.** `ultracode-verified-2026-08-12` tags a fully verified state. The
+**Recovery refs.** `ultracode-verified-2026-08-13` tags the current fully verified state
+(14 commits on `v17.3.2`); `ultracode-verified-2026-08-12` tags the previous one. The
 branch `feat/ultracode-keyword-pre-sync` is NOT a backup of latest work — the script
 moves it only when a rebase actually runs, so it can lag many commits. Check
 `git log --oneline <ref>..HEAD` before trusting either.
