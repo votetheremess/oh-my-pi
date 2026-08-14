@@ -20,10 +20,20 @@ import * as path from "node:path";
 
 const PKG_ROOT = path.resolve(import.meta.dir, "..");
 const MARKERS_FILE = path.join(PKG_ROOT, "scripts/ultracode-markers.txt");
+const TESTS_FILE = path.join(PKG_ROOT, "scripts/ultracode-tests.txt");
 
 /** Parse the marker list the installer reads: one per line, `#` comments and blanks dropped. */
 async function readMarkers(): Promise<string[]> {
 	const raw = await fs.readFile(MARKERS_FILE, "utf8");
+	return raw
+		.split("\n")
+		.map(line => line.trim())
+		.filter(line => line.length > 0 && !line.startsWith("#"));
+}
+
+/** Parse the installer's test list, same one-per-line format as the markers. */
+async function readTestList(): Promise<string[]> {
+	const raw = await fs.readFile(TESTS_FILE, "utf8");
 	return raw
 		.split("\n")
 		.map(line => line.trim())
@@ -100,5 +110,48 @@ describe("ultracode installer marker contract", () => {
 			expect(marker.length).toBeLessThanOrEqual(48);
 			expect(marker).not.toMatch(/[.!?]$/);
 		}
+	});
+});
+
+/**
+ * The other half of the installer contract: which tests must pass before a build
+ * is allowed to replace the working install.
+ *
+ * The marker list proves strings survived bundling. It does not prove the feature
+ * works -- and after the v17.3.2 rebase that difference cost real breakage: all
+ * three markers were present while 15 tests were failing, because upstream changed
+ * `createMagicKeywordSession` from taking a temp-dir path to taking a
+ * `ModelRegistry` and the fork's added tests still passed the old argument.
+ */
+describe("ultracode installer test contract", () => {
+	it("lists at least one test file, so an empty list cannot pass as a green gate", async () => {
+		const tests = await readTestList();
+		expect(tests.length).toBeGreaterThan(0);
+	});
+
+	it("points every listed path at a file that exists", async () => {
+		const tests = await readTestList();
+		const missing: string[] = [];
+		for (const rel of tests) {
+			const exists = await fs
+				.stat(path.join(PKG_ROOT, rel))
+				.then(() => true)
+				.catch(() => false);
+			if (!exists) missing.push(rel);
+		}
+		// A renamed or deleted test file otherwise turns the gate into a no-op:
+		// `bun test` on a path that does not exist is not a failure worth trusting.
+		expect(missing).toEqual([]);
+	});
+
+	it("covers every ultracode-named test file, so adding one cannot shrink the gate", async () => {
+		const tests = new Set(await readTestList());
+		const glob = new Bun.Glob("test/**/*ultracode*.test.ts");
+		const found: string[] = [];
+		for await (const rel of glob.scan({ cwd: PKG_ROOT })) found.push(rel);
+		// Guard the guard: a glob that suddenly matches nothing would make the
+		// subset check below vacuously true.
+		expect(found.length).toBeGreaterThan(0);
+		expect(found.filter(rel => !tests.has(rel))).toEqual([]);
 	});
 });
