@@ -222,9 +222,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("appends the ultracode notice and turns ultracode on for the session", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		expect(created.settings.get("ultracode")).toBe(false);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
@@ -244,9 +244,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("ships the orchestration contract in the ultracode notice when the tools are live", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("please ultracode this refactor");
@@ -264,9 +264,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("keeps ultracode on but drops the fan-out contract when eval is inactive", async () => {
-		const created = await createMagicKeywordSession(root, [mockTaskTool]);
+		const created = await createMagicKeywordSession(modelRegistry, [mockTaskTool]);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("please ultracode this refactor");
@@ -285,9 +285,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("does not carry the ultracode notice into a later keyword-free turn", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("please ultracode this refactor");
@@ -300,9 +300,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("re-arms whenever the word comes back", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("please ultracode this refactor");
@@ -315,9 +315,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("refuses to let a persisted ultracode:true arm a keyword-free turn", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		created.settings.set("ultracode", true);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
@@ -331,9 +331,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("appends a single ultracode notice when the keyword repeats while the flag is set", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		created.settings.override("ultracode", true);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
@@ -344,9 +344,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("honors the per-keyword ultracode toggle", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		created.settings.set("magicKeywords.ultracode", false);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
@@ -358,9 +358,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("does not turn ultracode on when magic keywords are disabled outright", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		created.settings.set("magicKeywords.enabled", false);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
@@ -372,9 +372,9 @@ describe("AgentSession magic keyword settings", () => {
 	});
 
 	it("never lets a synthetic turn trigger the ultracode keyword", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("please ultracode this refactor", { synthetic: true });
@@ -388,9 +388,9 @@ describe("AgentSession magic keyword settings", () => {
 	// prompt() with `attribution: "agent"` and no synthetic flag -- notably a
 	// subagent's own task text in task/executor.ts.
 	it("never lets an agent-authored turn trigger the ultracode keyword", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("please ultracode this refactor", { attribution: "agent" });
@@ -405,9 +405,9 @@ describe("AgentSession magic keyword settings", () => {
 	// and cleared the flag before the subagent could spawn anything -- so
 	// grandchild spawns silently dropped off the xhigh floor the notice promises.
 	it("leaves an inherited ultracode flag alone on an agent-authored turn", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		created.settings.override("ultracode", true);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
@@ -420,9 +420,9 @@ describe("AgentSession magic keyword settings", () => {
 	// A keyword-free USER turn must still disarm, or the keyword would silently
 	// become session-scoped again.
 	it("still disarms ultracode on a keyword-free user turn", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		created.settings.override("ultracode", true);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
@@ -438,9 +438,9 @@ describe("AgentSession magic keyword settings", () => {
 	// `ultracode-notice` was missing from that table while the other three were
 	// registered, so this enumerates from the session rather than hardcoding.
 	it("registers every queued keyword notice as a hidden user companion", async () => {
-		const created = await createMagicKeywordSession(root);
+		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
-		authStorage = created.authStorage;
+
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("ultracode and ultrathink and orchestrate and workflowz this");
