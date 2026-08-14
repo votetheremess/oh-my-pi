@@ -1,0 +1,29 @@
+# Test files that must pass before the out-of-tree installer will install a build.
+#
+# `~/.omp/omp-sync.sh` runs every file listed here (plus `check:types`) before it
+# builds and copies a bundle over the working install. The marker list next door
+# only proves some strings survived bundling; it says nothing about whether the
+# feature still WORKS. That gap was not theoretical: after the rebase onto
+# v17.3.2 all three markers were present in the installed bundle while 15 tests
+# in agent-session-magic-keywords.test.ts were broken, because upstream had
+# changed a fixture's signature underneath the fork's added tests. A marker-only
+# gate installed that happily.
+#
+# Scope deliberately excludes the wider suite. Upstream ships a handful of test
+# files that already fail on a clean checkout, so gating an update on `bun test`
+# as a whole would block every future update on someone else's red test. These
+# files are ours or directly adjacent, and all of them pass on the fork.
+#
+# `test/ultracode-markers.test.ts` asserts each path below exists AND that every
+# test file whose name mentions ultracode appears here, so adding a test file and
+# forgetting this list fails in the repo instead of quietly shrinking the gate.
+#
+# Paths are relative to packages/coding-agent. Blank lines and `#` comments are ignored.
+
+test/ultracode-markers.test.ts
+test/ultracode-turn-effort.test.ts
+test/ultracode-subagent-effort.test.ts
+test/agent-session-magic-keywords.test.ts
+test/modes/ultracode.test.ts
+test/modes/magic-keywords.test.ts
+test/interactive-mode-plan-review.test.ts
