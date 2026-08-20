@@ -400,8 +400,10 @@ binary and there is no `dist/cli.js` to patch. The bundle-swap approach ends the
 `bun run build` (compiled binary) is the migration path. `omp-sync.sh` detects this and
 says so rather than failing obscurely.
 
-**Recovery refs.** `ultracode-verified-2026-08-20` tags the current fully verified state
-(15 commits on `v17.4.0`); the dated tags before it mark earlier verified states. The
-branch `feat/ultracode-keyword-pre-sync` is NOT a backup of latest work — the script
-moves it only when a rebase actually runs, so it can lag many commits. Check
-`git log --oneline <ref>..HEAD` before trusting any of them.
+**Recovery refs.** The newest `ultracode-verified-<date>` tag marks the last state whose
+gate was actually green; older dated tags mark earlier ones. Deliberately no commit count
+here — an earlier revision of this line carried one and the very commit that wrote it made
+it stale. The branch `feat/ultracode-keyword-pre-sync` is NOT a backup of latest work: the
+script moves it only when a rebase actually runs, so it can lag many commits. Resolve any
+of them with `git log --oneline <ref>..HEAD` before trusting it, and re-point the newest
+tag at HEAD after the last commit of a session, never before.
