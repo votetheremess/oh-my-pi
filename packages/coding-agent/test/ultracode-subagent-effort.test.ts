@@ -88,6 +88,10 @@ function yieldEmittingSession(): AgentSession {
 		abort: async () => {},
 		dispose: async () => {},
 		setIrcWakeTurnObserver: () => {},
+		// v17.4.0 (`fix(hub): prevented stale agent refs from blocking wait`) made the agent
+		// registry mirror run-state on every spawn, so `runSubprocess` now calls this on the
+		// session it is handed. Returns an unsubscribe, matching the real signature.
+		subscribeRunState: (_listener: (state: "running" | "idle") => void) => () => {},
 	};
 	return session as unknown as AgentSession;
 }
