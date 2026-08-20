@@ -339,6 +339,27 @@ which is the only reason the wrapper exists.
   quietly stops covering things is worse than no gate. `omp-sync.sh` likewise refuses an
   empty list. Keep the list narrow: upstream ships test files that already fail on a
   clean checkout, so gating on the full suite would block updates on someone else's red.
+- **Faking `AgentSession` is a recurring tax, once per release or so.**
+  `test/ultracode-subagent-effort.test.ts` hands `runSubprocess` a hand-rolled fake
+  session behind `as unknown as AgentSession`. That opaque cast is upstream's own house
+  pattern in ~50 test files, so the compiler cannot flag a missing member, and upstream
+  updates its fakes in the same commit that adds a method — a sweep this out-of-tree
+  fixture is invisible to. v17.4.0 (`fix(hub): prevented stale agent refs from blocking
+  wait`) made the agent registry mirror run-state on every spawn, so `syncSessionStatus`
+  called `session.subscribeRunState()` and killed all ten spawns. Fix by adding the
+  member to the stub, matching the real signature.
+  - Diagnosing it is the slow part, because `runSubprocess` catches the TypeError and
+    reports only `exitCode: 1`. The symptom is every assertion in the file failing on
+    exit code, *including* the `ultracode: false` controls — that pattern means the
+    harness died, not the feature. Dump the whole result object (`stderr` and `error`
+    carry the stack) instead of reading the effort logic.
+  - Do NOT make the stub tolerate unknown members with a Proxy returning noops. Tried
+    and reverted: any predicate-shaped member then reads truthy forever, hanging an
+    internal wait loop so the suite stalls with no output at all. A stub that breaks
+    loudly once per release beats a clever one that can hang.
+  - A failed gate leaves the install on plain upstream, because the script runs omp's
+    real updater before rebuilding: `--status` reads `ultracode : ABSENT` until the gate
+    is green again. That is the gate working, not a second bug.
 - Keep the branch's footprint out of files upstream churns. Measure before adding a
   hunk: `git log --oneline <prev-tag>..<tag> -- <file> | wc -l`. `CHANGELOG.md` saw 23
   commits in a single release window and is deliberately left untouched;
@@ -361,8 +382,8 @@ binary and there is no `dist/cli.js` to patch. The bundle-swap approach ends the
 `bun run build` (compiled binary) is the migration path. `omp-sync.sh` detects this and
 says so rather than failing obscurely.
 
-**Recovery refs.** `ultracode-verified-2026-08-13` tags the current fully verified state
-(14 commits on `v17.3.2`); `ultracode-verified-2026-08-12` tags the previous one. The
+**Recovery refs.** `ultracode-verified-2026-08-20` tags the current fully verified state
+(15 commits on `v17.4.0`); the dated tags before it mark earlier verified states. The
 branch `feat/ultracode-keyword-pre-sync` is NOT a backup of latest work — the script
 moves it only when a rebase actually runs, so it can lag many commits. Check
-`git log --oneline <ref>..HEAD` before trusting either.
+`git log --oneline <ref>..HEAD` before trusting any of them.
