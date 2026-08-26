@@ -390,8 +390,8 @@ describe("AgentSession magic keyword settings", () => {
 		expect(created.settings.get("ultracode")).toBe(false);
 	});
 
-	// `synthetic` was the only gate, but three agent-initiated callers reach
-	// prompt() with `attribution: "agent"` and no synthetic flag -- notably a
+	// `synthetic` alone is not the gate: three agent-initiated callers reach
+	// prompt() with `attribution: "agent"` and no synthetic flag — notably a
 	// subagent's own task text in task/executor.ts.
 	it("never lets an agent-authored turn trigger the ultracode keyword", async () => {
 		const created = await createMagicKeywordSession(modelRegistry);
@@ -406,10 +406,11 @@ describe("AgentSession magic keyword settings", () => {
 		expect(created.settings.get("ultracode")).toBe(false);
 	});
 
-	// The depth-2 effort bug: a subagent inherits `ultracode: true`, then its own
-	// task prompt (agent-authored, no keyword in the text) hit the disarm branch
-	// and cleared the flag before the subagent could spawn anything -- so
-	// grandchild spawns silently dropped off the xhigh floor the notice promises.
+	// The depth-2 effort hazard: a subagent inherits `ultracode: true`, and its
+	// own task prompt (agent-authored, no keyword in the text) must not hit the
+	// disarm branch and clear the flag before the subagent can spawn anything —
+	// otherwise grandchild spawns silently drop off the xhigh floor the notice
+	// promises.
 	it("leaves an inherited ultracode flag alone on an agent-authored turn", async () => {
 		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
@@ -493,9 +494,9 @@ describe("AgentSession magic keyword settings", () => {
 		expect(created.settings.get("ultracode")).toBe(false);
 	});
 
-	// ...nor run the keyword builder's unconditional disarm `else` against an
-	// armed inherited flag — the skill-prompt twin of the depth-2 effort bug
-	// above. Loosening the user-attribution gate fails here.
+	// ...nor run the keyword builder's disarm `else` against an armed inherited
+	// flag — the skill-prompt twin of the depth-2 effort hazard above. Loosening
+	// the user-attribution gate fails here.
 	it("leaves an inherited ultracode flag alone on an agent-attributed skill steer", async () => {
 		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;

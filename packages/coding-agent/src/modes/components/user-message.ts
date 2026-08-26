@@ -50,8 +50,8 @@ export class UserMessageComponent extends Container implements ReactionTarget {
 		text = collapseImageMarkers(text, Number.POSITIVE_INFINITY, () => {});
 		const bgColor = (value: string) => theme.bg("userMessageBg", value);
 		this.#bgColor = bgColor;
-		// Paint the magic keywords ("ultrathink"/"orchestrate"/"workflowz") inside the rendered
-		// bubble too — matching the live editor glow. The Markdown component routes code spans and
+		// Paint the magic keywords ("ultrathink"/"orchestrate"/"workflowz"/"ultracode") inside the
+		// rendered bubble too — matching the live editor glow. The Markdown component routes code spans and
 		// fenced blocks through its own code styling (never `color`), so those are already excluded;
 		// `highlightMagicKeywords` additionally restores the bubble's own foreground after each
 		// painted keyword so the gradient never bleeds into the rest of the line.
