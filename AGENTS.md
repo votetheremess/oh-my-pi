@@ -370,7 +370,8 @@ lock anyone out. Retired machinery lives in `~/.omp/retired/`.
   stock updates instead, which pins the bundle world and doubles as total recovery
   (`bun install -g @oh-my-pi/pi-coding-agent@latest`). The fish wrapper routes
   `omp update` accordingly; non-fish `omp update` is the one remaining foot-gun.
-- Patch detection greps the identifiers in `packages/coding-agent/scripts/ultracode-markers.txt`.
+- Install-time feature verification (`verify_markers`) greps the identifiers in
+  `packages/coding-agent/scripts/ultracode-markers.txt` against the freshly built bundle.
   Never use prose as a marker: the original markers were two sentences inside
   `ultracode-notice.md` and a copy edit nearly broke installation, with a message
   claiming the feature was missing. `test/ultracode-markers.test.ts` enforces the
@@ -428,6 +429,17 @@ lock anyone out. Retired machinery lives in `~/.omp/retired/`.
   "Approve and execute with ultracode" in the plan review exists for. Arm effort only
   AFTER `#exitPlanMode`, which restores the pre-plan model and would revert the pin.
 
+**Deliberate deviations from official Claude Code's ultracode (2.1.211), recorded so no
+audit re-litigates them:** (i) CC's keyword is a turn-scoped orchestration opt-in ONLY —
+it never changes reasoning effort; xhigh there comes solely from the separate
+session-scoped `/effort ultracode` mode. The fork deliberately fuses the two onto the
+keyword: a turn-scoped xhigh pin replacing CC's dropped session mode. (ii) CC scans the
+pre-expansion prompt and never fires on a slash-prefixed one; the fork scans the expanded
+text (upstream's pre-existing pattern for the other three keywords), so a slash-command or
+template body and skill args can deliberately carry the keyword — code-span masking keeps
+a backticked mention inert. (iii) Intended, not a leak: a subagent spawned by an ultracode
+turn stays pinned for its whole lifetime, even if it outlives the turn.
+
 **Recovery refs.** The newest `ultracode-verified-<date>` tag marks the last state whose
 gate was actually green; older dated tags mark earlier ones. Deliberately no commit count
 here — an earlier revision of this line carried one and the very commit that wrote it made
@@ -437,16 +449,22 @@ of them with `git log --oneline <ref>..HEAD` before trusting it, and re-point th
 tag at HEAD after the last commit of a session, never before.
 
 **Upstream watch (verified 2026-08-25, tags v17.4.0→v18.0.5).** Upstream has no
-ultracode equivalent and gained none in that window: the keyword machinery, all three
-notice files, and the effort plumbing are byte-identical across the tags; `orchestrate`
+ultracode equivalent and gained none in that window: the keyword machinery and all three
+notice files are byte-identical across the tags, and the effort plumbing nearly so —
+`model-controls.ts` gained `setScopedModels` in that window (additive, nowhere near the
+fork's turn-pin seam); `orchestrate`
 and `workflowz` remain prompt-only (no effort or subagent side effects); `ultrathink`'s
 effort effect exists only under auto-thinking (stateless per-turn reclassification); the
 eval `agent()` bridge exposes no effort parameter at all, and upstream's merged effort
 policy is a per-spawn CEILING (`task.maxEffort`, #6794) — the opposite direction of the
-fork's pin. Watch items: issue #2159 (open request for exactly this feature), PR #5117
+fork's pin. Watch items: issue #2159 (the closest open request — a session-wide,
+session-persistent ultracode-parity mode; the fork deliberately ships the turn-scoped
+keyword variant instead), PR #5117
 ("Ultra reasoning mode" — open, unmerged, weaker: session-persistent, no subagent pin,
 no workflow contract), #7962 (plan-approval orchestration mode — the fork's plan-review
 option's slot), #7963 (keyword-consolidation RFC, undecided). PLAN: after the fork setup
-is re-verified end-to-end, propose upstreaming the feature as a PR answering #2159 —
+is re-verified end-to-end, propose upstreaming the feature as a PR answering #2159, with
+a description that says it answers the issue's ultracode-parity spirit while rejecting
+its central session-persistence ask —
 ONLY with the user's explicit approval, which has not been given yet; strip this whole
 FORK-LOCAL section from any PR branch.

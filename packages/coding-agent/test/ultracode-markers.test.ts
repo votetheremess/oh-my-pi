@@ -1,12 +1,14 @@
 /**
- * The marker contract between this repo and the out-of-tree installer.
+ * The marker contract between this repo and the out-of-tree update script.
  *
- * `~/.omp/omp-sync.sh` decides "does this bundle carry ultracode?" by grepping
- * the strings in `scripts/ultracode-markers.txt`. If a marker stops existing in
- * `src/`, the installer refuses to install a bundle that is actually fine, with a
- * message claiming the feature is missing -- and the shell wrapper's self-heal
- * reapplies the patch on every single invocation because it also thinks the
- * bundle reverted. Both failures point at the wrong thing.
+ * `~/.omp/ultracode-update.sh` (`verify_markers`) decides "does this freshly
+ * built bundle carry ultracode?" by grepping the strings in
+ * `scripts/ultracode-markers.txt`, and refuses to apply the build when any is
+ * missing. If a marker stops existing in `src/`, that install-time gate rejects
+ * a bundle that is actually fine, with a message claiming the feature is
+ * missing. (The fish wrapper is NOT a consumer: it gates on launcher-symlink +
+ * VERSION only and deliberately has no self-heal, so a stale marker can only
+ * refuse an update — never loop a reapply.)
  *
  * That is not hypothetical: the original markers were two prose sentences inside
  * `ultracode-notice.md`, and a rewrite of that prose came one line away from
@@ -83,7 +85,9 @@ describe("ultracode installer marker contract", () => {
 
 	it("keeps every marker unique to the ultracode feature", async () => {
 		// A marker that also appears in stock upstream code cannot distinguish a
-		// patched bundle from a pristine one, so the self-heal would never fire.
+		// bundle carrying the feature from a pristine stock one, so the update
+		// script's install-time verify_markers gate would pass a build the rebase
+		// had silently reverted.
 		const markers = await readMarkers();
 		const texts = await sourceTexts();
 		for (const marker of markers) {
@@ -114,8 +118,8 @@ describe("ultracode installer marker contract", () => {
 });
 
 /**
- * The other half of the installer contract: which tests must pass before a build
- * is allowed to replace the working install.
+ * The other half of the update-script contract: which tests must pass before
+ * `~/.omp/ultracode-update.sh` will apply a freshly built bundle.
  *
  * The marker list proves strings survived bundling. It does not prove the feature
  * works -- and after the v17.3.2 rebase that difference cost real breakage: all
@@ -153,5 +157,27 @@ describe("ultracode installer test contract", () => {
 		// subset check below vacuously true.
 		expect(found.length).toBeGreaterThan(0);
 		expect(found.filter(rel => !tests.has(rel))).toEqual([]);
+	});
+
+	it("pins the gate files whose names do not say ultracode, so deleting one from the list goes red", async () => {
+		// The glob check above re-derives only ultracode-NAMED files; these three
+		// carry the keyword-firing, session-lifecycle, and plan-review coverage
+		// and would otherwise drop out of the gate without any test noticing.
+		const pinned = [
+			"test/agent-session-magic-keywords.test.ts",
+			"test/modes/magic-keywords.test.ts",
+			"test/interactive-mode-plan-review.test.ts",
+		];
+		const listed = new Set(await readTestList());
+		expect(pinned.filter(rel => !listed.has(rel))).toEqual([]);
+		// Each pinned file must still exercise the feature: one that no longer
+		// mentions ultracode is renamed coverage or dead weight, and this pin
+		// should be re-decided rather than silently kept.
+		const unrelated: string[] = [];
+		for (const rel of pinned) {
+			const text = await fs.readFile(path.join(PKG_ROOT, rel), "utf8");
+			if (!/ultracode/i.test(text)) unrelated.push(rel);
+		}
+		expect(unrelated).toEqual([]);
 	});
 });
