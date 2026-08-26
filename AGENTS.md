@@ -334,7 +334,8 @@ silently delete the feature, which is the only reason the wrapper exists.
 
 **Binary era (since v18.0.5).** Upstream ships majors as standalone compiled binaries:
 `shouldForceBinaryUpdate` in `src/cli/update-cli.ts` returns true when the new release's
-major version exceeds the current one (or the release is marked binary-only), and
+major version exceeds the current one (an explicit `omp.dist` in the release metadata
+wins in both directions: `"binary"` forces it, any other value suppresses it), and
 `updateViaBinaryAt` then downloads the digest-verified release binary and swaps it in AT
 THE LAUNCHER PATH — on this machine `~/.bun/bin/omp`, which until the v18 switch was a
 bun symlink into the npm package. The npm package dir under
