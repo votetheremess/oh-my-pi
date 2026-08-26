@@ -324,47 +324,60 @@ This checkout is not a plain clone: `origin` is upstream (`can1357/oh-my-pi`) an
 branch `feat/ultracode-keyword` carries a local `ultracode` magic keyword rebased onto
 each release tag. Nothing here exists upstream.
 
-**How it reaches the running binary.** `~/.omp/omp-sync.sh` (invoked by `omp update`
-through a fish function in `~/.config/fish/functions/omp.fish`) rebases the branch onto
-the newest release tag, runs omp's own updater with `--force`, typechecks and runs the
-test files named in `packages/coding-agent/scripts/ultracode-tests.txt`, compiles a
-patched binary via `bun run build`, and swaps it in at the launcher path
-(`~/.bun/bin/omp`). Plain `omp update` would install the unpatched official binary and
-silently delete the feature, which is the only reason the wrapper exists.
+**How it reaches the running omp (zero-stock-mutation, since 2026-08-25).** Stock omp is
+installed by bun as the npm bundle (`~/.bun/bin/omp` symlink →
+`<pkg>/dist/cli.js`) and is NEVER modified — not the launcher, not the package, not any
+file bun installed. The fork is one ADDED subdirectory inside the installed package:
+`<pkg>/dist/ultracode/`, the `bun run gen:bundle` output built from this checkout plus a
+`VERSION` stamp. The fish wrapper (`~/.config/fish/functions/omp.fish`) runs that bundle
+(`bun <pkg>/dist/ultracode/cli.js`) only when the launcher is still bun's symlink AND the
+stamp matches the installed package version; on any doubt it runs `command omp`. There is
+deliberately NO self-heal: if something reinstalls stock and wipes the subdir, omp keeps
+working feature-less until `omp update` re-applies. The worst state this design can
+produce is "stock omp, feature absent" — never a broken omp. `omp update` routes to
+`~/.omp/ultracode-update.sh`: fetch → rebase onto the npm-latest tag (rerere) → gate
+(typecheck + `scripts/ultracode-tests.txt`) → `bun install -g
+@oh-my-pi/pi-coding-agent@<latest>` (pins the bundle world; also the universal recovery
+command) → gen:bundle → stage + atomic rename into the subdir → session-boot smoke, with
+`rm -rf` of the subdir on any post-install failure. Sibling files (templates, docs-index)
+ship inside the subdir; `@oh-my-pi/pi-natives` resolves up the node_modules tree to the
+npm-published prebuilt, so the bundle can never pair with mismatched natives. Non-fish
+invocations (scripts, other agents) always run stock. `--remove` deletes the subdir.
 
-**Binary era (since v18.0.5).** Upstream ships majors as standalone compiled binaries:
-`shouldForceBinaryUpdate` in `src/cli/update-cli.ts` returns true when the new release's
-major version exceeds the current one (an explicit `omp.dist` in the release metadata
-wins in both directions: `"binary"` forces it, any other value suppresses it), and
-`updateViaBinaryAt` then downloads the digest-verified release binary and swaps it in AT
-THE LAUNCHER PATH — on this machine `~/.bun/bin/omp`, which until the v18 switch was a
-bun symlink into the npm package. The npm package dir under
-`~/.bun/install/global/node_modules/` is inert from then on, and there is no
-`dist/cli.js` to patch. The fork's install step is therefore `bun run build`
-(`scripts/build-binary.ts`, ad-hoc codesigned on macOS, output `dist/omp`) and a
-temp+`mv` swap at the launcher path — `mv` because a `cp` onto the pre-switch symlink
-would follow it into the dead package instead of replacing the launcher. Markers are
-string literals, so the same `grep -F` detection works on the compiled binary as worked
-on the bundle; the install gate additionally smoke-runs `--version` on both the built
-and the installed binary, which a marker grep cannot cover (truncated or unsigned
-Mach-O). The bundle-era script survives at `~/.omp/omp-sync.sh.bundle-era` for
-archaeology only.
+**Incident, 2026-08-25 (why the two prior carry designs are retired).** The bundle-era
+design patched stock `dist/cli.js` in place; at v18 its updater path expired (majors
+switch the launcher to a standalone binary — `shouldForceBinaryUpdate`, where an explicit
+`omp.dist` wins in both directions) and the replacement design compiled a binary locally
+(`bun run build`) and swapped it in at the launcher. That binary embedded a STALE local
+`pi_natives` build (version-sentinel mismatch), passed `--version`, `--help`, and all
+three marker greps, and then crashed at session-module import on every real launch: omp
+was unusable until stock was reinstalled by hand. The self-heal made it worse, not
+better: markers present + stamp matched meant the healer called the broken install
+healthy. Lessons, each load-bearing in the current design: (1) never install a locally
+compiled binary — run the bundle under bun inside the published package so natives are
+npm's own; (2) never modify a stock artifact — additive-only, so every failure degrades
+to stock; (3) `--version` is not a boot test — the gate's acceptance is a headless
+session boot (`timeout 15 bun cli.js </dev/null` + crash-signature grep), proven to
+catch the incident artifact and pass a good bundle before it was trusted; (4) no
+auto-heal — a wrapper that can only choose between two intact artifacts cannot loop or
+lock anyone out. Retired machinery lives in `~/.omp/retired/`.
 
 **Rules that are load-bearing, learned the hard way:**
 
-- `--force` is mandatory when calling omp's updater from the script. The patched binary
-  bakes in the upstream version, so the updater's own check reports "already up to date"
-  and installs nothing. The bypass is `comparison <= 0 && !opts.force` in
-  `src/cli/update-cli.ts`.
+- NEVER run stock `omp update` (or omp's updater in any form) on this machine: on a
+  major bump it replaces the bun symlink launcher with a standalone binary, which ends
+  the bundle world the fork rides in. `ultracode-update.sh` uses `bun install -g` for
+  stock updates instead, which pins the bundle world and doubles as total recovery
+  (`bun install -g @oh-my-pi/pi-coding-agent@latest`). The fish wrapper routes
+  `omp update` accordingly; non-fish `omp update` is the one remaining foot-gun.
 - Patch detection greps the identifiers in `packages/coding-agent/scripts/ultracode-markers.txt`.
   Never use prose as a marker: the original markers were two sentences inside
   `ultracode-notice.md` and a copy edit nearly broke installation, with a message
   claiming the feature was missing. `test/ultracode-markers.test.ts` enforces the
   contract — it strips comment lines first, because the bundler strips comments and a
   marker surviving only in a doc comment is absent from the shipped bundle.
-- Compilation (like bundling before it) preserves string literals but mangles local
-  identifiers, so markers must be settings paths, `customType` values, or UI labels —
-  never internal symbol names.
+- Bundling preserves string literals but mangles local identifiers, so markers must be
+  settings paths, `customType` values, or UI labels — never internal symbol names.
 - **Markers prove the strings shipped, never that the feature works.** A textually clean
   rebase can still break the fork: on v17.3.2 upstream changed
   `createMagicKeywordSession` to take a `ModelRegistry` instead of a temp-dir path and
@@ -373,9 +386,10 @@ archaeology only.
   installs are gated on `check:types` plus `scripts/ultracode-tests.txt`. That list is
   repo-owned and `test/ultracode-markers.test.ts` fails when a listed path is missing or
   when an ultracode-named test file is absent from the list — a hand-maintained gate that
-  quietly stops covering things is worse than no gate. `omp-sync.sh` likewise refuses an
-  empty list. Keep the list narrow: upstream ships test files that already fail on a
-  clean checkout, so gating on the full suite would block updates on someone else's red.
+  quietly stops covering things is worse than no gate. `ultracode-update.sh` likewise
+  refuses an empty list. Keep the list narrow: upstream ships test files that already
+  fail on a clean checkout, so gating on the full suite would block updates on someone
+  else's red.
 - **Faking `AgentSession` is a recurring tax, once per release or so.**
   `test/ultracode-subagent-effort.test.ts` hands `runSubprocess` a hand-rolled fake
   session behind `as unknown as AgentSession`. That opaque cast is upstream's own house
@@ -394,9 +408,11 @@ archaeology only.
     and reverted: any predicate-shaped member then reads truthy forever, hanging an
     internal wait loop so the suite stalls with no output at all. A stub that breaks
     loudly once per release beats a clever one that can hang.
-  - A failed gate leaves the install on plain upstream, because the script runs omp's
-    real updater before rebuilding: `--status` reads `ultracode : ABSENT` until the gate
-    is green again. That is the gate working, not a second bug.
+  - Gate failures cost nothing: `ultracode-update.sh` gates BEFORE touching the stock
+    install, so the previous stock+fork pair stays active. Only a post-install boot-smoke
+    failure removes the fork subdir — `--status` then reads `ultracode : ABSENT` and fish
+    runs stock until the gate is green again. Either way that is the gate working, not a
+    second bug.
 - Keep the branch's footprint out of files upstream churns. Measure before adding a
   hunk: `git log --oneline <prev-tag>..<tag> -- <file> | wc -l`. `CHANGELOG.md` saw 23
   commits in a single release window and is deliberately left untouched;
@@ -419,3 +435,18 @@ it stale. The branch `feat/ultracode-keyword-pre-sync` is NOT a backup of latest
 script moves it only when a rebase actually runs, so it can lag many commits. Resolve any
 of them with `git log --oneline <ref>..HEAD` before trusting it, and re-point the newest
 tag at HEAD after the last commit of a session, never before.
+
+**Upstream watch (verified 2026-08-25, tags v17.4.0→v18.0.5).** Upstream has no
+ultracode equivalent and gained none in that window: the keyword machinery, all three
+notice files, and the effort plumbing are byte-identical across the tags; `orchestrate`
+and `workflowz` remain prompt-only (no effort or subagent side effects); `ultrathink`'s
+effort effect exists only under auto-thinking (stateless per-turn reclassification); the
+eval `agent()` bridge exposes no effort parameter at all, and upstream's merged effort
+policy is a per-spawn CEILING (`task.maxEffort`, #6794) — the opposite direction of the
+fork's pin. Watch items: issue #2159 (open request for exactly this feature), PR #5117
+("Ultra reasoning mode" — open, unmerged, weaker: session-persistent, no subagent pin,
+no workflow contract), #7962 (plan-approval orchestration mode — the fork's plan-review
+option's slot), #7963 (keyword-consolidation RFC, undecided). PLAN: after the fork setup
+is re-verified end-to-end, propose upstreaming the feature as a PR answering #2159 —
+ONLY with the user's explicit approval, which has not been given yet; strip this whole
+FORK-LOCAL section from any PR branch.
