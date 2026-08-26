@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { Agent, AgentBusyError, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -21,7 +22,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
+import { AUTO_THINKING, clampAutoThinkingEffort } from "@oh-my-pi/pi-coding-agent/thinking";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
 import { formatNumber, TempDir } from "@oh-my-pi/pi-utils";
@@ -1298,6 +1299,84 @@ describe("InteractiveMode plan review rendering", () => {
 		// The load-bearing assertion: the approved plan executes on the operator's
 		// selected tier, not the restored default.
 		expect(session.model?.id).toBe(slow.id);
+	});
+
+	it("arms ultracode only after #exitPlanMode's restore and the executionModel application", async () => {
+		// The ordering constraint #approvePlan documents as load-bearing:
+		// `armUltracodeTurn()` must run LAST — after #exitPlanMode (which
+		// restores the pre-plan model state, thinking level included) and after
+		// #applyPlanExecutionModel (which applies the slider tier, thinking
+		// suffix included). Hoisting the arming above either call still leaves
+		// `settings.ultracode` true, the prompt synthetic, and the notice
+		// already rendered — every assertion in the arming test above passes —
+		// while the restore/application reverts the pinned LEVEL and the
+		// approved plan executes cold. Capturing the level AT DISPATCH makes
+		// either hoist fail here.
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const slow = session.modelRegistry.find("anthropic", "claude-opus-4-5");
+		const def = session.modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!slow || !def) throw new Error("Expected sonnet + opus to exist in registry");
+
+		// plan === default === the session model, so plan-mode entry records the
+		// previous-model state #exitPlanMode restores. The slow tier carries an
+		// explicit `:low` suffix so #applyPlanExecutionModel also sets a
+		// concrete non-pin level — both reverters are live in this scenario.
+		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
+		session.settings.setModelRole("slow", "anthropic/claude-opus-4-5:low");
+		session.settings.setModelRole("plan", "anthropic/claude-sonnet-4-5");
+		// A concrete pre-plan level distinct from the pin: the restore target.
+		session.setThinkingLevel(ThinkingLevel.Low);
+
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nExecute at the ultracode floor.");
+
+		await mode.handlePlanModeCommand();
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		expect(session.model?.id).toBe(def.id);
+
+		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+
+		// The pin the arming applies on the final (slow-tier) model. Guard that
+		// the fixture can distinguish a reverted level from the pin at all.
+		const expectedPin = clampAutoThinkingEffort(slow, Effort.XHigh);
+		expect(expectedPin).toBeDefined();
+		expect(expectedPin).not.toBe(ThinkingLevel.Low);
+
+		let levelAtDispatch: ThinkingLevel | undefined;
+		vi.spyOn(session, "prompt").mockImplementation(async () => {
+			levelAtDispatch = session.thinkingLevel;
+			return true;
+		});
+
+		vi.spyOn(mode, "showPlanReview").mockImplementation(
+			async (_planContent, _title, options, _dialogOptions, extra?: { slider?: HookSelectorSlider }) => {
+				const slider = extra?.slider;
+				expect(slider).toBeDefined();
+				const slowIndex = slider!.segments.findIndex(segment => segment.label === "slow");
+				expect(slowIndex).toBeGreaterThanOrEqual(0);
+				// Slide to the slow tier AND pick the ultracode option: the
+				// execution turn must land on slow's model at the pinned effort.
+				slider!.onChange?.(slowIndex);
+				return pickPlanOption(options, "Approve and execute with ultracode");
+			},
+		);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		// The tier survived the exit-plan-mode restore (as the executionModel
+		// test above already guarantees)...
+		expect(session.model?.id).toBe(slow.id);
+		// ...and the execution turn dispatched on the PIN — not the restored
+		// pre-plan `low` (arming hoisted above #exitPlanMode) and not the slow
+		// tier's explicit `:low` suffix (arming hoisted above
+		// #applyPlanExecutionModel).
+		expect(levelAtDispatch).toBe(expectedPin);
+		expect(session.settings.get("ultracode")).toBe(true);
 	});
 
 	it("retains the plan model when the slider selection matches the active plan tier", async () => {

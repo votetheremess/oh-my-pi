@@ -11,7 +11,11 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	type CustomMessage,
+	SKILL_PROMPT_MESSAGE_TYPE,
+	type SkillPromptDetails,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
 import { isHiddenUserCompanion, MAGIC_KEYWORD_NOTICE_TYPES } from "@oh-my-pi/pi-coding-agent/session/queued-messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
@@ -222,7 +226,7 @@ describe("AgentSession magic keyword settings", () => {
 		expect(noticeIdx).toBeLessThan(userIdx);
 	});
 
-	it("appends the ultracode notice and turns ultracode on for the session", async () => {
+	it("appends the ultracode notice and arms the ultracode turn flag", async () => {
 		const created = await createMagicKeywordSession(modelRegistry);
 		session = created.session;
 
@@ -240,7 +244,8 @@ describe("AgentSession magic keyword settings", () => {
 		const notice = promptMessages.find(message => message.customType === "ultracode-notice");
 		expect(notice?.display).toBe(false);
 		expect(notice?.attribution).toBe("user");
-		// The keyword is a session opt-in, not a per-turn nudge.
+		// The override is turn state, not a session preference: armed by the
+		// carrying turn, cleared by the next keyword-free user turn.
 		expect(created.settings.get("ultracode")).toBe(true);
 	});
 
@@ -428,6 +433,105 @@ describe("AgentSession magic keyword settings", () => {
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 
 		await session.prompt("just a normal follow-up question");
+
+		expect(promptSpy).toHaveBeenCalled();
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	// A keyword typed as /skill ARGUMENTS fires through the same notice builder
+	// as a plain prompt: promptCustomMessage routes a user-attributed skill
+	// prompt's args into the keyword scan. Severing that callsite (or dropping
+	// ultracode from it) ships green through every plain-prompt test above —
+	// this is the only gated coverage of the skill-args firing path.
+	it("arms ultracode from user-attributed skill args", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		const details: SkillPromptDetails = {
+			name: "deep-work",
+			path: "/skills/deep-work/SKILL.md",
+			args: "ultracode the refactor",
+			lineCount: 1,
+		};
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: `Skill body\n\nUser: ${details.args}`,
+			display: true,
+			details,
+			attribution: "user",
+		});
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		// The notice precedes the skill body, exactly like a typed keyword's
+		// notice precedes the user message.
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([
+			"ultracode-notice",
+			SKILL_PROMPT_MESSAGE_TYPE,
+		]);
+		expect(created.settings.get("ultracode")).toBe(true);
+	});
+
+	// Skill prompts the harness injects itself (autoloads, subagent skill
+	// injection) carry `attribution: "agent"`. Their args are not user-authored
+	// text and must neither arm the keyword...
+	it("never lets an agent-attributed skill prompt's args trigger ultracode", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "Skill body",
+			display: false,
+			details: { name: "autoload", path: "/skills/autoload/SKILL.md", args: "ultracode the refactor" },
+			attribution: "agent",
+		});
+
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([SKILL_PROMPT_MESSAGE_TYPE]);
+		expect(created.settings.get("ultracode")).toBe(false);
+	});
+
+	// ...nor run the keyword builder's unconditional disarm `else` against an
+	// armed inherited flag — the skill-prompt twin of the depth-2 effort bug
+	// above. Loosening the user-attribution gate fails here.
+	it("leaves an inherited ultracode flag alone on an agent-attributed skill steer", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+
+		created.settings.override("ultracode", true);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "Skill body",
+			display: false,
+			details: { name: "autoload", path: "/skills/autoload/SKILL.md", args: "carry on with the brief" },
+			attribution: "agent",
+		});
+
+		expect(promptSpy).toHaveBeenCalled();
+		expect(created.settings.get("ultracode")).toBe(true);
+	});
+
+	// A keyword-free USER-attributed skill turn is still a user turn: it must
+	// hand the borrowed effort back, or firing a skill would silently extend an
+	// ultracode turn past the message that carried the word.
+	it("disarms ultracode on a keyword-free user-attributed skill prompt", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+
+		created.settings.override("ultracode", true);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "Skill body",
+			display: true,
+			details: { name: "deep-work", path: "/skills/deep-work/SKILL.md", args: "just do the next step" },
+			attribution: "user",
+		});
 
 		expect(promptSpy).toHaveBeenCalled();
 		expect(created.settings.get("ultracode")).toBe(false);

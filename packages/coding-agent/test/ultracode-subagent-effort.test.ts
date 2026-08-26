@@ -18,12 +18,16 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { runEvalAgent } from "@oh-my-pi/pi-coding-agent/eval/agent-bridge";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, type TaskEffort } from "@oh-my-pi/pi-coding-agent/thinking";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 function modelOrThrow(provider: Parameters<typeof getBundledModel>[0], id: string): Model {
@@ -307,5 +311,126 @@ describe("ultracode subagent effort pin", () => {
 		// Forcing xhigh onto a model that cannot express it would be an invalid
 		// level downstream; the agent's own selector must survive instead.
 		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+});
+
+/**
+ * The pin chokepoint (`runSubprocess`) is only as good as the plumbing above
+ * it: `buildExecutorOptions` in structured-subagent.ts hands the PARENT
+ * session's live settings — runtime override layer included — to the executor.
+ * The tests below enter at the two real frontends ABOVE that seam (the eval
+ * `agent()` bridge and a task-kind `runStructuredSubagent` call) instead of
+ * hand-building executor options the way `spawn` does, so a regression that
+ * gives those spawns derivative or clean settings (dropping the override)
+ * fails HERE even though every direct-`runSubprocess` test above stays green.
+ *
+ * Plain object, not a Proxy: only the members the structured-subagent seam and
+ * the executor actually read, each matching the real ToolSession signature.
+ */
+function frontendToolSession(options: { model: Model; ultracode?: boolean }): ToolSession {
+	const settings = Settings.isolated();
+	// Flipped exactly the way the keyword flips it: the non-persisted runtime layer.
+	if (options.ultracode) settings.override("ultracode", true);
+	settings.setModelRole("task", `${options.model.provider}/${options.model.id}`);
+	return {
+		cwd: "/tmp",
+		settings,
+		modelRegistry: createModelRegistry(options.model),
+		getSessionSpawns: () => "*",
+		getSessionFile: () => null,
+		enableLsp: false,
+		enableIrc: false,
+		enableMCP: false,
+	} as unknown as ToolSession;
+}
+
+function mockFrontendSpawnSeams() {
+	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [baseAgent], projectAgentsDir: null });
+	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(yieldEmittingSession()));
+}
+
+describe("ultracode pin through the real spawn frontends", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("pins an eval agent() spawn to xhigh end-to-end through the bridge", async () => {
+		const spy = mockFrontendSpawnSeams();
+		const session = frontendToolSession({ model: FULL_LADDER, ultracode: true });
+
+		await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+
+		expect(spy).toHaveBeenCalledTimes(1);
+		const forwarded = spy.mock.calls[0]?.[0];
+		// Fails if the bridge or buildExecutorOptions stops handing the parent's
+		// live settings through runStructuredSubagent (e.g. eval spawns given a
+		// derivative/clean Settings): the pin computation at the chokepoint then
+		// reads `ultracode: false` and this spawn dispatches cold.
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		// The same severing also breaks inheritance: the child's settings
+		// snapshot is taken from what the frontend forwarded.
+		expect(forwarded?.settings?.get("ultracode")).toBe(true);
+	});
+
+	it("leaves an eval agent() spawn unpinned when ultracode is off", async () => {
+		const spy = mockFrontendSpawnSeams();
+		const session = frontendToolSession({ model: FULL_LADDER });
+
+		await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+
+		// The control: proves the pin above came from the parent's live flag,
+		// not from anything constant about the eval path.
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.thinkingLevel).toBeUndefined();
+		expect(forwarded?.settings?.get("ultracode")).toBe(false);
+	});
+
+	it("pins a task-kind structured-subagent spawn identically", async () => {
+		const spy = mockFrontendSpawnSeams();
+		const session = frontendToolSession({ model: FULL_LADDER, ultracode: true });
+
+		await runStructuredSubagent({ session, invocationKind: "task", assignment: "do work", agent: "task" });
+
+		// Fails if the task-kind settings plumbing above runSubprocess diverges
+		// from the eval kind — the "one seam covers both" claim, tested for both.
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.settings?.get("ultracode")).toBe(true);
+	});
+});
+
+// The grandchild middle link. The pin tests above prove the parent's flag pins
+// the CHILD's level, and agent-session-magic-keywords proves an armed child
+// keeps an inherited flag through its agent-authored turn — but only the
+// whole-schema snapshot in createSubagentSettings connects the two. If that
+// seam force-cleared `ultracode` — a plausible edit, since the adjacent block
+// already force-sets "tools.approvalMode" and "advisor.enabled", and the
+// schema comment calls the flag turn state, not a preference — grandchildren
+// would silently lose the xhigh floor while every level assertion above
+// stayed green. These fail on exactly that severing.
+describe("ultracode override inheritance into child settings", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("carries the runtime ultracode override into the child settings snapshot", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-inherits-into-child",
+			model: FULL_LADDER,
+			ultracode: true,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.settings?.get("ultracode")).toBe(true);
+	});
+
+	it("spawns children with the flag off when the parent turn is not armed", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-not-inherited-when-off",
+			model: FULL_LADDER,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.settings?.get("ultracode")).toBe(false);
 	});
 });
