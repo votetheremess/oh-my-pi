@@ -158,6 +158,12 @@ describe("ultracode orchestration contract", () => {
 		expect(withTooling).toContain("it never returns null");
 		expect(withTooling).toContain("discards the entire results array");
 		expect(withTooling).toContain("put the try/catch INSIDE each risky thunk");
+		// The budget throw is gated on `turnBudget?.hard` (agent-bridge.ts): only a
+		// `+Nk!`/Goal-Mode ceiling refuses the spawn. The notice used to claim ANY
+		// exhausted budget throws, inviting the model to skip its own
+		// budget.remaining() gate under a soft +Nk that enforces nothing.
+		expect(withTooling).toContain("hits a hard (`+Nk!`/Goal Mode) budget ceiling THROWS");
+		expect(withTooling).not.toContain("exhausts the turn budget");
 	});
 
 	it("documents the budget members in their real, awaitable form", () => {
@@ -167,6 +173,21 @@ describe("ultracode orchestration contract", () => {
 		expect(withTooling).toContain("await budget.total()");
 		expect(withTooling).toContain("await budget.remaining()");
 		expect(withTooling).not.toContain("while (budget.total && budget.remaining()");
+		// The advisory/hard split must travel with the API: a plain +Nk is enforced
+		// by nobody, so the notice has to say self-limit rather than letting the
+		// model believe agent() polices it.
+		expect(withTooling).toContain("A plain `+Nk` target is advisory");
+		expect(withTooling).toContain("refuse to spawn");
+	});
+
+	it("describes phase() as a status line, not an agent-row grouper", () => {
+		// The renderer never nests agent rows under phases: eval-render.ts draws
+		// "phase" as one standalone line in a flat status list and EXCLUDES agent
+		// events from that stream entirely (they get their own flat tree). The old
+		// wording promised `agent()` calls would group under the phase -- a display
+		// behavior nothing implements.
+		expect(withTooling).toContain("following status lines appear under it");
+		expect(withTooling).not.toContain("`agent()` calls group under it");
 	});
 
 	it("spells the option name Python actually accepts", () => {
@@ -257,13 +278,20 @@ describe("ultracode notice renders live session facts", () => {
 
 	it("stops asserting the effort pin when the transport will discard it", () => {
 		const applied = renderUltracodeNotice({ workflowAvailable: true, effortApplied: true });
-		expect(applied).toContain("The harness has already applied it");
+		expect(applied).toContain("The harness has already pinned");
+		// beginUltracodeTurn no-ops on non-reasoning models and reasoning models
+		// with no controllable effort surface, and on ladders without xhigh it pins
+		// the clamped level instead (model-controls.ts). The renderer cannot see
+		// which case it is, so the applied branch must carry the hedge in its own
+		// text rather than assert an unconditional, unclamped xhigh pin.
+		expect(applied).toContain("clamped to each model's own ladder");
+		expect(applied).toContain("one with no effort control runs unchanged");
 		// With externalThinking on, upstream's forceReasoningOff strips reasoning
 		// before the request leaves, so the pin never reaches the wire. Asserting
 		// it anyway makes the failure unobservable from inside the turn -- the
 		// notice also forbids commenting on effort.
 		const suppressed = renderUltracodeNotice({ workflowAvailable: true, effortApplied: false });
-		expect(suppressed).not.toContain("The harness has already applied it");
+		expect(suppressed).not.toContain("The harness has already pinned");
 		expect(suppressed).toContain("externalThinking");
 		expect(suppressed).toContain("`think`");
 	});
