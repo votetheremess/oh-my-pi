@@ -313,11 +313,12 @@ Setting-gated, off by default: `github`, `security_scan`, `generate_image`, `tts
 
 ### Prompt controls
 
-Three standalone, lowercase words opt a turn into specialized agent behavior:
+Four standalone, lowercase words opt a turn into specialized agent behavior:
 
 - `ultrathink` — request careful multi-step reasoning and the highest supported automatic thinking effort.
 - `orchestrate` — run substantial independent work through parallel subagents and verify each phase.
 - `workflowz` — build a deterministic multi-subagent workflow with the active `task` tool.
+- `ultracode` — pin the turn and every subagent it spawns to maximum reasoning effort and make scripted multi-agent workflows the default for that turn (switch: `magicKeywords.ultracode`).
 
 They trigger only in prose, not inside code spans, fenced code blocks, XML/HTML sections, identifiers, or paths. See [Magic keywords](docs/magic-keywords.md) for exact matching rules and configuration.
 
