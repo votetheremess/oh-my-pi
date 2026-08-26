@@ -1,10 +1,14 @@
 # Strings that prove a built bundle carries the local ultracode feature.
 #
-# ~/.omp/omp-sync.sh greps EVERY one of these in the bundle it just built and
-# refuses to install when any is missing; the shell wrapper greps them to decide
-# whether an `omp update` (or a stray `bun install -g`) has silently reverted the
-# patch. test/ultracode-markers.test.ts asserts each one still exists in src/, so
-# removing a marker fails here instead of quietly breaking the installer.
+# ~/.omp/ultracode-update.sh (verify_markers) greps EVERY one of these in the
+# bundle it just built and refuses to apply when any is missing — fail closed:
+# an unreadable or empty list means "cannot verify", never "verified". Nothing
+# else reads this file. In particular the fish wrapper never greps markers: it
+# gates only on the launcher symlink and the VERSION stamp, and it deliberately
+# has NO self-heal — the worst state the carry design can produce is stock omp
+# with the feature absent. test/ultracode-markers.test.ts asserts each marker
+# still exists in src/, so removing a marker fails here instead of quietly
+# breaking the update script.
 #
 # Pick identifiers, never prose. The original markers were two English sentences
 # inside ultracode-notice.md; rewriting that prose came within one line of
