@@ -327,14 +327,31 @@ each release tag. Nothing here exists upstream.
 **How it reaches the running binary.** `~/.omp/omp-sync.sh` (invoked by `omp update`
 through a fish function in `~/.config/fish/functions/omp.fish`) rebases the branch onto
 the newest release tag, runs omp's own updater with `--force`, typechecks and runs the
-test files named in `packages/coding-agent/scripts/ultracode-tests.txt`, rebuilds via
-`bun run gen:bundle`, and copies `dist/cli.js` over the installed npm bundle. Plain
-`omp update` would install the unpatched npm bundle and silently delete the feature,
-which is the only reason the wrapper exists.
+test files named in `packages/coding-agent/scripts/ultracode-tests.txt`, compiles a
+patched binary via `bun run build`, and swaps it in at the launcher path
+(`~/.bun/bin/omp`). Plain `omp update` would install the unpatched official binary and
+silently delete the feature, which is the only reason the wrapper exists.
+
+**Binary era (since v18.0.5).** Upstream ships majors as standalone compiled binaries:
+`shouldForceBinaryUpdate` in `src/cli/update-cli.ts` returns true when the new release's
+major version exceeds the current one (or the release is marked binary-only), and
+`updateViaBinaryAt` then downloads the digest-verified release binary and swaps it in AT
+THE LAUNCHER PATH — on this machine `~/.bun/bin/omp`, which until the v18 switch was a
+bun symlink into the npm package. The npm package dir under
+`~/.bun/install/global/node_modules/` is inert from then on, and there is no
+`dist/cli.js` to patch. The fork's install step is therefore `bun run build`
+(`scripts/build-binary.ts`, ad-hoc codesigned on macOS, output `dist/omp`) and a
+temp+`mv` swap at the launcher path — `mv` because a `cp` onto the pre-switch symlink
+would follow it into the dead package instead of replacing the launcher. Markers are
+string literals, so the same `grep -F` detection works on the compiled binary as worked
+on the bundle; the install gate additionally smoke-runs `--version` on both the built
+and the installed binary, which a marker grep cannot cover (truncated or unsigned
+Mach-O). The bundle-era script survives at `~/.omp/omp-sync.sh.bundle-era` for
+archaeology only.
 
 **Rules that are load-bearing, learned the hard way:**
 
-- `--force` is mandatory when calling omp's updater from the script. The patched bundle
+- `--force` is mandatory when calling omp's updater from the script. The patched binary
   bakes in the upstream version, so the updater's own check reports "already up to date"
   and installs nothing. The bypass is `comparison <= 0 && !opts.force` in
   `src/cli/update-cli.ts`.
@@ -344,8 +361,9 @@ which is the only reason the wrapper exists.
   claiming the feature was missing. `test/ultracode-markers.test.ts` enforces the
   contract — it strips comment lines first, because the bundler strips comments and a
   marker surviving only in a doc comment is absent from the shipped bundle.
-- Bundling preserves string literals but mangles local identifiers, so markers must be
-  settings paths, `customType` values, or UI labels — never internal symbol names.
+- Compilation (like bundling before it) preserves string literals but mangles local
+  identifiers, so markers must be settings paths, `customType` values, or UI labels —
+  never internal symbol names.
 - **Markers prove the strings shipped, never that the feature works.** A textually clean
   rebase can still break the fork: on v17.3.2 upstream changed
   `createMagicKeywordSession` to take a `ModelRegistry` instead of a temp-dir path and
@@ -392,13 +410,6 @@ which is the only reason the wrapper exists.
   keywords, so a typed keyword cannot reach the execution turn. That is what
   "Approve and execute with ultracode" in the plan review exists for. Arm effort only
   AFTER `#exitPlanMode`, which restores the pre-plan model and would revert the pin.
-
-**Known expiry.** `shouldForceBinaryUpdate` in `src/cli/update-cli.ts` returns true when
-the new release's major version exceeds the current one, or when a release is marked
-binary-only. At omp 18 the updater replaces the bun script launcher with a standalone
-binary and there is no `dist/cli.js` to patch. The bundle-swap approach ends there;
-`bun run build` (compiled binary) is the migration path. `omp-sync.sh` detects this and
-says so rather than failing obscurely.
 
 **Recovery refs.** The newest `ultracode-verified-<date>` tag marks the last state whose
 gate was actually green; older dated tags mark earlier ones. Deliberately no commit count
