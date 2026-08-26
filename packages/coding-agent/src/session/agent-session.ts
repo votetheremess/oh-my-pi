@@ -325,6 +325,7 @@ import {
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
 import {
+	attachQueuedMessageDeliveryEffect,
 	isAdvisorCard,
 	isDisplayableQueuedMessage,
 	isHiddenUserCompanion,
@@ -1215,7 +1216,11 @@ export class AgentSession {
 			textOutputCommitted: () => this.#textOutputCommitted,
 			thinkingLevel: () => this.thinkingLevel,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
-			setThinkingLevel: level => this.setThinkingLevel(level),
+			// Retry fallback is an automated recovery, not the user reaching for the
+			// effort control: bypass the session wrapper's ultracode off-ramp so a
+			// transient fallback mid-ultracode-turn cannot drop the pending handback
+			// or the subagent floor.
+			setThinkingLevel: level => this.#models.setThinkingLevel(level),
 			thinkingLevelCeiling: () => this.#models.thinkingLevelCeiling,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
@@ -5802,12 +5807,40 @@ export class AgentSession {
 	}
 
 	/**
-	 * Build the hidden steering notices for whichever magic keywords `text` carries.
+	 * Arm or disarm the per-turn ultracode state for a user-authored turn
+	 * carrying `text`.
 	 *
-	 * Callers MUST restrict this to genuinely user-authored turns. The ultracode
-	 * branch below has an unconditional `else` that disarms the keyword, so running
-	 * it on an agent-initiated prompt clears an inherited `ultracode: true` before
-	 * the subagent holding it can spawn anything.
+	 * MUST run when that turn actually STARTS, not when it is enqueued: flipping
+	 * the state from a message queued during streaming would raise or drop the
+	 * in-flight turn's effort pin and subagent floor before the message is even
+	 * delivered. Direct prompts apply it inline; queued steers/follow-ups defer
+	 * it to delivery via {@link attachQueuedMessageDeliveryEffect}.
+	 *
+	 * Callers MUST restrict this to genuinely user-authored turns. The
+	 * unconditional `else` disarms the keyword, so running it on an
+	 * agent-initiated prompt clears an inherited `ultracode: true` before the
+	 * subagent holding it can spawn anything.
+	 */
+	#applyUltracodeTurnState(text: string): void {
+		if (this.#magicKeywordEnabled("ultracode") && containsUltracode(text)) {
+			// Runtime override layer only, never written to settings.json. It is how
+			// the task executor learns this turn's spawns run at the ultracode floor.
+			this.settings.override("ultracode", true);
+			this.#models.beginUltracodeTurn();
+		} else {
+			// A user turn without the word ends any ultracode turn before it: hand the
+			// borrowed effort back and clear the flag. Written unconditionally rather
+			// than cleared, so a persisted `ultracode: true` cannot leak through the
+			// override layer and silently re-arm every turn.
+			this.settings.override("ultracode", false);
+			this.#models.endUltracodeTurn();
+		}
+	}
+
+	/**
+	 * Build the hidden steering notices for whichever magic keywords `text`
+	 * carries. Pure builder — the ultracode arm/disarm side effects live in
+	 * {@link #applyUltracodeTurnState}, which the caller runs at turn start.
 	 */
 	#createMagicKeywordNotices(text: string): CustomMessage[] {
 		const timestamp = Date.now();
@@ -5816,10 +5849,6 @@ export class AgentSession {
 		// keywords. Saying it once does not arm the session; the word has to be
 		// repeated on any later message that wants the same treatment.
 		if (this.#magicKeywordEnabled("ultracode") && containsUltracode(text)) {
-			// Runtime override layer only, never written to settings.json. It is how
-			// the task executor learns this turn's spawns run at the ultracode floor.
-			this.settings.override("ultracode", true);
-			this.#models.beginUltracodeTurn();
 			keywordNotices.push({
 				role: "custom",
 				customType: "ultracode-notice",
@@ -5828,13 +5857,6 @@ export class AgentSession {
 				attribution: "user",
 				timestamp,
 			});
-		} else {
-			// A user turn without the word ends any ultracode turn before it: hand the
-			// borrowed effort back and clear the flag. Written unconditionally rather
-			// than cleared, so a persisted `ultracode: true` cannot leak through the
-			// override layer and silently re-arm every turn.
-			this.settings.override("ultracode", false);
-			this.#models.endUltracodeTurn();
 		}
 		if (this.#magicKeywordEnabled("ultrathink") && containsUltrathink(text)) {
 			keywordNotices.push({
@@ -5976,10 +5998,19 @@ export class AgentSession {
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
+			// The ultracode arm/disarm belongs to the turn that DELIVERS this
+			// message, not to the enqueue: flipping it here would yank the effort
+			// pin and the subagent floor out from under the in-flight turn, and a
+			// message later dequeued or handed back to the editor would leave the
+			// flip behind with no turn. It rides the queued message instead and
+			// fires when the loop commits the message into the live context.
+			const applyKeywordTurnState = userAuthoredTurn
+				? () => this.#applyUltracodeTurnState(expandedText)
+				: undefined;
 			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp", submittedAt);
+				await this.#queueUserMessage(expandedText, options?.images, "followUp", submittedAt, undefined, applyKeywordTurnState);
 			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer", submittedAt);
+				await this.#queueUserMessage(expandedText, options?.images, "steer", submittedAt, undefined, applyKeywordTurnState);
 			}
 			return true;
 		}
@@ -6025,12 +6056,25 @@ export class AgentSession {
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt, {
-				images: normalizedImages,
-				descriptionNotice: imageDescriptionNotice,
-			});
+			await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior,
+				submittedAt,
+				{ images: normalizedImages, descriptionNotice: imageDescriptionNotice },
+				userAuthoredTurn ? () => this.#applyUltracodeTurnState(expandedText) : undefined,
+			);
 			return true;
 		}
+
+		// Enqueue IS turn start on the direct path: apply the keyword turn state
+		// before dispatch, so everything that reads it during turn setup
+		// (`applyAutoThinkingLevel`, the task executor's spawn floor) sees this
+		// turn's state. This sits BELOW the streaming re-check on purpose: the
+		// race loser queues instead of dispatching, and its turn state must ride
+		// the queued message like every other queued turn — applying it up top
+		// would yank the winner's in-flight pin and floor.
+		if (userAuthoredTurn) this.#applyUltracodeTurnState(expandedText);
 
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 		if (externalThinkingToolChoice) {
@@ -6112,6 +6156,7 @@ export class AgentSession {
 						.join("");
 
 		let keywordNotices: CustomMessage[] = [];
+		let applyKeywordTurnState: (() => void) | undefined;
 		if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") {
 			const details = message.details;
 			let skillName: string | undefined;
@@ -6124,6 +6169,10 @@ export class AgentSession {
 			// so it is a user-authored turn by construction.
 			this.#beginTurnBudgetFrom(skillArgs);
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
+			// Same enqueue-vs-delivery split as prompt(): a queued skill prompt
+			// applies the ultracode turn state when it is delivered, a direct one
+			// right before dispatch.
+			applyKeywordTurnState = () => this.#applyUltracodeTurnState(skillArgs);
 			this.maybeStartTitleGeneration(
 				skillPromptTitleInput({
 					name: skillName,
@@ -6140,7 +6189,7 @@ export class AgentSession {
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, applyKeywordTurnState);
 			return true;
 		}
 		if (this.isStreaming) {
@@ -6150,9 +6199,11 @@ export class AgentSession {
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, applyKeywordTurnState);
 			return true;
 		}
+
+		applyKeywordTurnState?.();
 
 		const customMessage: CustomMessage<T> = {
 			role: "custom",
@@ -6670,6 +6721,7 @@ export class AgentSession {
 		mode: "steer" | "followUp",
 		timestamp?: number,
 		preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined },
+		onDeliver?: () => void,
 	): Promise<void> {
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
@@ -6691,23 +6743,19 @@ export class AgentSession {
 				? await this.#buildImageDescriptionNotice(normalizedImages)
 				: undefined;
 		this.#allowQueuedMessageDrainRetry();
+		const message: AgentMessage =
+			mode === "followUp"
+				? { role: "user", content, attribution: "user", timestamp: timestamp ?? Date.now() }
+				: { role: "user", content, steering: true, attribution: "user", timestamp: timestamp ?? Date.now() };
+		// Turn-start side effects (the ultracode arm/disarm) ride the message and
+		// fire when the loop commits it into the live context, never at enqueue.
+		if (onDeliver) attachQueuedMessageDeliveryEffect(message, onDeliver);
 		if (mode === "followUp") {
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
-			this.agent.followUp({
-				role: "user",
-				content,
-				attribution: "user",
-				timestamp: timestamp ?? Date.now(),
-			});
+			this.agent.followUp(message);
 		} else {
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
-			this.agent.steer({
-				role: "user",
-				content,
-				steering: true,
-				attribution: "user",
-				timestamp: timestamp ?? Date.now(),
-			});
+			this.agent.steer(message);
 		}
 		this.#scheduleIdleQueueDrain();
 	}
@@ -6899,6 +6947,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp",
 		queueChipText?: string,
+		onDeliver?: () => void,
 	): Promise<void> {
 		const details =
 			queueChipText !== undefined
@@ -6920,6 +6969,9 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		// Turn-start side effects (the ultracode arm/disarm for a queued skill
+		// prompt) ride the message and fire at delivery, never at enqueue.
+		if (onDeliver) attachQueuedMessageDeliveryEffect(normalizedAppMessage, onDeliver);
 		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
@@ -7685,8 +7737,20 @@ export class AgentSession {
 		return this.#models.getAvailableModels();
 	}
 
-	/** Selects the session thinking level and optionally persists it as the default. */
+	/**
+	 * Selects the session thinking level and optionally persists it as the default.
+	 *
+	 * Every caller of this wrapper is an explicit user selection (model/settings
+	 * selector, RPC `set_thinking_level`, ACP, extension runtimes), so it takes
+	 * the same ultracode off-ramp as {@link cycleThinkingLevel}: drop the pending
+	 * restore so the end-of-turn handback cannot silently overwrite the level the
+	 * user just picked, and drop the subagent floor with it. Internal level
+	 * changes (retry fallback, begin/endUltracodeTurn, transcript restore) call
+	 * ModelControls directly and stay exempt.
+	 */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
+		this.#models.forgetUltracodeRestore();
+		if (this.settings.get("ultracode")) this.settings.override("ultracode", false);
 		this.#models.setThinkingLevel(level, persist);
 	}
 
