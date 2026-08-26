@@ -92,6 +92,12 @@ function yieldEmittingSession(): AgentSession {
 		// registry mirror run-state on every spawn, so `runSubprocess` now calls this on the
 		// session it is handed. Returns an unsubscribe, matching the real signature.
 		subscribeRunState: (_listener: (state: "running" | "idle") => void) => () => {},
+		// v18.0.5 (2af99a67d2 `fix(agent): review subagent final yield in advisor`) drains
+		// the advisor's final-turn review before teardown, so `finalizeSubagentLifecycle`
+		// now calls both of these on every graceful (non-aborted) finish. No-op /
+		// instantly-caught-up, matching the real signatures.
+		prepareForHeadlessAdvisorDrain: () => {},
+		waitForAdvisorCatchup: async (_timeoutMs: number) => true,
 	};
 	return session as unknown as AgentSession;
 }
