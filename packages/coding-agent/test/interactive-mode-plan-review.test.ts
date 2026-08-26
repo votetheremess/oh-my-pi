@@ -43,9 +43,9 @@ const isPlanApprovedCall = (args: unknown[]): boolean =>
  * Pick a plan-review option by label prefix.
  *
  * Selecting by index silently re-targets a different branch whenever the menu
- * gains an entry, which is exactly what happened when "Approve and execute with
- * ultracode" was inserted. Prefix, because the keep-context label carries a
- * live token count.
+ * gains or loses an entry (the ultracode option comes and goes with its
+ * settings gate). Prefix, because the keep-context label carries a live token
+ * count.
  */
 const pickPlanOption = (options: readonly string[], prefix: string): string => {
 	const match = options.find(option => option.startsWith(prefix));
@@ -767,6 +767,38 @@ describe("InteractiveMode plan review rendering", () => {
 		);
 	});
 
+	it("drops the ultracode approval option when the keyword is disabled in settings", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the thing.");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		// The menu obeys the same per-keyword gate as the typed keyword: with
+		// magicKeywords.ultracode off, the option disappears and every later
+		// entry moves up one slot.
+		session.settings.set("magicKeywords.ultracode", false);
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 7320, contextWindow: 10000, percent: 73.2 });
+		const selector = vi.spyOn(mode, "showPlanReview").mockResolvedValue("Refine plan");
+
+		await mode.handlePlanApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+		});
+
+		expect(selector.mock.calls[0]?.[2]).toEqual([
+			"Approve and execute",
+			"Approve and compact context",
+			"Approve and keep context (~7.3k / 10k)",
+			"Refine plan",
+			"Save and quit",
+		]);
+	});
+
 	it("ignores aborted zero-usage assistant messages when estimating context usage", () => {
 		session.agent.appendMessage(assistantWithUsage({ usage: usageWithInput(7320), stopReason: "stop" }));
 		session.agent.appendMessage(assistantWithUsage({ usage: usageWithInput(0), stopReason: "aborted" }));
@@ -859,7 +891,7 @@ describe("InteractiveMode plan review rendering", () => {
 			title: "PLAN",
 		});
 
-		// Assert the INVARIANT -- the disabled entry is the keep-context option --
+		// Assert the INVARIANT — the disabled entry is the keep-context option —
 		// rather than a literal index, which silently re-targets a different option
 		// whenever the menu gains an entry.
 		const call = selector.mock.calls[0];
@@ -1254,6 +1286,34 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.planModeEnabled = true;
 		mode.planModePlanFilePath = planFilePath;
 		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(session.settings.get("ultracode")).toBe(false);
+		const [text] = prompt.mock.calls[0] ?? [];
+		expect(text?.startsWith("<system-notice>")).toBe(false);
+	});
+
+	it("never arms ultracode while the master keyword switch is off, even for a forged choice", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the work.");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.settings.set("magicKeywords.enabled", false);
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => {
+			// The gated option must not be offered...
+			expect(options).not.toContain("Approve and execute with ultracode");
+			// ...and even a chooser that answers with the label anyway must not
+			// reach the arming path: the menu and the arm share one gate.
+			return "Approve and execute with ultracode";
+		});
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 

@@ -138,8 +138,8 @@ describe("ultracode orchestration contract", () => {
 	});
 
 	it("describes both helpers as barriers, because both are", () => {
-		// The first build inherited Claude Code's claim that pipeline() streams
-		// items independently. In THIS runtime pipeline() runs one bounded pool per
+		// Guards against the notice claiming pipeline() streams items
+		// independently. In THIS runtime pipeline() runs one bounded pool per
 		// stage (src/eval/js/shared/prelude.txt), and prelude.py says so outright:
 		// "Every item clears stage N before any item enters stage N+1". Telling the
 		// model to reach for pipeline() to AVOID a barrier buys the barrier.
@@ -153,14 +153,14 @@ describe("ultracode orchestration contract", () => {
 	it("tells the truth about failure propagation, which decides whether a fan-out survives", () => {
 		// agent() throws a ToolError on every failure path (src/eval/agent-bridge.ts)
 		// and parallel() re-raises the lowest-index error, discarding every result
-		// that succeeded (prelude.txt __pool). The notice used to promise null plus
-		// `.filter(Boolean)`, a defence that can never fire.
+		// that succeeded (prelude.txt __pool). A notice promising null returns plus
+		// `.filter(Boolean)` would describe a defence that can never fire.
 		expect(withTooling).toContain("it never returns null");
 		expect(withTooling).toContain("discards the entire results array");
 		expect(withTooling).toContain("put the try/catch INSIDE each risky thunk");
 		// The budget throw is gated on `turnBudget?.hard` (agent-bridge.ts): only a
-		// `+Nk!`/Goal-Mode ceiling refuses the spawn. The notice used to claim ANY
-		// exhausted budget throws, inviting the model to skip its own
+		// `+Nk!`/Goal-Mode ceiling refuses the spawn. Claiming ANY exhausted
+		// budget throws would invite the model to skip its own
 		// budget.remaining() gate under a soft +Nk that enforces nothing.
 		expect(withTooling).toContain("hits a hard (`+Nk!`/Goal Mode) budget ceiling THROWS");
 		expect(withTooling).not.toContain("exhausts the turn budget");
@@ -168,8 +168,8 @@ describe("ultracode orchestration contract", () => {
 
 	it("documents the budget members in their real, awaitable form", () => {
 		// Every JS budget member is async: `budget.total` is a function object
-		// (always truthy) and remaining() returns a Promise, so the old guard
-		// `while (budget.total && budget.remaining() > 50_000)` never looped once.
+		// (always truthy) and remaining() returns a Promise, so a guard like
+		// `while (budget.total && budget.remaining() > 50_000)` never loops once.
 		expect(withTooling).toContain("await budget.total()");
 		expect(withTooling).toContain("await budget.remaining()");
 		expect(withTooling).not.toContain("while (budget.total && budget.remaining()");
@@ -183,9 +183,9 @@ describe("ultracode orchestration contract", () => {
 	it("describes phase() as a status line, not an agent-row grouper", () => {
 		// The renderer never nests agent rows under phases: eval-render.ts draws
 		// "phase" as one standalone line in a flat status list and EXCLUDES agent
-		// events from that stream entirely (they get their own flat tree). The old
-		// wording promised `agent()` calls would group under the phase -- a display
-		// behavior nothing implements.
+		// events from that stream entirely (they get their own flat tree).
+		// Promising that `agent()` calls group under the phase would describe a
+		// display behavior nothing implements.
 		expect(withTooling).toContain("following status lines appear under it");
 		expect(withTooling).not.toContain("`agent()` calls group under it");
 	});
@@ -218,8 +218,8 @@ describe("ultracode orchestration contract", () => {
 
 	it("scopes the contract to this turn and never claims the session", () => {
 		expect(withTooling).toContain("THIS TURN");
-		// The first build made the contract standing for the whole session. The
-		// keyword is per-turn now, so nothing may promise it outlives the turn.
+		// The keyword is per-turn, so nothing in the notice may promise the
+		// contract outlives the turn as a session-wide standing default.
 		expect(withTooling).not.toContain("standing default for the session");
 		expect(withTooling).not.toContain("for the rest of the session");
 	});
@@ -238,9 +238,9 @@ describe("ultracode orchestration contract", () => {
 		expect(WORKFLOW_NOTICE.endsWith("</system-notice>")).toBe(true);
 		expect(WORKFLOW_NOTICE).toContain("**workflowz**");
 		// ultracode ships its own fuller contract. It must never splice in or
-		// re-render the workflowz notice, which announces a keyword the user did
-		// not type — that coupling is what kept this branch diverging from
-		// upstream's copy of workflow-notice.md and caused the only rebase conflict.
+		// re-render the workflowz notice: that announces a keyword the user did
+		// not type, and splicing would couple the ultracode contract to every
+		// future edit of workflow-notice.md.
 		expect(ULTRACODE_NOTICE).not.toContain(WORKFLOW_NOTICE);
 		expect(ULTRACODE_NOTICE).not.toContain("**workflowz**");
 	});
@@ -272,7 +272,7 @@ describe("ultracode notice renders live session facts", () => {
 			"at most 32 thunks at once",
 		);
 		// 0 is "unlimited" for task.maxConcurrency, so any stated cap would be a
-		// lie -- and the system prompt in the same context window omits it too.
+		// lie — and the system prompt in the same context window omits it too.
 		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 0 })).not.toContain("at most");
 	});
 
@@ -286,10 +286,10 @@ describe("ultracode notice renders live session facts", () => {
 		// text rather than assert an unconditional, unclamped xhigh pin.
 		expect(applied).toContain("clamped to each model's own ladder");
 		expect(applied).toContain("one with no effort control runs unchanged");
-		// With externalThinking on, upstream's forceReasoningOff strips reasoning
-		// before the request leaves, so the pin never reaches the wire. Asserting
-		// it anyway makes the failure unobservable from inside the turn -- the
-		// notice also forbids commenting on effort.
+		// With externalThinking on, the transport's forceReasoningOff strips
+		// reasoning before the request leaves, so the pin never reaches the wire.
+		// Asserting it anyway makes the failure unobservable from inside the
+		// turn — the notice also forbids commenting on effort.
 		const suppressed = renderUltracodeNotice({ workflowAvailable: true, effortApplied: false });
 		expect(suppressed).not.toContain("The harness has already pinned");
 		expect(suppressed).toContain("externalThinking");
@@ -314,7 +314,7 @@ describe("ultracode notice renders live session facts", () => {
 });
 
 // Plan approval dispatches a SYNTHETIC prompt, and synthetic turns never scan for
-// keywords -- so an `ultracode` typed into the planning turn cannot reach the
+// keywords — so an `ultracode` typed into the planning turn cannot reach the
 // execution turn, which is the phase that actually spawns subagents. The plan
 // review's "Approve and execute with ultracode" carries it across that boundary.
 describe("ultracode notice for an approved plan", () => {

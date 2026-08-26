@@ -325,13 +325,13 @@ const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resum
  *
  * Plan approval dispatches a synthetic prompt, and synthetic turns never scan for
  * magic keywords, so an `ultracode` typed into the PLANNING turn cannot reach the
- * EXECUTION turn -- the phase that actually spawns the subagents. This option is
- * how the operator carries it across that boundary.
+ * EXECUTION turn — the phase that actually spawns the subagents. This option is
+ * how the operator carries it across that boundary. It obeys the same
+ * per-keyword settings gate as the typed keyword (`magicKeywords.enabled` +
+ * `magicKeywords.ultracode`): a keyword the operator switched off must not
+ * resurface as a menu entry.
  */
 const PLAN_EXECUTE_ULTRACODE_LABEL = "Approve and execute with ultracode";
-// Index of `keepContextLabel` in the plan-review option array below. Keep in sync
-// when reordering the options.
-const PLAN_KEEP_CONTEXT_OPTION_INDEX = 3;
 const PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT = 95;
 const PLAN_SAVE_AND_QUIT_OPTION = "Save and quit";
 const PLAN_SAVE_TITLE_LINE_LIMIT = 6;
@@ -4515,17 +4515,26 @@ export class InteractiveMode implements InteractiveModeContext {
 		let feedback = "";
 		const annotationStateKey = this.#resolvePlanFilePath(planFilePath);
 
+		// Same per-keyword settings check the keyword scan applies
+		// (AgentSession's #magicKeywordEnabled): with either switch off, the
+		// ultracode option is dropped from the menu AND ignored on the arming
+		// path below, so a disabled keyword cannot arm a turn through the menu.
+		const ultracodeEnabled =
+			this.session.settings.get("magicKeywords.enabled") && this.session.settings.get("magicKeywords.ultracode");
+		// The keep-context disable targets its live index: the list's shape
+		// depends on the ultracode gate above.
+		const planOptions = [
+			"Approve and execute",
+			...(ultracodeEnabled ? [PLAN_EXECUTE_ULTRACODE_LABEL] : []),
+			"Approve and compact context",
+			keepContextLabel,
+			"Refine plan",
+			PLAN_SAVE_AND_QUIT_OPTION,
+		];
 		const choice = await this.showPlanReview(
 			planContent,
 			"Plan mode - next step",
-			[
-				"Approve and execute",
-				PLAN_EXECUTE_ULTRACODE_LABEL,
-				"Approve and compact context",
-				keepContextLabel,
-				"Refine plan",
-				PLAN_SAVE_AND_QUIT_OPTION,
-			],
+			planOptions,
 			{
 				helpText,
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
@@ -4541,7 +4550,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					if (state.annotations.length > 0) this.#planReviewAnnotationState.set(annotationStateKey, state);
 					else this.#planReviewAnnotationState.delete(annotationStateKey);
 				},
-				disabledIndices: keepContextDisabled ? [PLAN_KEEP_CONTEXT_OPTION_INDEX] : undefined,
+				disabledIndices: keepContextDisabled ? [planOptions.indexOf(keepContextLabel)] : undefined,
 			},
 			{ slider },
 		);
@@ -4617,7 +4626,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					title: details.title,
 					preserveContext: choice !== "Approve and execute" && choice !== PLAN_EXECUTE_ULTRACODE_LABEL,
 					compactBeforeExecute: choice === "Approve and compact context",
-					executionUltracode: choice === PLAN_EXECUTE_ULTRACODE_LABEL,
+					executionUltracode: ultracodeEnabled && choice === PLAN_EXECUTE_ULTRACODE_LABEL,
 					executionModel,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);

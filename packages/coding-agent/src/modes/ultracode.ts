@@ -6,7 +6,7 @@ import { magicKeywordRegex } from "./magic-keyword-boundary";
 import { keywordInProse } from "./markdown-prose";
 
 /**
- * "ultracode" keyword support, mirroring Claude Code's affordance.
+ * "ultracode" keyword support.
  *
  * Typing the standalone word in the input editor paints it with a violet ->
  * magenta -> gold ripple ({@link highlightUltracode}); submitting a message that
@@ -24,11 +24,11 @@ const ULTRACODE_WORD = magicKeywordRegex("ultracode");
 /**
  * Hidden system notice appended after a user message that mentions "ultracode".
  *
- * Carries a port of Claude Code's Workflow tool contract: the orchestration
- * doctrine, the script API mapped onto this harness's `eval` helpers, the
+ * Carries the full workflow orchestration contract: the orchestration
+ * doctrine, the script API for this harness's `eval` helpers, the
  * barrier rules, the quality patterns, and the three-verdict adjudication that
  * keeps adversarial verification from destroying real findings. Deliberately
- * NOT the `workflowz` notice: that is this project's own shorter prose, and the
+ * NOT the `workflowz` notice: that one is shorter prose by design, and the
  * point of ultracode is the fuller contract.
  *
  * Every claim the notice makes about the runtime is rendered from the live
@@ -74,7 +74,7 @@ export const ULTRACODE_NOTICE: string = renderUltracodeNotice({ workflowAvailabl
 
 /**
  * Whether `text` contains the standalone keyword "ultracode" (lowercase,
- * prose-delimited) in prose - never inside a code block, inline code span,
+ * prose-delimited) in prose — never inside a code block, inline code span,
  * or XML/HTML section.
  */
 export function containsUltracode(text: string): boolean {
@@ -83,11 +83,10 @@ export function containsUltracode(text: string): boolean {
 
 /**
  * Highlight every standalone "ultracode" in `text` for editor display with a
- * violet -> magenta -> gold ripple (hue 280..40, wrapping through 360), which
- * mirrors Claude Code's own violet ultracode treatment. Visually distinct from
- * the other three keywords: ultrathink is a full-spectrum rainbow, orchestrate
- * is hue 150..280 (teal -> violet), and workflowz is hue 30..150 (amber ->
- * green).
+ * violet -> magenta -> gold ripple (hue 280..40, wrapping through 360), chosen
+ * to stay distinct from the other three keywords' palettes: ultrathink is a
+ * full-spectrum rainbow, orchestrate is hue 150..280 (teal -> violet), and
+ * workflowz is hue 30..150 (amber -> green).
  */
 export const highlightUltracode: KeywordHighlighter = createGradientHighlighter({
 	probe: /ultracode/,
