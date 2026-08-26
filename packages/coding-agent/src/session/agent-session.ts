@@ -5571,10 +5571,13 @@ export class AgentSession {
 			this.#models.beginUltracodeTurn();
 		} else {
 			// A user turn without the word ends any ultracode turn before it: hand the
-			// borrowed effort back and clear the flag. Written unconditionally rather
-			// than cleared, so a persisted `ultracode: true` cannot leak through the
-			// override layer and silently re-arm every turn.
-			this.settings.override("ultracode", false);
+			// borrowed effort back and force the flag to false (not merely cleared), so
+			// a persisted `ultracode: true` cannot leak through the override layer and
+			// silently re-arm every turn. Guarded on the merged value: writing the
+			// override rebuilds the settings merge and seeds the override map, which
+			// the common keyword-free turn must not pay for when the flag is already
+			// off.
+			if (this.settings.get("ultracode")) this.settings.override("ultracode", false);
 			this.#models.endUltracodeTurn();
 		}
 	}
@@ -5704,7 +5707,7 @@ export class AgentSession {
 
 		// Magic keywords ("ultracode", "ultrathink", "orchestrate", "workflowz"): append
 		// hidden system notices after the user's message that steer this turn.
-		// User-authored prompts only -- and `synthetic` alone does not express that.
+		// User-authored prompts only — and `synthetic` alone does not express that.
 		// Three agent-initiated callers reach prompt() with `attribution: "agent"` and
 		// no `synthetic` flag: a subagent's own task text (task/executor.ts), the
 		// agentic commit session, and the agent dashboard. Running keywords there arms
