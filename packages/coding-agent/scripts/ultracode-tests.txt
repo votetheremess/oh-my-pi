@@ -1,22 +1,26 @@
-# Test files that must pass before the out-of-tree installer will install a build.
+# Test files that must pass before ~/.omp/ultracode-update.sh will apply a build.
 #
-# `~/.omp/omp-sync.sh` runs every file listed here (plus `check:types`) before it
-# builds and copies a bundle over the working install. The marker list next door
-# only proves some strings survived bundling; it says nothing about whether the
-# feature still WORKS. That gap was not theoretical: after the rebase onto
-# v17.3.2 all three markers were present in the installed bundle while 15 tests
-# in agent-session-magic-keywords.test.ts were broken, because upstream had
-# changed a fixture's signature underneath the fork's added tests. A marker-only
-# gate installed that happily.
+# `~/.omp/ultracode-update.sh` (verify_source) runs every file listed here (plus
+# `check:types`) BEFORE it touches anything; only on green does it `bun install -g`
+# the stock package, run gen:bundle, and atomically rename the staged bundle into
+# the fork's added subdir (<pkg>/dist/ultracode/). No stock artifact is ever
+# modified, so a gate failure costs nothing: the previous stock+fork pair stays
+# active. The marker list next door only proves some strings survived bundling;
+# it says nothing about whether the feature still WORKS. That gap was not
+# theoretical: after the rebase onto v17.3.2 all three markers were present in
+# the installed bundle while 15 tests in agent-session-magic-keywords.test.ts
+# were broken, because upstream had changed a fixture's signature underneath the
+# fork's added tests. A marker-only gate installed that happily.
 #
 # Scope deliberately excludes the wider suite. Upstream ships a handful of test
 # files that already fail on a clean checkout, so gating an update on `bun test`
 # as a whole would block every future update on someone else's red test. These
 # files are ours or directly adjacent, and all of them pass on the fork.
 #
-# `test/ultracode-markers.test.ts` asserts each path below exists AND that every
-# test file whose name mentions ultracode appears here, so adding a test file and
-# forgetting this list fails in the repo instead of quietly shrinking the gate.
+# `test/ultracode-markers.test.ts` asserts each path below exists, that every
+# test file whose name mentions ultracode appears here, AND pins the three listed
+# files whose names do not — so adding a test file and forgetting this list, or
+# deleting a listed entry, fails in the repo instead of quietly shrinking the gate.
 #
 # Paths are relative to packages/coding-agent. Blank lines and `#` comments are ignored.
 
