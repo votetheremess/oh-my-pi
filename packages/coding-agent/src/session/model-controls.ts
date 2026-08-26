@@ -506,8 +506,18 @@ export class ModelControls {
 	 * auto writes its provisional level plus `configured: "auto"` immediately,
 	 * giving external readers an authoritative selection receipt before the next
 	 * user turn. Later classifications persist only changed concrete resolutions.
+	 *
+	 * `configuredReceipt` overrides the `configured` value written to the session
+	 * record for a concrete level. {@link beginUltracodeTurn} passes the
+	 * borrowed-FROM level so the turn-scoped pin never becomes the session's own
+	 * configured level on disk: a process killed mid-ultracode-turn must resume
+	 * at the pre-ultracode level, not stranded at xhigh with no handback state.
 	 */
-	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
+	setThinkingLevel(
+		level: ConfiguredThinkingLevel | undefined,
+		persist: boolean = false,
+		configuredReceipt?: ConfiguredThinkingLevel,
+	): void {
 		if (level === AUTO_THINKING) {
 			const provisional = clampThinkingLevelToCeiling(
 				this.#model,
@@ -551,7 +561,7 @@ export class ModelControls {
 
 		if (isChanging) {
 			this.#host.clearInheritedProviderPromptCacheKey();
-			this.#host.sessionManager.appendThinkingLevelChange(effectiveLevel, effectiveLevel);
+			this.#host.sessionManager.appendThinkingLevelChange(effectiveLevel, configuredReceipt ?? effectiveLevel);
 			if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
 				this.#host.settings.set("defaultThinkingLevel", effectiveLevel);
 			}
@@ -634,7 +644,10 @@ export class ModelControls {
 		if (this.#levelBeforeUltracode === undefined) {
 			this.#levelBeforeUltracode = this.configuredThinkingLevel() ?? ThinkingLevel.Off;
 		}
-		this.setThinkingLevel(effort);
+		// The borrowed-from level is also the session record's `configured` receipt:
+		// the handback state lives in process memory only, so persisting the pin as
+		// the configured level would strand a killed-and-resumed session at xhigh.
+		this.setThinkingLevel(effort, false, this.#levelBeforeUltracode);
 	}
 
 	/**

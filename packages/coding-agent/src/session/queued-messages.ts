@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, ASIDE_MESSAGE_COMMIT } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import type { RestoredQueuedMessage } from "./agent-session-types";
 import { type CustomMessage, readQueueChipText } from "./messages";
@@ -101,6 +101,20 @@ export function queueChipText(message: AgentMessage): string {
 	const text = queuedTextContent(message) ?? "";
 	if (text) return text;
 	return queuedImageContent(message) ? "[Image]" : "";
+}
+
+/**
+ * Attach a side effect that runs exactly once, when the queued message is
+ * committed into the live context (the agent loop's delivery point, before the
+ * provider call that first includes the message).
+ *
+ * This is for state that must flip at TURN START rather than at enqueue: the
+ * ultracode arm/disarm rides the queued user message so a steer/follow-up
+ * queued during streaming cannot flip the effort pin under the in-flight turn,
+ * and a message that is dequeued or handed back to the editor never fires it.
+ */
+export function attachQueuedMessageDeliveryEffect(message: AgentMessage, effect: () => void): void {
+	Object.defineProperty(message, ASIDE_MESSAGE_COMMIT, { configurable: true, value: effect });
 }
 
 /** Converts a queued user message to editor-restorable content. */

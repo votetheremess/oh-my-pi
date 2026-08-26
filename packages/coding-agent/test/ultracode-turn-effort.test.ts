@@ -13,16 +13,29 @@
  * a ladder that sits entirely above xhigh (`["max"]`) must resolve to max, not
  * throw. See the "ladder entirely above xhigh" case.
  */
-import { describe, expect, it } from "bun:test";
-import { type Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	Agent,
+	type AgentMessage,
+	ASIDE_MESSAGE_COMMIT,
+	type CommittableAsideMessage,
+	ThinkingLevel,
+} from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-ai";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { ModelControls, type ModelControlsHost } from "@oh-my-pi/pi-coding-agent/session/model-controls";
-import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-coding-agent/thinking";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 function makeModel(id: string, thinking: Model<Api>["thinking"], reasoning = true): Model<Api> {
 	return {
@@ -169,7 +182,7 @@ function createHarness(options: {
 }
 
 describe("beginUltracodeTurn", () => {
-	it("pins the session at xhigh on a model whose ladder offers it", () => {
+	it("pins the turn at xhigh on a model whose ladder offers it", () => {
 		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
 		h.controls.beginUltracodeTurn();
 
@@ -232,7 +245,9 @@ describe("beginUltracodeTurn", () => {
 		expect(h.controls.isAutoThinking).toBe(false);
 		expect(h.controls.configuredThinkingLevel()).toBe(Effort.XHigh);
 		expect(h.controls.autoResolvedThinkingLevel).toBeUndefined();
-		expect(h.entries.at(-1)).toEqual({ thinkingLevel: Effort.XHigh, configured: Effort.XHigh });
+		// The pin's session receipt records the borrowed-FROM selector ("auto"
+		// here), never xhigh itself — see the "ultracode resume receipt" block.
+		expect(h.entries.at(-1)).toEqual({ thinkingLevel: Effort.XHigh, configured: AUTO_THINKING });
 	});
 
 	it("is turn-scoped: it never rewrites the persisted defaultThinkingLevel", () => {
@@ -384,5 +399,190 @@ describe("applyAutoThinkingLevel under ultracode", () => {
 		await h.controls.applyAutoThinkingLevel("second turn", GENERATION);
 		expect(h.controls.thinkingLevel).toBe(Effort.XHigh);
 		expect(h.settingReads).not.toContain("providers.autoThinkingModel");
+	});
+});
+
+describe("ultracode resume receipt", () => {
+	// Invariant: the xhigh pin is turn state, never the session's own configured
+	// level on disk. The handback state (`#levelBeforeUltracode`) lives in process
+	// memory only, so the pin's `thinking_level_change` entry must carry the
+	// borrowed-FROM level as `configured` — the value session restore replays
+	// (session-context reads `entry.configured`, sdk feeds it through
+	// `parseConfiguredThinkingLevel`). A process killed mid-ultracode-turn
+	// therefore resumes at the pre-ultracode level instead of stranded at xhigh
+	// with no handback state left to run.
+	it("records the borrowed-from level, not xhigh, as the pin's configured receipt", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
+		h.controls.beginUltracodeTurn();
+
+		expect(h.controls.thinkingLevel).toBe(Effort.XHigh);
+		expect(h.entries.at(-1)).toEqual({ thinkingLevel: Effort.XHigh, configured: Effort.Low });
+	});
+
+	it("writes the handed-back level as both fields once the turn ends", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
+		h.controls.beginUltracodeTurn();
+		h.controls.endUltracodeTurn();
+
+		expect(h.entries.at(-1)).toEqual({ thinkingLevel: Effort.Low, configured: Effort.Low });
+	});
+
+	it("leaves ordinary level changes writing the level itself as the receipt", () => {
+		const h = createHarness({ model: HAS_XHIGH, thinkingLevel: Effort.Low });
+		h.controls.setThinkingLevel(Effort.Medium);
+
+		expect(h.entries.at(-1)).toEqual({ thinkingLevel: Effort.Medium, configured: Effort.Medium });
+	});
+});
+
+// The seam between AgentSession.prompt() and ModelControls is two one-line
+// calls (arm in the keyword branch, disarm in the keyword-free branch of the
+// turn-state applier). Each test below fails if its call is severed, which the
+// ModelControls-level blocks above cannot see.
+describe("AgentSession ultracode turn wiring", () => {
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage;
+	let authRoot: string;
+	let modelRegistry: ModelRegistry;
+
+	beforeAll(async () => {
+		authRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-ultracode-turn-auth-"));
+		authStorage = await AuthStorage.create(path.join(authRoot, "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage, path.join(authRoot, "models.yml"));
+	});
+
+	afterAll(async () => {
+		authStorage.close();
+		await removeWithRetries(authRoot);
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		if (session) await session.dispose();
+		session = undefined;
+	});
+
+	async function createSession(): Promise<{ session: AgentSession; settings: Settings }> {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Claude Sonnet model");
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+				thinkingLevel: Effort.High,
+			},
+		});
+		const settings = Settings.isolated();
+		const created = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		return { session: created, settings };
+	}
+
+	/** Forces the streaming queue path in prompt() without a live agent loop. */
+	function forceStreaming(target: AgentSession): void {
+		Object.defineProperty(target, "isStreaming", { configurable: true, get: () => true });
+	}
+
+	/**
+	 * Fires the queued message's delivery effect exactly as the agent loop does
+	 * when it commits the message into the live context. Fails when no effect is
+	 * attached — a severed hook would otherwise pass silently as a no-op.
+	 */
+	function deliverQueued(message: AgentMessage | undefined): void {
+		const hook = (message as CommittableAsideMessage | undefined)?.[ASIDE_MESSAGE_COMMIT];
+		expect(typeof hook).toBe("function");
+		hook?.();
+	}
+
+	it("pins the turn's thinking level through prompt(), not just through ModelControls", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("hands the borrowed level back on the next keyword-free user turn through prompt()", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		await session.prompt("now the keyword-free follow-up");
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("does not disarm the in-flight ultracode turn when a keyword-free steer is enqueued", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		await session.prompt("please ultracode this refactor");
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		forceStreaming(session);
+		await session.prompt("also check the tests", { streamingBehavior: "steer" });
+
+		// Enqueue leaves the in-flight armed turn alone: the pin and the subagent
+		// floor stay up for everything the turn still spawns.
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		// The flip fires only when the loop delivers the queued message.
+		deliverQueued(session.agent.peekSteeringQueue().find(m => m.role === "user"));
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("arms a queued ultracode follow-up at delivery, not under the current turn", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		forceStreaming(session);
+		await session.prompt("ultracode the next piece", { streamingBehavior: "followUp" });
+
+		// The tail of the CURRENT (keyword-free) turn must not borrow xhigh.
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+
+		deliverQueued(session.agent.peekFollowUpQueue().find(m => m.role === "user"));
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("keeps the user's explicit selector pick instead of the stale ultracode handback", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		await session.prompt("please ultracode this refactor");
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		// The selector / RPC / ACP / extension path: an unambiguous "I want THIS
+		// effort". It drops the pending restore and the subagent floor with it.
+		session.setThinkingLevel(Effort.Medium);
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+
+		// The next keyword-free turn's handback must not overwrite the pick.
+		await session.prompt("keyword-free follow-up");
+		expect(session.thinkingLevel).toBe(Effort.Medium);
 	});
 });
