@@ -467,6 +467,27 @@ script moves it only when a rebase actually runs, so it can lag many commits. Re
 of them with `git log --oneline <ref>..HEAD` before trusting it, and re-point the newest
 tag at HEAD after the last commit of a session, never before.
 
+**Upstream watch refresh (verified 2026-08-31, tags v18.0.5→v18.0.11, during the
+v18.0.11 rebase).** Same negative result: the keyword subsystem had ZERO upstream
+commits in the window (magic-keywords.ts, markdown-prose.ts, magic-keyword-boundary.ts,
+ultrathink/workflow/orchestrate modes, queued-messages.ts), the effort-resolution block
+in executor.ts is untouched, `ASIDE_MESSAGE_COMMIT` is untouched (`git log -S` empty),
+and no AgentSession spawn-path member was added (only `getEnabledToolNames` appears in
+the executor window diff, already stubbed). Rebase conflicts were confined to the three
+known-churn spots: docs/settings.md (twice) and `#queueUserMessage` in agent-session.ts,
+where upstream's new `timestamp?: number` latency anchor (f9a00c7313, db0fa518c3) and
+the fork's `onDeliver` hook compose as two independent trailing params — resolution
+adversarially reviewed, both intents preserved. rerere recorded all three resolutions.
+**Known-open edges (2026-08-31 review, latent, none introduced by the rebase):** (a) a
+collab peer's `chat` (collab/host.ts routing into `session.prompt` with no
+synthetic/attribution marker) passes the `userAuthoredTurn` gate, so a remote peer can
+arm/disarm ultracode; (b) an extension calling `setThinkingLevel` inside a subagent hits
+the off-ramp and silently drops that subagent's floor; (c) `createSubagentSettings`
+snapshots every schema key, so the child's isolated Settings bakes `ultracode: true` as
+its own base value — this is the mechanism behind deliberate deviation (iii), listed so
+nobody mistakes it for a leak; (d) no test pins the `timestamp ?? Date.now()` pass-through
+in the hoisted `#queueUserMessage` message const (upstream shipped it untested too).
+
 **Upstream watch (verified 2026-08-25, tags v17.4.0→v18.0.5).** Upstream has no
 ultracode equivalent and gained none in that window: the keyword machinery and all three
 notice files are byte-identical across the tags, and the effort plumbing nearly so —
