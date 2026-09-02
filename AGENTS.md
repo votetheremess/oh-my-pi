@@ -467,6 +467,31 @@ script moves it only when a rebase actually runs, so it can lag many commits. Re
 of them with `git log --oneline <ref>..HEAD` before trusting it, and re-point the newest
 tag at HEAD after the last commit of a session, never before.
 
+**Upstream watch refresh (verified 2026-09-02, tags v18.0.11→v18.1.3, during the
+v18.1.3 rebase).** Quiet seams again: keyword subsystem, executor floor,
+`createSubagentSettings` snapshot loop, `ASIDE_MESSAGE_COMMIT`, settings-schema
+magicKeywords group, plan-review flow — zero relevant upstream commits. Two real
+intersections, both handled: (1) upstream added a pre-dispatch `isStreaming` re-check to
+`prompt()` (dispatch-race loser queues instead of erroring), which broke commit 22's
+"enqueue IS turn start on the direct path" assumption — the direct-path
+`#applyUltracodeTurnState` now sits BELOW that re-check and the requeue passes the
+delivery hook (with `undefined` filling upstream's new `preprocessed` param);
+adaptation adversarially reviewed clean on five axes (no reader of turn state in the
+moved span, no double/zero application on any path, no dropped upstream hunk, no test
+asserting the old position). (2) The fixture tax again: usage-owner threading
+(73949b6a6b, 80605a93e7) makes `applyAutoThinkingLevel` call
+`sessionManager.getSessionId()/getLeafId()` BEFORE the classifier try-block —
+stub taught `getSessionId`/`getLeafId`/`appendModelUsage` with real signatures.
+Checked-clean beyond the seams: vibe-exit's `agent.replaceQueues` and every other
+caller filter/slice the EXISTING message arrays (object identity preserved), so the
+non-enumerable delivery hook survives queue rewrites; a rider disappears only when its
+whole message is deliberately removed, which is correct. Still untested (recorded, not
+fixed): the re-check-branch delivery hook has no direct test (the wiring tests
+forceStreaming through the early branch); in-place rewind across an armed turn
+(believed benign: restore path re-arms). General note: upstream removed `hub` from
+`READ_ONLY_TOOL_NAMES`. Operational: upstream re-pointed pre-publish tag v18.1.4;
+`ultracode-update.sh` now fetches tags with `--force`.
+
 **Upstream watch refresh (verified 2026-08-31, tags v18.0.5→v18.0.11, during the
 v18.0.11 rebase).** Same negative result: the keyword subsystem had ZERO upstream
 commits in the window (magic-keywords.ts, markdown-prose.ts, magic-keyword-boundary.ts,
