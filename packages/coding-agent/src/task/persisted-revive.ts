@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { Effort } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import type { ModelRegistry } from "../config/model-registry";
@@ -88,8 +89,18 @@ export function createPersistedSubagentReviverFactory(
 		// advisor-role model, anything else = the explicit pattern stamped onto
 		// this session's `modelRoles.advisor`. Absent = unadvised (the
 		// createSubagentSettings default).
+		//
+		// `ultracode` seeds the snapshot from the persisted spawn-time flag. It is
+		// only a fallback: `syncChildUltracodeAtResume` (run by the lifecycle
+		// right after revive) overwrites it with the nearest live ancestor's flag,
+		// so a stale persisted `true` never floors anything once the parent's
+		// armed turn is over. The persisted thinking entries restore the xhigh
+		// pin itself; the ceiling/restore-level pair below rebuilds the rest of
+		// what the live spawn had, so the sync can re-pin (ceiling at xhigh, not
+		// the parent's `task.maxEffort`) or hand back (to the pre-pin level).
 		const subagentSettings = createSubagentSettings(ctx.settings, {
 			...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
+			...(init.ultracode ? { ultracode: true } : undefined),
 			...(init.advisor
 				? {
 						"advisor.enabled": true,
@@ -132,6 +143,9 @@ export function createPersistedSubagentReviverFactory(
 				modelRegistry: ctx.modelRegistry,
 				...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
 				modelPatternAuthFallback: init.resolvedModel,
+				...(init.ultracode
+					? { thinkingLevelCeiling: Effort.XHigh, ultracodeRestoreLevel: init.ultracodeRestoreLevel }
+					: {}),
 				settings: subagentSettings,
 				sessionManager: reopened,
 				agentId: ref.id,

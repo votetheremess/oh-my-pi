@@ -1,15 +1,18 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
+import { formatModelStringWithRouting } from "../../config/model-resolver";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import * as sdk from "../../sdk";
 import type { AgentSession } from "../../session/agent-session";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE } from "../../session/messages";
 import { SessionManager } from "../../session/session-manager";
 import { createMCPProxyTools, createSubagentSettings } from "../../task/executor";
+import { UltracodeEffortError, ultracodeEffortFor } from "../../thinking";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
 import type { InteractiveModeContext } from "../types";
 
@@ -73,7 +76,23 @@ export class TanCommandController {
 		// (the parent being itself a fork/tan). Mirror exactly what the parent
 		// populated the cache under — same rule as advisor and handoff calls.
 		const parentPromptCacheKey = session.agent.promptCacheKey ?? parentSessionId;
-		const thinkingLevel = session.configuredThinkingLevel();
+		// A tan forked out of an ultracode turn is one of that turn's agents: it
+		// runs at exactly xhigh (the snapshot below carries `ultracode: true`, so
+		// its own spawns are floored the same way) or is refused up front when
+		// the model has no xhigh rung — never clamped. Outside ultracode the
+		// parent's configured level carries over unchanged. The restore level is
+		// the USER's own (never the borrowed pin): a disarm hands the clone back
+		// to it instead of leaving xhigh behind as its own choice.
+		const ultracodeEffortLevel = this.ctx.settings.get("ultracode") ? ultracodeEffortFor(model) : undefined;
+		if (this.ctx.settings.get("ultracode") && ultracodeEffortLevel === undefined) {
+			this.ctx.showError(
+				new UltracodeEffortError(formatModelStringWithRouting(model), getSupportedEfforts(model)).message,
+			);
+			return;
+		}
+		const userThinkingLevel = session.userConfiguredThinkingLevel();
+		const thinkingLevel = ultracodeEffortLevel ?? userThinkingLevel;
+		const ultracodeRestoreLevel = ultracodeEffortLevel !== undefined ? userThinkingLevel : undefined;
 		const systemPrompt = [...session.systemPrompt];
 		const toolNames = session.getEnabledToolNames();
 		const modelRegistry = session.modelRegistry;
@@ -144,6 +163,8 @@ export class TanCommandController {
 							sessionManager: cloneManager,
 							model,
 							thinkingLevel,
+							thinkingLevelCeiling: ultracodeEffortLevel,
+							ultracodeRestoreLevel,
 							systemPrompt,
 							toolNames,
 							providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
@@ -175,6 +196,11 @@ export class TanCommandController {
 							systemPrompt: clone.systemPrompt ? clone.systemPrompt.join("\n\n") : systemPrompt.join("\n\n"),
 							task: trimmedWork,
 							tools: clone.getEnabledToolNames(),
+							// Persisted (only when armed) like a task spawn, so a cold revive
+							// can tell the tan was forked inside an ultracode turn and rebuild
+							// the pin and its hand-back.
+							ultracode: this.ctx.settings.get("ultracode") || undefined,
+							ultracodeRestoreLevel,
 						});
 						const abortClone = () => {
 							void clone?.abort();
@@ -211,7 +237,11 @@ export class TanCommandController {
 							// it is a tangential fork — its parent owns the prior conversation;
 							// this agent must focus exclusively on the user's request.
 							injectContextSwitch();
-							await clone.prompt(trimmedWork, { attribution: "user" });
+							// The work text was typed by the user, so it is a user turn: it
+							// scans for magic keywords like any other. It cannot flip the
+							// ultracode state — the clone is a child kind (parentTaskPrefix),
+							// and children only ever re-pin the flag they inherited.
+							await clone.prompt(trimmedWork);
 							await clone.waitForIdle();
 							return extractAssistantText(clone.getLastAssistantMessage()) || "(no output)";
 						} finally {

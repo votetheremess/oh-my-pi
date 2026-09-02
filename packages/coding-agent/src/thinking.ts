@@ -266,6 +266,48 @@ export function clampAutoThinkingEffort(
 	return chosen;
 }
 
+/**
+ * The effort an ultracode turn pins on `model`: exactly {@link Effort.XHigh},
+ * or `undefined` when the model cannot honor it. Never any other level.
+ *
+ * Ultracode is a hard contract, not a preference: the turn and every agent it
+ * spawns run at xhigh — never max, never below — so results are comparable
+ * across models and cost is bounded. {@link clampAutoThinkingEffort} is the
+ * wrong tool here: it snaps onto the model's ladder, landing a `["max"]`-only
+ * ladder on max and a `[.., "high"]` ladder on high, and both would quietly
+ * break the contract. A missing rung is a fail-loud condition for callers
+ * (see {@link UltracodeEffortError}), not something to round away.
+ *
+ * `undefined` (no model resolved yet) is optimistic on purpose: the caller has
+ * nothing to check the ladder against, and the pin is re-validated once a
+ * concrete model lands. Non-reasoning models and reasoning models without a
+ * controllable effort surface expose no ladder at all, so they cannot satisfy
+ * ultracode either.
+ */
+export function ultracodeEffortFor(model: Model | undefined): Effort | undefined {
+	if (model === undefined) return Effort.XHigh;
+	return getSupportedEfforts(model).includes(Effort.XHigh) ? Effort.XHigh : undefined;
+}
+
+/**
+ * Thrown by spawn and auxiliary-agent paths when ultracode is armed but the
+ * resolved model has no xhigh rung. Silent clamping is the failure mode this
+ * guards against: a subagent quietly running at high (or max) under a turn that
+ * promised xhigh is worse than a visible refusal.
+ */
+export class UltracodeEffortError extends Error {
+	readonly modelId: string;
+	readonly ladder: readonly Effort[];
+
+	constructor(modelId: string, ladder: readonly Effort[]) {
+		const exposes = ladder.length === 0 ? "exposes no controllable effort" : `exposes [${ladder.join(", ")}]`;
+		super(`ultracode requires xhigh; ${modelId} ${exposes}`);
+		this.name = "UltracodeEffortError";
+		this.modelId = modelId;
+		this.ladder = ladder;
+	}
+}
+
 /** Coarse per-spawn effort selectors accepted by the task tool. */
 export const TASK_EFFORTS = ["lo", "med", "hi"] as const;
 

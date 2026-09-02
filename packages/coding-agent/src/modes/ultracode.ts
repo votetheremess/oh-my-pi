@@ -42,6 +42,10 @@ const ULTRACODE_WORD = magicKeywordRegex("ultracode");
  *   the think tool, and the transport honors that (`forceReasoningOff`), so the
  *   xhigh pin never reaches the wire. The notice must not assert an effort the
  *   request will not carry.
+ * - `effortPinned` false: the active model exposes no xhigh rung, so the turn
+ *   was NOT armed (no pin, no subagent floor) and the user was told. The
+ *   notice must say so instead of promising an effort the harness refused to
+ *   substitute for; the orchestration contract still ships.
  * - `maxConcurrency` is the live `task.maxConcurrency`; 0 means unbounded and
  *   the cap sentence is omitted entirely, matching the system prompt.
  */
@@ -49,12 +53,14 @@ export function renderUltracodeNotice({
 	workflowAvailable,
 	scoutAvailable,
 	effortApplied,
+	effortPinned,
 	maxConcurrency,
 	viaPlanApproval,
 }: {
 	workflowAvailable: boolean;
 	scoutAvailable?: boolean;
 	effortApplied?: boolean;
+	effortPinned?: boolean;
 	maxConcurrency?: number;
 	viaPlanApproval?: boolean;
 }): string {
@@ -63,6 +69,7 @@ export function renderUltracodeNotice({
 			workflowAvailable,
 			scoutAvailable: scoutAvailable ?? true,
 			effortApplied: effortApplied ?? true,
+			effortPinned: effortPinned ?? true,
 			MAX_CONCURRENCY: normalizeConcurrencyLimit(maxConcurrency ?? 0),
 			viaPlanApproval: viaPlanApproval ?? false,
 		})

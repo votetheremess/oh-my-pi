@@ -162,6 +162,13 @@ export interface AgentSessionConfig {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Hard ceiling on the session's thinking effort (e.g. a task spawn's `task.maxEffort`-capped hint); every later change, including retry-fallback recovery, is re-clamped to it. */
 	thinkingLevelCeiling?: Effort;
+	/**
+	 * Level the ultracode handback returns to. A task-spawned child constructed
+	 * directly at xhigh under an armed parent never pins for itself, so this is
+	 * how it learns what to hand back when the parent's turn ends and the
+	 * lifecycle sync disarms it. Roots leave it unset: they capture at pin time.
+	 */
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 	/** Retry chain ownership when startup selected one of its fallback entries. */
 	initialRetryFallback?: InitialRetryFallbackState;
 	/** Prewalk from the starting model to a fast/cheap target after implementation begins. */
@@ -367,6 +374,15 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/**
+	 * Turn-start side effect that fires when the queued follow-up is COMMITTED
+	 * into the live context — never at enqueue. The canonical use is the
+	 * plan-approval ultracode arm (`armUltracodeTurnDeferred()`): arming at
+	 * enqueue would raise the in-flight turn's effort pin and subagent floor
+	 * before the approved plan starts, and leave them raised if the follow-up is
+	 * later dequeued or handed back to the editor.
+	 */
+	onDeliver?: () => void;
 }
 
 /** Result from a handoff operation. */
@@ -380,6 +396,15 @@ export interface SessionHandoffOptions {
 	autoTriggered?: boolean;
 	signal?: AbortSignal;
 }
+
+/**
+ * Who is changing the session's model, as seen by an ultracode turn in flight.
+ * `"user"` is an explicit pick and an off-ramp (the turn ends, the borrowed
+ * level is handed back first, the pick wins). `"extension"` and `"internal"`
+ * (prewalk, context promotion, retry fallback) keep the turn: the swap
+ * re-pins xhigh and warns loudly when the new model cannot take the pin.
+ */
+export type ModelChangeSource = "user" | "extension" | "internal";
 
 /** Result from cycleModel(). */
 export interface ModelCycleResult {

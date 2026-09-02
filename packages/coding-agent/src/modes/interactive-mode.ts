@@ -98,6 +98,7 @@ import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
+import planModeApprovedUltracodePrompt from "../prompts/system/plan-mode-approved-ultracode.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
@@ -3128,9 +3129,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Capture the pre-plan model so #exitPlanMode can restore it. Only the
 		// entry path records this — a mid-planning role change (below) leaves the
 		// active model on the plan role, so overwriting here would restore the old
-		// plan model instead of the user's real pre-plan model.
+		// plan model instead of the user's real pre-plan model. The level is the
+		// USER's own, never a borrowed ultracode pin: restoring xhigh as "the
+		// configured level" on plan exit would strand the session there.
 		this.#planModePreviousModelState = currentModel
-			? { model: currentModel, thinkingLevel: this.session.configuredThinkingLevel() }
+			? { model: currentModel, thinkingLevel: this.session.userConfiguredThinkingLevel() }
 			: undefined;
 
 		await this.#applyPlanModelTransition(currentModel, resolved);
@@ -3194,14 +3197,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	/** Apply any deferred model switch after the current stream ends. */
+	/**
+	 * Apply any deferred model switch after the current stream ends. A RESTORE
+	 * (or the plan role landing late), not the user picking a model: `internal`
+	 * keeps an armed ultracode turn's pin and floor across the swap.
+	 */
 	async flushPendingModelSwitch(): Promise<void> {
 		const pending = this.#pendingModelSwitch;
 		this.#pendingModelSwitch = undefined;
 		this.#pendingPlanModelSwitch = false;
 		if (!pending) return;
 		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+			await this.session.setModelTemporary(pending.model, pending.thinkingLevel, undefined, "internal");
 		} catch (error) {
 			this.showWarning(
 				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
@@ -3503,7 +3510,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const planModeTools = this.session.getEnabledToolNames();
 		const planModeMountedTools = this.session.getMountedXdevToolNames();
 		const planModeModelState = this.session.model
-			? { model: this.session.model, thinkingLevel: this.session.configuredThinkingLevel() }
+			? { model: this.session.model, thinkingLevel: this.session.userConfiguredThinkingLevel() }
 			: undefined;
 		this.session.setPlanModeState(undefined);
 		try {
@@ -3530,7 +3537,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (
 				planModeModelState &&
 				(!modelsAreEqual(this.session.model, planModeModelState.model) ||
-					this.session.configuredThinkingLevel() !== planModeModelState.thinkingLevel)
+					this.session.userConfiguredThinkingLevel() !== planModeModelState.thinkingLevel)
 			) {
 				try {
 					await this.#restorePlanPreviousModel(planModeModelState);
@@ -4085,14 +4092,17 @@ export class InteractiveMode implements InteractiveModeContext {
 			planContent,
 			contextPreserved: options.preserveContext === true,
 		});
-		// Arm ultracode LAST, after #exitPlanMode and any executionModel application:
-		// #exitPlanMode restores the pre-plan model state, which would revert the
-		// pinned thinking level, exactly as documented for executionModel above. The
-		// notice rides on the synthetic directive because the synthetic path does not
-		// build keyword notices; the turn stays synthetic, so nothing disarms it, and
-		// the next keyword-free user turn hands the borrowed effort back.
+		// The ultracode notice rides on the synthetic directive because the
+		// synthetic path does not build keyword notices. `ultracodeArmNotice` is a
+		// pure render: the ARM itself happens below, as late as possible, so the
+		// state never flips for a turn that has not started (see the dispatch
+		// branches). The turn stays synthetic, so nothing disarms it, and the next
+		// keyword-free user turn hands the borrowed effort back.
 		const planModePrompt = options.executionUltracode
-			? `${this.session.armUltracodeTurn()}\n\n${planModeDirective}`
+			? prompt.render(planModeApprovedUltracodePrompt, {
+					ultracodeNotice: this.session.ultracodeArmNotice(),
+					planModeDirective,
+				})
 			: planModeDirective;
 		// Close the review overlay only now — after the async title write and plan
 		// prompt are prepared, immediately before the execution turn is queued. The
@@ -4114,16 +4124,49 @@ export class InteractiveMode implements InteractiveModeContext {
 		// execution directive behind it as a synthetic follow-up. If `isStreaming`
 		// flips true between the check and dispatch (the same fire-and-forget race
 		// noted below), catch `AgentBusyError` and fall back to the same queue.
+		//
+		// Ultracode arms at the moment the execution turn actually STARTS, never at
+		// enqueue, and always AFTER #exitPlanMode and any executionModel
+		// application above: #exitPlanMode restores the pre-plan model state, which
+		// would revert the pinned thinking level (the hazard documented for
+		// executionModel). Queued directive: the flip rides the follow-up as its
+		// delivery hook, so a directive that waits behind an in-flight turn cannot
+		// raise (or drop) that turn's pin and floor early, and a dropped directive
+		// leaves no flip behind. Direct dispatch: flip immediately before `prompt`.
+		//
+		// A plain approval is the user's effort decision for execution: the
+		// planning turn may have carried the keyword, and a synthetic turn never
+		// runs the keyword-free disarm on its own, so it is disarmed here
+		// explicitly rather than inheriting the planning arm.
+		const applyExecutionUltracodeState = options.executionUltracode
+			? this.session.armUltracodeTurnDeferred()
+			: this.session.disarmUltracodeTurnDeferred();
+		const followUpOptions = { synthetic: true, onDeliver: applyExecutionUltracodeState };
 		if (this.session.isStreaming) {
-			await this.session.followUp(planModePrompt, undefined, { synthetic: true });
-		} else {
-			try {
-				await this.session.prompt(planModePrompt, { synthetic: true });
-			} catch (error) {
-				if (!(error instanceof AgentBusyError)) throw error;
-				await this.session.followUp(planModePrompt, undefined, { synthetic: true });
-			}
+			await this.session.followUp(planModePrompt, undefined, followUpOptions);
+			return true;
 		}
+		// The undo reverts exactly this arm (and nothing an in-flight keyword turn
+		// already holds) when the prompt never starts a turn: an abort/denial
+		// returning false, or the AgentBusyError race, which re-queues the
+		// directive with the same flip as its delivery hook.
+		let undoArm: (() => void) | undefined;
+		if (options.executionUltracode) undoArm = this.session.armUltracodeTurnWithUndo().undo;
+		else this.session.disarmUltracodeTurn();
+		let dispatched = false;
+		try {
+			dispatched = await this.session.prompt(planModePrompt, { synthetic: true });
+		} catch (error) {
+			undoArm?.();
+			if (!(error instanceof AgentBusyError)) throw error;
+			// The direct arm already warned once when the model cannot take the
+			// pin; re-arming at delivery would only repeat the warning.
+			const deferredOptions =
+				options.executionUltracode && !this.session.canPinUltracode() ? { synthetic: true } : followUpOptions;
+			await this.session.followUp(planModePrompt, undefined, deferredOptions);
+			return true;
+		}
+		if (!dispatched) undoArm?.();
 		return true;
 	}
 	async #abortPlanApprovalTurnSilently(): Promise<void> {

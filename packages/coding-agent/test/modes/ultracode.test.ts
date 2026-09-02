@@ -276,16 +276,21 @@ describe("ultracode notice renders live session facts", () => {
 		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 0 })).not.toContain("at most");
 	});
 
-	it("stops asserting the effort pin when the transport will discard it", () => {
+	it("states the pin as exactly xhigh, never a clamp, when the harness applied it", () => {
 		const applied = renderUltracodeNotice({ workflowAvailable: true, effortApplied: true });
 		expect(applied).toContain("The harness has already pinned");
-		// beginUltracodeTurn no-ops on non-reasoning models and reasoning models
-		// with no controllable effort surface, and on ladders without xhigh it pins
-		// the clamped level instead (model-controls.ts). The renderer cannot see
-		// which case it is, so the applied branch must carry the hedge in its own
-		// text rather than assert an unconditional, unclamped xhigh pin.
-		expect(applied).toContain("clamped to each model's own ladder");
-		expect(applied).toContain("one with no effort control runs unchanged");
+		// The contract is strict: beginUltracodeTurn and the executor pin xhigh or
+		// refuse (ultracodeEffortFor in src/thinking.ts). The notice must not
+		// hedge with the old clamp language, which promised a neighbouring level
+		// the harness now never substitutes.
+		expect(applied).toContain("exactly xhigh");
+		expect(applied).toContain("never max and never lower");
+		expect(applied).toContain("fails to spawn rather than running at a substitute level");
+		expect(applied).not.toContain("clamped to each model's own ladder");
+		expect(applied).not.toContain("pins to high");
+	});
+
+	it("stops asserting the effort pin when the transport will discard it", () => {
 		// With externalThinking on, the transport's forceReasoningOff strips
 		// reasoning before the request leaves, so the pin never reaches the wire.
 		// Asserting it anyway makes the failure unobservable from inside the
@@ -296,20 +301,52 @@ describe("ultracode notice renders live session facts", () => {
 		expect(suppressed).toContain("`think`");
 	});
 
+	it("says the turn is NOT armed when the model has no xhigh rung", () => {
+		// Fail loud, not clamp: AgentSession passes effortPinned=false when
+		// ultracodeEffortFor(model) is undefined, having set no override and no
+		// pin. A notice claiming "already pinned" there would have the model
+		// believe in an effort the harness refused to substitute for.
+		const unarmed = renderUltracodeNotice({ workflowAvailable: true, effortPinned: false });
+		expect(unarmed).toContain("NOT armed");
+		expect(unarmed).toContain("no xhigh reasoning tier");
+		expect(unarmed).not.toContain("The harness has already pinned");
+		expect(unarmed).not.toContain("externalThinking");
+		// The orchestration contract still ships: the keyword fired, only the
+		// effort could not be honoured.
+		expect(unarmed).toContain("agent(");
+		expect(unarmed).toContain("THIS TURN");
+		// The not-armed branch outranks the externalThinking branch: with no pin
+		// there is no effort target to spend through the think tool either.
+		expect(renderUltracodeNotice({ workflowAvailable: true, effortPinned: false, effortApplied: false })).toBe(
+			unarmed,
+		);
+	});
+
+	it("defaults effortPinned to true, so existing render call sites are byte-identical", () => {
+		expect(renderUltracodeNotice({ workflowAvailable: true, effortPinned: true })).toBe(
+			renderUltracodeNotice({ workflowAvailable: true }),
+		);
+		expect(renderUltracodeNotice({ workflowAvailable: false, effortPinned: true })).toBe(
+			renderUltracodeNotice({ workflowAvailable: false }),
+		);
+	});
+
 	it("leaves no handlebars behind in any combination of live facts", () => {
 		for (const scoutAvailable of [true, false])
 			for (const effortApplied of [true, false])
-				for (const maxConcurrency of [0, 8, 32])
-					for (const workflowAvailable of [true, false]) {
-						const notice = renderUltracodeNotice({
-							workflowAvailable,
-							scoutAvailable,
-							effortApplied,
-							maxConcurrency,
-						});
-						expect(notice).not.toContain("{{");
-						expect(notice).not.toContain("}}");
-					}
+				for (const effortPinned of [true, false])
+					for (const maxConcurrency of [0, 8, 32])
+						for (const workflowAvailable of [true, false]) {
+							const notice = renderUltracodeNotice({
+								workflowAvailable,
+								scoutAvailable,
+								effortApplied,
+								effortPinned,
+								maxConcurrency,
+							});
+							expect(notice).not.toContain("{{");
+							expect(notice).not.toContain("}}");
+						}
 	});
 });
 

@@ -3,7 +3,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentTool,
+	ASIDE_MESSAGE_COMMIT,
+	type CommittableAsideMessage,
+} from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
@@ -40,6 +46,10 @@ const mockEvalTool: AgentTool = {
 async function createMagicKeywordSession(
 	modelRegistry: ModelRegistry,
 	tools: AgentTool[] = [mockTaskTool, mockEvalTool],
+	options?: {
+		/** `"sub"` is what sdk.ts derives for a task-spawned child; arming is root-only. */
+		agentKind?: "main" | "sub";
+	},
 ): Promise<{
 	session: AgentSession;
 	settings: Settings;
@@ -61,6 +71,7 @@ async function createMagicKeywordSession(
 		sessionManager: SessionManager.inMemory(),
 		settings,
 		modelRegistry,
+		agentKind: options?.agentKind,
 	});
 	return { session, settings };
 }
@@ -565,5 +576,221 @@ describe("AgentSession magic keyword settings", () => {
 			expect(MAGIC_KEYWORD_NOTICE_TYPES[notice.customType]).toBe(true);
 			expect(isHiddenUserCompanion(notice)).toBe(true);
 		}
+	});
+});
+
+// Programmatic entry points. `sendUserMessage` is a USER message by contract
+// (an extension relaying what the user typed in some other surface), so on a
+// root it fires the keywords exactly like typing. What keeps a subagent's flag
+// safe is not attribution but the root-only rule: on a `"sub"` session nothing
+// ever arms or disarms from prompt text, whichever door the text comes in by.
+// The synthetic plan-approval follow-up is agent-authored and must never flip
+// the keyword at enqueue; its arm rides the message as a delivery hook.
+describe("AgentSession ultracode on programmatic prompts", () => {
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage;
+	let authRoot: string;
+	let modelRegistry: ModelRegistry;
+
+	beforeAll(async () => {
+		authRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-magic-keywords-programmatic-auth-"));
+		authStorage = await AuthStorage.create(path.join(authRoot, "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage, path.join(authRoot, "models.yml"));
+	});
+
+	afterAll(async () => {
+		authStorage.close();
+		await removeWithRetries(authRoot);
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		if (session) await session.dispose();
+		session = undefined;
+	});
+
+	/** Forces the queue path without a live agent loop, so nothing drains. */
+	function forceStreaming(target: AgentSession): void {
+		Object.defineProperty(target, "isStreaming", { configurable: true, get: () => true });
+	}
+
+	/** The queued developer message a synthetic followUp() lands on the follow-up queue. */
+	function queuedDeveloperMessage(target: AgentSession): CommittableAsideMessage | undefined {
+		const queued = target.agent.peekFollowUpQueue().find(message => message.role === "developer");
+		expect(queued).toBeDefined();
+		return queued as CommittableAsideMessage | undefined;
+	}
+
+	/** The queued user message on the given queue, with its (optional) delivery rider. */
+	function queuedUserMessage(target: AgentSession, queue: "steer" | "followUp"): CommittableAsideMessage | undefined {
+		const queued = (queue === "steer" ? target.agent.peekSteeringQueue() : target.agent.peekFollowUpQueue()).find(
+			message => message.role === "user",
+		);
+		expect(queued).toBeDefined();
+		return queued as CommittableAsideMessage | undefined;
+	}
+
+	// `sendUserMessage` is the extension runtime's (and autoresearch's, and the
+	// ACP/RPC extension bridges') way in for a message the USER authored on
+	// another surface. It routes through prompt() with the default user
+	// attribution, so the keyword fires exactly as if typed.
+	it("arms ultracode from a root's sendUserMessage, notice included", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.sendUserMessage("please ultracode this refactor");
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual(["ultracode-notice"]);
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("disarms on a root's keyword-free sendUserMessage, like any user turn", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		session.armUltracodeTurn();
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.sendUserMessage("carry on with the brief");
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("delivers sendUserMessage steers arm-only and follow-ups arm-or-disarm", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		forceStreaming(session);
+
+		// A keyword steer arms when the loop commits it...
+		await session.sendUserMessage("ultracode the rest of this", { deliverAs: "steer" });
+		expect(created.settings.get("ultracode")).toBe(false);
+		queuedUserMessage(session, "steer")?.[ASIDE_MESSAGE_COMMIT]?.();
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		// ...a keyword-free follow-up disarms when it starts the next turn.
+		await session.sendUserMessage("now the plain next step", { deliverAs: "followUp" });
+		expect(created.settings.get("ultracode")).toBe(true);
+		const hook = queuedUserMessage(session, "followUp")?.[ASIDE_MESSAGE_COMMIT];
+		expect(typeof hook).toBe("function");
+		hook?.();
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	// The depth-2 hazard, by the extension door: a task child inherits
+	// `ultracode: true` through its settings snapshot, and an extension inside
+	// it relaying text must neither arm nor disarm — the flag follows the
+	// parent's turn through the lifecycle sync, never prompt text.
+	it("never arms a task-spawned child from sendUserMessage, and queues it no notice", async () => {
+		const created = await createMagicKeywordSession(modelRegistry, undefined, { agentKind: "sub" });
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.sendUserMessage("please ultracode this refactor");
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ customType?: string }>;
+		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("never disarms a task-spawned child's inherited flag from a keyword-free sendUserMessage", async () => {
+		const created = await createMagicKeywordSession(modelRegistry, undefined, { agentKind: "sub" });
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		created.settings.override("ultracode", true);
+		expect(session.repinUltracodeIfArmed()).toBe(true);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.sendUserMessage("carry on with the brief");
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("attaches no keyword rider to a task-spawned child's queued sendUserMessage", async () => {
+		const created = await createMagicKeywordSession(modelRegistry, undefined, { agentKind: "sub" });
+		session = created.session;
+		created.settings.override("ultracode", true);
+		forceStreaming(session);
+
+		await session.sendUserMessage("ultracode this", { deliverAs: "steer" });
+		await session.sendUserMessage("plain follow-up", { deliverAs: "followUp" });
+
+		expect(queuedUserMessage(session, "steer")?.[ASIDE_MESSAGE_COMMIT]).toBeUndefined();
+		expect(queuedUserMessage(session, "followUp")?.[ASIDE_MESSAGE_COMMIT]).toBeUndefined();
+		expect(created.settings.get("ultracode")).toBe(true);
+	});
+
+	// The plan review's "Approve and execute with ultracode" lands behind an
+	// in-flight turn as a synthetic follow-up. The arm must ride that message
+	// as a delivery hook — firing when the loop commits it — never at enqueue,
+	// where it would yank the pin and floor of whatever is still running.
+	it("attaches a follow-up's onDeliver hook to the queued message and never fires it at enqueue", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		forceStreaming(session);
+		let fired = 0;
+
+		await session.followUp("<system-notice>approved</system-notice>\n\nexecute the plan", undefined, {
+			synthetic: true,
+			onDeliver: () => {
+				fired++;
+			},
+		});
+
+		expect(fired).toBe(0);
+		const hook = queuedDeveloperMessage(session)?.[ASIDE_MESSAGE_COMMIT];
+		expect(typeof hook).toBe("function");
+		hook?.();
+		expect(fired).toBe(1);
+	});
+
+	it("arms ultracode only when the queued plan-approval follow-up is delivered", async () => {
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		forceStreaming(session);
+
+		// Exactly what interactive-mode passes on the queued path.
+		await session.followUp("<system-notice>approved</system-notice>\n\nexecute the plan", undefined, {
+			synthetic: true,
+			onDeliver: session.armUltracodeTurnDeferred(),
+		});
+
+		// Enqueue is not turn start: the current turn keeps its own effort.
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+
+		queuedDeveloperMessage(session)?.[ASIDE_MESSAGE_COMMIT]?.();
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("attaches no delivery effect to a synthetic follow-up that did not ask for one", async () => {
+		// Control for the two above: the hook is opt-in, so an ordinary approved
+		// plan (no ultracode option) queues a plain developer message.
+		const created = await createMagicKeywordSession(modelRegistry);
+		session = created.session;
+		forceStreaming(session);
+
+		await session.followUp("execute the plan", undefined, { synthetic: true });
+
+		expect(queuedDeveloperMessage(session)?.[ASIDE_MESSAGE_COMMIT]).toBeUndefined();
+		expect(created.settings.get("ultracode")).toBe(false);
 	});
 });

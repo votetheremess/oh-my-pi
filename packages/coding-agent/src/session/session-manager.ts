@@ -19,6 +19,7 @@ import {
 	toError,
 } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { ConfiguredThinkingLevel } from "../thinking";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -2412,6 +2413,8 @@ export class SessionManager {
 		spawns?: string;
 		readSummarize?: boolean;
 		advisor?: string;
+		ultracode?: boolean;
+		ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -2977,6 +2980,8 @@ export class SessionManager {
 			spawns?: string;
 			readSummarize?: boolean;
 			advisor?: string;
+			ultracode?: boolean;
+			ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 		} | null;
 	} | null> {
 		let header: SessionHeader | undefined;
@@ -2994,6 +2999,8 @@ export class SessionManager {
 			spawns?: string;
 			readSummarize?: boolean;
 			advisor?: string;
+			ultracode?: boolean;
+			ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 		} | null = null;
 		const visit = (entry: FileEntry): void => {
 			if (entry.type === "session") {
@@ -3015,6 +3022,8 @@ export class SessionManager {
 					readSummarize: entry.readSummarize,
 					spawns: entry.spawns,
 					advisor: entry.advisor,
+					ultracode: entry.ultracode,
+					ultracodeRestoreLevel: entry.ultracodeRestoreLevel,
 				};
 			}
 		};

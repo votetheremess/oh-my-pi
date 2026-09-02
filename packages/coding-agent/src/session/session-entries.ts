@@ -8,6 +8,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { ConfiguredThinkingLevel } from "../thinking";
 import type { CompactionMethod } from "./compaction-methods";
 
 export const CURRENT_SESSION_VERSION = 3;
@@ -257,6 +258,15 @@ export interface SessionInitEntry extends SessionEntryBase {
 	readSummarize?: boolean;
 	/** Effective advisor for this subagent: `"on"` = advisor-role model, else an explicit model pattern; absent = unadvised. */
 	advisor?: string;
+	/** True when the subagent was spawned inside an ultracode turn; a cold revive re-pins xhigh from it when the parent's live settings are unavailable. */
+	ultracode?: boolean;
+	/**
+	 * The thinking level the child would have run at WITHOUT ultracode (only
+	 * written next to `ultracode`). A cold revive seeds the child's hand-back
+	 * from it so a later disarm restores this level instead of leaving the
+	 * borrowed xhigh behind as if the user had chosen it.
+	 */
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

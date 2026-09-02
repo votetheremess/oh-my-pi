@@ -21,8 +21,10 @@
  */
 
 import * as fs from "node:fs/promises";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import { UltracodeEffortError } from "../thinking";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import {
 	type AgentRef,
@@ -43,6 +45,68 @@ async function persistAgentTombstone(sessionFile: string): Promise<void> {
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 	}
+}
+
+/**
+ * Re-derive a child's ultracode state at a resume boundary (follow-up turn,
+ * lifecycle revive, hub wake). The `ultracode` flag a task child carries is a
+ * settings SNAPSHOT taken at spawn, so left alone it would keep flooring the
+ * child's own spawns long after the parent's armed turn ended — or fail to
+ * floor them when the child was spawned unarmed and is woken inside a later
+ * ultracode turn. The nearest LIVE ancestor's runtime settings are the truth
+ * for "is the current turn armed": walk the parent chain to it (the root is
+ * always registered in-process) and mirror its flag onto the child.
+ *
+ * Armed → the child is re-pinned to exactly xhigh. The pin is checked BEFORE
+ * the flag is written: a child whose model has no xhigh rung, or whose hard
+ * effort ceiling sits below it, cannot satisfy the pin and the wake fails
+ * loudly (never a silent clamp) with the flag left exactly as it arrived — a
+ * flagged-but-unpinned child would floor its own spawns at a level it does
+ * not run at itself. A child that arrived already flagged (stale persisted
+ * snapshot) is disarmed first for the same reason. Not armed but the child
+ * still flagged → disarm so the child hands any borrowed effort back (to its
+ * `ultracodeRestoreLevel`) and its grandchildren stop flooring. Children
+ * never arm from prompt text; this parent-driven mirror is the only path that
+ * changes their flag. No live ancestor (custom registry, detached process) →
+ * the child's own snapshot — seeded from the persisted `session_init.ultracode`
+ * on a cold revive — stands as the fallback.
+ *
+ * Root/main sessions (no parent) are untouched: their arm/disarm is owned by
+ * the user turn itself.
+ */
+export function syncChildUltracodeAtResume(id: string, session: AgentSession, registry: AgentRegistry): void {
+	const ref = registry.get(id);
+	if (!ref?.parentId) return;
+	let armed = session.settings.get("ultracode");
+	const seen = new Set<string>([id]);
+	for (let parentId: string | undefined = ref.parentId; parentId && !seen.has(parentId); ) {
+		seen.add(parentId);
+		const parent = registry.get(parentId);
+		if (parent?.session) {
+			armed = parent.session.settings.get("ultracode");
+			break;
+		}
+		parentId = parent?.parentId;
+	}
+	if (!armed) {
+		if (session.settings.get("ultracode")) session.disarmUltracodeTurn();
+		return;
+	}
+	const refusal = session.ultracodePinRefusal();
+	if (refusal !== undefined) {
+		if (session.settings.get("ultracode")) session.disarmUltracodeTurn();
+		const model = session.model;
+		const modelId = model ? `${model.provider}/${model.id}` : "(unresolved model)";
+		if (refusal === "no-xhigh") throw new UltracodeEffortError(modelId, model ? getSupportedEfforts(model) : []);
+		// The rung exists; the session's hard effort ceiling is what clamps the
+		// pin below it (a child spawned unarmed keeps its `task.maxEffort` cap).
+		throw new Error(
+			`ultracode requires xhigh; ${modelId} exposes it but this session's effort ceiling clamps the pin below xhigh`,
+		);
+	}
+	if (!session.settings.get("ultracode")) session.settings.override("ultracode", true);
+	// Same predicate as `ultracodePinRefusal`, so this cannot decline now.
+	session.repinUltracodeIfArmed();
 }
 
 /**
@@ -537,6 +601,11 @@ export class AgentLifecycleManager {
 			await session.dispose();
 			throw new Error(`Agent "${id}" changed before its persisted session became idle.`);
 		}
+		// The revived session was rebuilt from a stale snapshot; mirror the live
+		// parent turn's ultracode state before anyone prompts it. Runs after the
+		// idle transition so a fail-loud (no xhigh rung) throw leaves a consistent
+		// idle, revivable agent behind rather than one stuck `running`.
+		syncChildUltracodeAtResume(id, session, this.#registry);
 		return session;
 	}
 

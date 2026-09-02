@@ -79,6 +79,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { type EditStore, PowerAssertion, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
 import {
@@ -102,7 +103,7 @@ import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
-import type { ResolvedModelRoleValue } from "../config/model-resolver";
+import { formatModelStringWithRouting, type ResolvedModelRoleValue } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -197,6 +198,7 @@ import {
 	parseConfiguredThinkingLevel,
 	shouldDisableReasoning,
 	toReasoningEffort,
+	UltracodeEffortError,
 } from "../thinking";
 import { isLowSignalTitleInput } from "../tiny/text";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
@@ -246,6 +248,7 @@ import type {
 	FollowUpOptions,
 	FreshSessionResult,
 	HandoffResult,
+	ModelChangeSource,
 	ModelCycleResult,
 	Prewalk,
 	PromptOptions,
@@ -695,6 +698,15 @@ export class AgentSession {
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
 	#scoutAllowedBySpawnPolicy = true;
+	/**
+	 * Bumped on every successful ultracode arm AND every disarm. Deferred
+	 * side effects (the dropped-turn undo, a queued keyword-free turn's disarm)
+	 * capture it when created and act only if nothing armed in between, so a
+	 * later arm — a plan directive queued behind a keyword-free follow-up, a
+	 * keyword steer landing while a dropped prompt's undo is pending — always
+	 * wins over an older intent to end the turn.
+	 */
+	#ultracodeArmSeq = 0;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
 	#inheritedProviderPromptCacheKey: string | undefined;
@@ -1280,8 +1292,14 @@ export class AgentSession {
 			sessionManager: this.sessionManager,
 			model: () => this.model,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
+			ultracodeArmed: () => this.settings.get("ultracode"),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
-			setModelTemporary: (model, thinkingLevel, options) => this.setModelTemporary(model, thinkingLevel, options),
+			// The prewalk's model swap is an internal, self-restoring transition, not
+			// the user picking a model: `source: "internal"` skips the ultracode
+			// off-ramp (a prewalk inside an armed turn must not drop the pin or
+			// floor) while still surfacing a refused re-pin.
+			setModelTemporary: (model, thinkingLevel, options) =>
+				this.setModelTemporary(model, thinkingLevel, options, "internal"),
 			setActiveToolsByName: names => this.setActiveToolsByName(names),
 			restoreNonMCPToolPresentation: (nonMCPToolNames, nonMCPMountedToolNames) =>
 				this.restoreNonMCPToolPresentation(nonMCPToolNames, nonMCPMountedToolNames),
@@ -1343,6 +1361,7 @@ export class AgentSession {
 			scopedModels: config.scopedModels,
 			thinkingLevel: config.thinkingLevel,
 			thinkingLevelCeiling: config.thinkingLevelCeiling,
+			ultracodeRestoreLevel: config.ultracodeRestoreLevel,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
 
@@ -1368,6 +1387,9 @@ export class AgentSession {
 			// transient fallback mid-ultracode-turn cannot drop the pending handback
 			// or the subagent floor.
 			setThinkingLevel: level => this.#models.setThinkingLevel(level),
+			repinUltracodeIfArmed: () => this.#models.repinUltracodeIfArmed(),
+			userConfiguredThinkingLevel: () => this.#models.userConfiguredThinkingLevel(),
+			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			thinkingLevelCeiling: () => this.#models.thinkingLevelCeiling,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
@@ -1893,7 +1915,11 @@ export class AgentSession {
 			runRecoveryCompactionWithRollback: (reason, message, allowDefer, options) =>
 				this.#recovery.runRecoveryCompactionWithRollback(reason, message, allowDefer, options),
 			parseRetryAfterMsFromError: errorMessage => this.#recovery.parseRetryAfterMsFromError(errorMessage),
-			setModelTemporary: (model, thinkingLevel, options) => this.setModelTemporary(model, thinkingLevel, options),
+			// Context promotion on overflow is an automated recovery, not the user
+			// picking a model: `source: "internal"` skips the ultracode off-ramp but
+			// still surfaces a refused re-pin.
+			setModelTemporary: (model, thinkingLevel, options) =>
+				this.setModelTemporary(model, thinkingLevel, options, "internal"),
 			abort: options => this.abort(options),
 			abortHandoff: () => this.abortHandoff(),
 		};
@@ -6059,6 +6085,7 @@ export class AgentSession {
 		workflowAvailable: boolean;
 		scoutAvailable: boolean;
 		effortApplied: boolean;
+		effortPinned: boolean;
 		maxConcurrency: number;
 	} {
 		const tools = this.getActiveToolNames();
@@ -6073,8 +6100,24 @@ export class AgentSession {
 				this.getEnabledToolNames().includes("think") &&
 				supportsExternalThinking(this.agent.state.model)
 			),
+			// Ultracode pins EXACTLY xhigh and never clamps, and only a root arms:
+			// this is the very predicate `#armUltracodeTurnNow` decides on (rung
+			// present AND not capped by the effort ceiling), so the notice never
+			// promises a floor the spawns will refuse to run under.
+			effortPinned: this.canPinUltracode(),
 			maxConcurrency: this.settings.get("task.maxConcurrency"),
 		};
+	}
+
+	/**
+	 * Plan-approval ultracode notice, rendered from live session facts with no
+	 * side effects. Split from {@link armUltracodeTurn} because the queued
+	 * approval branch needs the notice text at ENQUEUE (it rides the synthetic
+	 * follow-up) while the arm itself runs at delivery via
+	 * {@link armUltracodeTurnDeferred}.
+	 */
+	ultracodeArmNotice(): string {
+		return renderUltracodeNotice({ ...this.#ultracodeNoticeFacts(), viaPlanApproval: true });
 	}
 
 	/**
@@ -6094,11 +6137,199 @@ export class AgentSession {
 	 * - The armed turn MUST be synthetic, so the disarm `else` branch never runs
 	 *   against it. The next keyword-free USER turn hands the borrowed effort back,
 	 *   exactly as it would for a typed `ultracode` turn.
+	 *
+	 * Root-only like {@link #applyUltracodeTurnState}: a child never arms. When
+	 * the model has no xhigh rung nothing is armed (see {@link #armUltracodeTurnNow})
+	 * and the returned notice says so via `effortPinned`.
 	 */
 	armUltracodeTurn(): string {
-		this.settings.override("ultracode", true);
-		this.#models.beginUltracodeTurn();
-		return renderUltracodeNotice({ ...this.#ultracodeNoticeFacts(), viaPlanApproval: true });
+		return this.armUltracodeTurnWithUndo().notice;
+	}
+
+	/**
+	 * {@link armUltracodeTurn} that also hands back the arm's undo closure, for
+	 * a caller that arms right before a dispatch which may still drop the turn
+	 * (the plan-approval direct dispatch racing an abort): running the undo
+	 * reverts exactly what this arm changed, and nothing if a later arm or
+	 * disarm has already decided the state. `undo` is absent when nothing was
+	 * armed (child session, refused pin, or already armed with a handback).
+	 */
+	armUltracodeTurnWithUndo(): { notice: string; undo?: () => void } {
+		const undo = this.#agentKind !== "sub" ? this.#armUltracodeTurnNow() : undefined;
+		return { notice: this.ultracodeArmNotice(), undo };
+	}
+
+	/**
+	 * {@link armUltracodeTurn} as a thunk, for callers that arm at DELIVERY
+	 * rather than at enqueue: the plan-approval follow-up queued behind a busy
+	 * turn (as its {@link FollowUpOptions.onDeliver} hook).
+	 * Arming at enqueue would raise the in-flight turn's pin and floor before
+	 * the approved plan even starts, and leave them raised if it is dequeued.
+	 */
+	armUltracodeTurnDeferred(): () => void {
+		return () => {
+			if (this.#agentKind !== "sub") this.#armUltracodeTurnNow();
+		};
+	}
+
+	/**
+	 * Disarm as a delivery thunk, for a keyword-free turn that ENDS an
+	 * ultracode turn at DELIVERY rather than at enqueue: a queued keyword-free
+	 * follow-up, or a plan approved WITHOUT ultracode whose directive is queued
+	 * behind a running keyword turn (disarming at enqueue would yank that turn's
+	 * pin). Yields to an arm that fired in the SAME commit batch — see
+	 * {@link #ultracodeArmedInBatch} — and otherwise always disarms: a
+	 * keyword-free follow-up delivered as its own later turn (the default
+	 * `followUpMode`) ends ultracode exactly like a typed one. Root-only: a child
+	 * never ends its parent's turn from prompt text.
+	 */
+	disarmUltracodeTurnDeferred(): () => void {
+		return () => {
+			if (this.#agentKind !== "sub" && !this.#ultracodeArmedInBatch) this.disarmUltracodeTurn();
+		};
+	}
+
+	/**
+	 * True while an arm hook has fired in the CURRENT synchronous commit batch.
+	 * The agent loop commits every queued message of a batch in one synchronous
+	 * `for` (agent-loop.ts, `ASIDE_MESSAGE_COMMIT`), so a microtask scheduled by
+	 * the arm clears the flag exactly after that batch: a keyword-free
+	 * follow-up committed in the same batch as an arm (all-at-once follow-ups,
+	 * or a plan directive's arm ahead of a plain follow-up) yields to the arm —
+	 * they run as ONE turn, and that turn carries the keyword — while one
+	 * delivered in a later batch is its own turn and disarms. An enqueue-time
+	 * sequence number cannot express this: it made a follow-up queued before
+	 * the arm but delivered as a later turn skip its disarm and run armed.
+	 */
+	#ultracodeArmedInBatch = false;
+
+	#markUltracodeArmedInBatch(): void {
+		if (this.#ultracodeArmedInBatch) return;
+		this.#ultracodeArmedInBatch = true;
+		queueMicrotask(() => {
+			this.#ultracodeArmedInBatch = false;
+		});
+	}
+
+	/**
+	 * Arm ultracode for the turn starting now: pin exactly xhigh, then raise the
+	 * runtime `ultracode` override the task executor reads as the spawn floor.
+	 *
+	 * Pin BEFORE flag, never the reverse: a model with no xhigh rung cannot be
+	 * pinned, and ultracode never clamps (user decision: fail loudly). Raising the
+	 * flag anyway would floor every spawn at a level this session itself is not
+	 * running at, and the executor would throw on each one. So on a failed pin the
+	 * turn stays unarmed, the user is told, and nothing is changed.
+	 *
+	 * @returns an undo closure reverting exactly what this call changed — the
+	 * override write and the pin/handback — for a dispatch that drops the turn
+	 * before it starts; `undefined` when nothing changed (refused pin, or a
+	 * re-arm behind an already-armed turn with its handback in place). The undo
+	 * is guarded by {@link #ultracodeArmSeq}: it acts only while it is still the
+	 * latest flip, so a later arm or disarm is never reverted by an older one.
+	 */
+	#armUltracodeTurnNow(): (() => void) | undefined {
+		const wasArmed = this.settings.get("ultracode");
+		const hadPendingRestore = this.#models.hasPendingUltracodeRestore();
+		if (!this.#models.beginUltracodeTurn()) {
+			// Silent clamping is exactly what the fail-loud policy forbids, so the
+			// refusal has to be visible to the user, not buried in the hidden notice.
+			const model = this.model;
+			const error = new UltracodeEffortError(
+				model ? formatModelStringWithRouting(model) : "no model",
+				model ? getSupportedEfforts(model) : [],
+			);
+			this.emitNotice("warning", `${error.message}; this turn is not armed`, "ultracode");
+			return undefined;
+		}
+		// Runtime override layer only, never written to settings.json. It is how
+		// the task executor learns this turn's spawns run at the ultracode floor.
+		if (!wasArmed) this.settings.override("ultracode", true);
+		const seq = ++this.#ultracodeArmSeq;
+		// Even a re-arm that changed nothing counts for the batch: a keyword-free
+		// follow-up committed alongside it must still yield to the keyword.
+		this.#markUltracodeArmedInBatch();
+		this.#advisors.resyncUltracodeEffort();
+		if (wasArmed && hadPendingRestore) return undefined;
+		return () => {
+			// A later arm or disarm already decided the state; reverting this
+			// one now would yank the pin and floor out from under that turn.
+			if (this.#ultracodeArmSeq !== seq) return;
+			if (!wasArmed && this.settings.get("ultracode")) this.settings.override("ultracode", false);
+			if (!hadPendingRestore) this.#models.endUltracodeTurn();
+			this.#ultracodeArmSeq++;
+			this.#advisors.resyncUltracodeEffort();
+		};
+	}
+
+	/**
+	 * End any ultracode turn in flight: force the runtime flag to false (not
+	 * merely cleared, so a persisted `ultracode: true` cannot leak back through
+	 * the override layer and silently re-arm every turn) and hand the borrowed
+	 * effort back. Guarded on the merged value: writing the override rebuilds the
+	 * settings merge and seeds the override map, which the common keyword-free
+	 * turn must not pay for when the flag is already off.
+	 *
+	 * Public for the paths where armed state would otherwise outlive its turn:
+	 * session transitions (`newSession`/`switchSession`), a user picking a model
+	 * or role between turns, and the task executor mirroring a parent that has
+	 * since disarmed onto a resumed child. Works on child sessions for that last
+	 * reason — only prompt-text ARMING is root-only.
+	 */
+	disarmUltracodeTurn(): void {
+		// Bookkeeping only on an actual flip: a keyword-free turn on an unarmed
+		// session (the common case) must not bump the sequence or make advisors
+		// re-resolve — that resync is observable when advisors are live.
+		const wasArmed = this.settings.get("ultracode");
+		const hadPendingRestore = this.#models.hasPendingUltracodeRestore();
+		if (wasArmed) this.settings.override("ultracode", false);
+		this.#models.endUltracodeTurn();
+		if (!wasArmed && !hadPendingRestore) return;
+		this.#ultracodeArmSeq++;
+		this.#advisors.resyncUltracodeEffort();
+	}
+
+	/**
+	 * Whether this session would arm on the next keyword: a root whose current
+	 * model can pin exactly xhigh under its effort ceiling. The very predicate
+	 * {@link #armUltracodeTurnNow} decides on, exposed so notices and hosts
+	 * never promise a floor the arm will refuse.
+	 */
+	canPinUltracode(): boolean {
+		return this.#agentKind !== "sub" && this.#models.canPinUltracode();
+	}
+
+	/**
+	 * Why the current model cannot pin xhigh (`"no-xhigh"`: the ladder lacks the
+	 * rung; `"ceiling"`: the session's effort ceiling caps it below), or
+	 * `undefined` when it can. Hosts that fail loudly on a refused re-pin (the
+	 * task lifecycle sync, /tan) word their error from this.
+	 */
+	ultracodePinRefusal(): "no-xhigh" | "ceiling" | undefined {
+		return this.#models.ultracodePinRefusal();
+	}
+
+	/**
+	 * The thinking level the USER owns: the level an ultracode turn borrowed
+	 * from when one is in flight, otherwise the configured selector. Never the
+	 * borrowed xhigh pin — surfaces that show or hand back "the user's level"
+	 * read this instead of {@link configuredThinkingLevel}.
+	 */
+	userConfiguredThinkingLevel(): ConfiguredThinkingLevel | undefined {
+		return this.#models.userConfiguredThinkingLevel();
+	}
+
+	/**
+	 * Re-apply the xhigh pin on the current model if this session is armed
+	 * (`settings.get("ultracode")`), returning whether it landed. False while
+	 * armed means the model cannot take the pin (see {@link ultracodePinRefusal});
+	 * the level is left alone and the caller decides how to fail (the task
+	 * lifecycle sync throws, /tan refuses the fork up front). For a
+	 * child this is the ONLY way effort follows the inherited flag: children
+	 * never run {@link #applyUltracodeTurnState}.
+	 */
+	repinUltracodeIfArmed(): boolean {
+		return this.#models.repinUltracodeIfArmed();
 	}
 
 	/**
@@ -6122,31 +6353,68 @@ export class AgentSession {
 	 * MUST run when that turn actually STARTS, not when it is enqueued: flipping
 	 * the state from a message queued during streaming would raise or drop the
 	 * in-flight turn's effort pin and subagent floor before the message is even
-	 * delivered. Direct prompts apply it inline; queued steers/follow-ups defer
-	 * it to delivery via {@link attachQueuedMessageDeliveryEffect}.
+	 * delivered. Direct prompts apply it inline (and undo it via the returned
+	 * closure when dispatch drops the turn, so a pin never outlives a turn that
+	 * never ran); queued steers/follow-ups defer it to delivery through
+	 * {@link #ultracodeDeliveryHook}.
 	 *
 	 * Callers MUST restrict this to genuinely user-authored turns. The
 	 * unconditional `else` disarms the keyword, so running it on an
 	 * agent-initiated prompt clears an inherited `ultracode: true` before the
 	 * subagent holding it can spawn anything.
+	 *
+	 * Root-only: a task-spawned child (`agentKind: "sub"`) inherits the flag
+	 * through its settings snapshot and only ever re-pins. A user steering a
+	 * child directly (collab host, transcript viewer) or an extension sending it
+	 * a user-attributed message must neither disarm what the parent's turn
+	 * armed nor arm what it did not, so on a child this is a no-op.
+	 *
+	 * @returns the undo closure for what the arm changed, or `undefined` when a
+	 * keyword-free turn disarmed (a dropped keyword-free turn leaving things
+	 * disarmed is the correct end state, so there is nothing to revert).
 	 */
-	#applyUltracodeTurnState(text: string): void {
+	#applyUltracodeTurnState(text: string): (() => void) | undefined {
+		if (this.#agentKind === "sub") return undefined;
 		if (this.#magicKeywordEnabled("ultracode") && containsUltracode(text)) {
-			// Runtime override layer only, never written to settings.json. It is how
-			// the task executor learns this turn's spawns run at the ultracode floor.
-			this.settings.override("ultracode", true);
-			this.#models.beginUltracodeTurn();
-		} else {
-			// A user turn without the word ends any ultracode turn before it: hand the
-			// borrowed effort back and force the flag to false (not merely cleared), so
-			// a persisted `ultracode: true` cannot leak through the override layer and
-			// silently re-arm every turn. Guarded on the merged value: writing the
-			// override rebuilds the settings merge and seeds the override map, which
-			// the common keyword-free turn must not pay for when the flag is already
-			// off.
-			if (this.settings.get("ultracode")) this.settings.override("ultracode", false);
-			this.#models.endUltracodeTurn();
+			return this.#armUltracodeTurnNow();
 		}
+		// A user turn without the word ends any ultracode turn before it.
+		this.disarmUltracodeTurn();
+		return undefined;
+	}
+
+	/**
+	 * Delivery-time counterpart of {@link #applyUltracodeTurnState} for a
+	 * user-authored message queued behind a running turn, attached via
+	 * {@link attachQueuedMessageDeliveryEffect} so it fires when the loop
+	 * commits the message, never at enqueue.
+	 *
+	 * The queue mode decides what a keyword-free message means. A follow-up
+	 * STARTS a turn, so it gets the full arm-or-disarm. A steer JOINS the
+	 * running turn: with the keyword it arms (the user is raising the turn
+	 * they are already in), without it it does nothing — a mid-turn "actually,
+	 * also do X" must not yank the pin and spawn floor out of the turn it
+	 * joins, so a keyword-free steer attaches no hook at all. An aside is a
+	 * non-interrupting join (folded in at the next step boundary), so it is
+	 * arm-only for exactly the same reason.
+	 *
+	 * The disarm yields to an arm that fired in the same commit batch (see
+	 * {@link #ultracodeArmedInBatch}): a plan directive's arm hook ahead of a
+	 * keyword-free follow-up in one batch is the later user intent and wins;
+	 * the same follow-up delivered as its own later turn disarms.
+	 *
+	 * Root-only for the same reason as the inline apply: a child never arms or
+	 * disarms from prompt text.
+	 */
+	#ultracodeDeliveryHook(text: string, mode: "steer" | "followUp" | "aside"): (() => void) | undefined {
+		if (this.#agentKind === "sub") return undefined;
+		if (this.#magicKeywordEnabled("ultracode") && containsUltracode(text)) {
+			return () => {
+				this.#armUltracodeTurnNow();
+			};
+		}
+		if (mode !== "followUp") return undefined;
+		return this.disarmUltracodeTurnDeferred();
 	}
 
 	/**
@@ -6159,8 +6427,11 @@ export class AgentSession {
 		const keywordNotices: CustomMessage[] = [];
 		// "ultracode" steers only the turn that carries it, like the other three
 		// keywords. Saying it once does not arm the session; the word has to be
-		// repeated on any later message that wants the same treatment.
-		if (this.#magicKeywordEnabled("ultracode") && containsUltracode(text)) {
+		// repeated on any later message that wants the same treatment. A child
+		// never arms (it only re-pins what its parent's turn set), so on a sub
+		// session the notice would promise a workflow the session cannot run:
+		// skip it entirely there.
+		if (this.#agentKind !== "sub" && this.#magicKeywordEnabled("ultracode") && containsUltracode(text)) {
 			keywordNotices.push({
 				role: "custom",
 				customType: "ultracode-notice",
@@ -6316,11 +6587,17 @@ export class AgentSession {
 			// pin and the subagent floor out from under the in-flight turn, and a
 			// message later dequeued or handed back to the editor would leave the
 			// flip behind with no turn. It rides the queued message instead and
-			// fires when the loop commits the message into the live context.
-			const applyKeywordTurnState = userAuthoredTurn
-				? () => this.#applyUltracodeTurnState(expandedText)
-				: undefined;
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt, undefined, applyKeywordTurnState);
+			// fires when the loop commits the message into the live context. The
+			// queue mode shapes it: a steer or an aside joins the running turn and
+			// is arm-only.
+			await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior,
+				submittedAt,
+				undefined,
+				userAuthoredTurn ? this.#ultracodeDeliveryHook(expandedText, streamingBehavior) : undefined,
+			);
 			return true;
 		}
 
@@ -6372,7 +6649,7 @@ export class AgentSession {
 				streamingBehavior,
 				submittedAt,
 				{ images: normalizedImages, descriptionNotice: imageDescriptionNotice },
-				userAuthoredTurn ? () => this.#applyUltracodeTurnState(expandedText) : undefined,
+				userAuthoredTurn ? this.#ultracodeDeliveryHook(expandedText, streamingBehavior) : undefined,
 			);
 			return true;
 		}
@@ -6384,7 +6661,7 @@ export class AgentSession {
 		// race loser queues instead of dispatching, and its turn state must ride
 		// the queued message like every other queued turn — applying it up top
 		// would yank the winner's in-flight pin and floor.
-		if (userAuthoredTurn) this.#applyUltracodeTurnState(expandedText);
+		const undoUltracodeTurnState = userAuthoredTurn ? this.#applyUltracodeTurnState(expandedText) : undefined;
 
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 		if (externalThinkingToolChoice) {
@@ -6440,6 +6717,10 @@ export class AgentSession {
 			// (e.g., compaction aborted, validation failed).
 			this.#toolChoiceQueue.removeByLabel("eager-todo");
 			this.#toolChoiceQueue.removeByLabel("external-thinking");
+			// A turn that never started must not leave its pin and spawn floor
+			// armed for whatever runs next (an agent-initiated continuation would
+			// inherit them without ever having carried the keyword).
+			if (!dispatched) undoUltracodeTurnState?.();
 		}
 		if (!dispatched && message.role === "user") {
 			// An abort (Esc) or preflight denial raced turn setup: the prompt never
@@ -6474,7 +6755,8 @@ export class AgentSession {
 						.join("");
 
 		let keywordNotices: CustomMessage[] = [];
-		let applyKeywordTurnState: (() => void) | undefined;
+		// User-authored skill args only (set below); `undefined` otherwise.
+		let keywordText: string | undefined;
 		if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") {
 			const details = message.details;
 			let skillName: string | undefined;
@@ -6488,9 +6770,9 @@ export class AgentSession {
 			this.#beginTurnBudgetFrom(skillArgs);
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
 			// Same enqueue-vs-delivery split as prompt(): a queued skill prompt
-			// applies the ultracode turn state when it is delivered, a direct one
-			// right before dispatch.
-			applyKeywordTurnState = () => this.#applyUltracodeTurnState(skillArgs);
+			// applies the ultracode turn state when it is delivered (shaped by the
+			// queue mode), a direct one right before dispatch.
+			keywordText = skillArgs;
 			this.maybeStartTitleGeneration(
 				skillPromptTitleInput({
 					name: skillName,
@@ -6507,7 +6789,12 @@ export class AgentSession {
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, applyKeywordTurnState);
+			await this.#queueCustomMessage(
+				message,
+				streamingBehavior,
+				options.queueChipText,
+				keywordText === undefined ? undefined : this.#ultracodeDeliveryHook(keywordText, streamingBehavior),
+			);
 			return true;
 		}
 		if (this.isStreaming) {
@@ -6517,11 +6804,16 @@ export class AgentSession {
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, applyKeywordTurnState);
+			await this.#queueCustomMessage(
+				message,
+				streamingBehavior,
+				options?.queueChipText,
+				keywordText === undefined ? undefined : this.#ultracodeDeliveryHook(keywordText, streamingBehavior),
+			);
 			return true;
 		}
 
-		applyKeywordTurnState?.();
+		const undoKeywordTurnState = keywordText === undefined ? undefined : this.#applyUltracodeTurnState(keywordText);
 
 		const customMessage: CustomMessage<T> = {
 			role: "custom",
@@ -6533,10 +6825,18 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		return this.#promptWithMessage(customMessage, textContent, {
-			...options,
-			prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
-		});
+		let dispatched = false;
+		try {
+			dispatched = await this.#promptWithMessage(customMessage, textContent, {
+				...options,
+				prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
+			});
+		} finally {
+			// Same rollback as prompt(): a skill turn that never started must not
+			// leave its pin and spawn floor armed for whatever runs next.
+			if (!dispatched) undoKeywordTurnState?.();
+		}
+		return dispatched;
 	}
 
 	async #promptWithMessage(
@@ -6945,6 +7245,10 @@ export class AgentSession {
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
+	 *
+	 * User text from RPC/SDK/collab hosts, so the ultracode keyword counts: a
+	 * steer joins the running turn, so the hook is arm-only (a keyword-free
+	 * steer never disarms the turn it joins).
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
 		if (text.startsWith("/")) {
@@ -6955,7 +7259,14 @@ export class AgentSession {
 		// Stamp before image preprocessing so a queued image steer measures from
 		// the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
-		await this.#queueUserMessage(expandedText, images, "steer", submittedAt);
+		await this.#queueUserMessage(
+			expandedText,
+			images,
+			"steer",
+			submittedAt,
+			undefined,
+			this.#ultracodeDeliveryHook(expandedText, "steer"),
+		);
 	}
 
 	/**
@@ -6976,7 +7287,23 @@ export class AgentSession {
 		// from the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
 		if (!options?.synthetic) {
-			await this.#queueUserMessage(expandedText, images, "followUp", submittedAt);
+			// User text that STARTS a turn when delivered: full arm-or-disarm,
+			// ahead of any caller-supplied delivery effect.
+			const ultracodeHook = this.#ultracodeDeliveryHook(expandedText, "followUp");
+			const onDeliver = options?.onDeliver;
+			await this.#queueUserMessage(
+				expandedText,
+				images,
+				"followUp",
+				submittedAt,
+				undefined,
+				ultracodeHook && onDeliver
+					? () => {
+							ultracodeHook();
+							onDeliver();
+						}
+					: (ultracodeHook ?? onDeliver),
+			);
 			return;
 		}
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
@@ -6993,7 +7320,7 @@ export class AgentSession {
 			: undefined;
 		this.#allowQueuedMessageDrainRetry();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
-		this.agent.followUp({
+		const message: AgentMessage = {
 			role: "developer",
 			content,
 			attribution: options.attribution ?? "agent",
@@ -7002,7 +7329,11 @@ export class AgentSession {
 			// behind a busy turn): replay uses the marker to clear the preceding
 			// user's prompt anchor, matching the live agent_start clear.
 			synthetic: true,
-		});
+		};
+		// Turn-start side effects (the plan-approval ultracode arm) ride the
+		// message and fire when the loop commits it, never at enqueue.
+		if (options.onDeliver) attachQueuedMessageDeliveryEffect(message, options.onDeliver);
+		this.agent.followUp(message);
 		this.#scheduleIdleQueueDrain();
 	}
 
@@ -7520,20 +7851,27 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
+		// Non-synthetic user text on every branch: the queued ones carry the same
+		// delivery hooks as steer()/followUp() (a steer or aside is arm-only, a
+		// follow-up starts a turn), and the direct one keeps user attribution so
+		// keyword notices, the TUI turn-time anchor, and warp's prompt_submit see
+		// an extension-initiated turn as the user turn it is. Root-only gating in
+		// the hooks already keeps a child from disarming its parent's turn; on a
+		// root an extension's keyword-free turn legitimately ends ultracode.
 		let deliveredAsAside = false;
 		if (options?.deliverAs === "aside") {
 			if (this.isStreaming) {
-				await this.#queueUserMessage(text, images, "aside");
+				await this.#queueUserMessage(text, images, "aside", undefined, undefined, this.#ultracodeDeliveryHook(text, "aside"));
 				return;
 			}
 			// Idle: fall through to the prompt flow below (starts a turn, like an omitted
 			// deliverAs) — there is no live run to inject an aside into.
 			deliveredAsAside = true;
 		} else if (options?.deliverAs === "followUp") {
-			await this.#queueUserMessage(text, images, "followUp");
+			await this.#queueUserMessage(text, images, "followUp", undefined, undefined, this.#ultracodeDeliveryHook(text, "followUp"));
 			return;
 		} else if (options?.deliverAs === "steer") {
-			await this.#queueUserMessage(text, images, "steer");
+			await this.#queueUserMessage(text, images, "steer", undefined, undefined, this.#ultracodeDeliveryHook(text, "steer"));
 			return;
 		}
 
@@ -8030,6 +8368,11 @@ export class AgentSession {
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
+		// An ultracode turn ends with the transcript it ran in. Disarm BEFORE the
+		// initial thinking entry below is written, so the new session records the
+		// pre-ultracode level as its own rather than inheriting a borrowed xhigh
+		// pin (and the spawn floor) that no keyword in this session ever asked for.
+		this.disarmUltracodeTurn();
 		this.#cancelOwnAsyncJobs();
 		this.#closeAllProviderSessions("new session");
 		await this.#bash.flushPending();
@@ -8223,12 +8566,54 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
+	 * Ultracode off-ramp for a USER picking a model or role between turns.
+	 *
+	 * The pick is an explicit choice and wins, so the turn is ended FIRST:
+	 * `disarmUltracodeTurn` hands the borrowed level back before the pick
+	 * applies, so a pick that carries its own level lands on top of the user's
+	 * pre-ultracode state, and a level-less pick reapplies that state instead
+	 * of inheriting the borrowed xhigh. The flag goes with it so the next spawn
+	 * does not floor at a level the user just walked away from. Lives on the
+	 * session wrappers, NOT in ModelControls: its own swaps (retry fallback,
+	 * plan-mode transitions, transcript restore) are internal and re-pin.
+	 */
+	#dropUltracodeForUserModelPick(): void {
+		this.disarmUltracodeTurn();
+	}
+
+	/**
+	 * Fail loudly when a non-user model swap leaves an armed turn unpinnable:
+	 * ModelControls re-pins after its own swap, and a refused re-pin means the
+	 * new model has no xhigh rung (or the ceiling caps it), so the flag is now
+	 * promising a floor every spawn will be refused under. Silent clamping is
+	 * exactly what the fail-loud policy forbids, so say so.
+	 */
+	#warnIfUltracodeRepinRefused(): void {
+		if (!this.settings.get("ultracode") || this.#models.canPinUltracode()) return;
+		const model = this.model;
+		const detail =
+			this.#models.ultracodePinRefusal() === "ceiling"
+				? "this session's effort ceiling caps it below xhigh"
+				: `its ladder has no xhigh rung (${model ? getSupportedEfforts(model).join(", ") : "none"})`;
+		this.emitNotice(
+			"warning",
+			`Ultracode cannot re-pin xhigh on ${model ? formatModelStringWithRouting(model) : "no model"}: ${detail}; the pin was not re-applied and this turn's spawns will be refused`,
+			"ultracode",
+		);
+	}
+
+	/**
 	 * Set model directly.
 	 * Validates that a credential source is configured (synchronously, without
 	 * refreshing OAuth or running command-backed key programs). Active switches
 	 * always take effect; if the current transcript is too large for the target
 	 * model, the next prompt's compaction/error path owns that recovery instead
 	 * of leaving the session pinned to the old model.
+	 *
+	 * `source` decides what the swap means for an ultracode turn: a `"user"`
+	 * pick is an off-ramp (see {@link #dropUltracodeForUserModelPick}); an
+	 * `"extension"` or `"internal"` swap keeps the turn and re-pins, warning
+	 * when the re-pin is refused.
 	 * @throws Error if no API key available for the model
 	 */
 	async setModel(
@@ -8239,22 +8624,35 @@ export class AgentSession {
 			thinkingLevel?: ThinkingLevel;
 			persist?: boolean;
 		},
+		source: ModelChangeSource = "user",
 	): Promise<{ switched: boolean }> {
-		return this.#models.setModel(model, role, options);
+		if (source === "user") this.#dropUltracodeForUserModelPick();
+		const result = await this.#models.setModel(model, role, options);
+		if (source !== "user") this.#warnIfUltracodeRepinRefused();
+		return result;
 	}
 
 	/** Selects a model for this session without updating persisted model settings. */
-	setModelTemporary(
+	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
 		options?: { ephemeral?: boolean },
+		source: ModelChangeSource = "user",
 	): Promise<void> {
-		return this.#models.setModelTemporary(model, thinkingLevel, options);
+		if (source === "user") this.#dropUltracodeForUserModelPick();
+		await this.#models.setModelTemporary(model, thinkingLevel, options);
+		if (source !== "user") this.#warnIfUltracodeRepinRefused();
 	}
 
 	/** Cycles the scoped model set, or all available models when no scope exists. */
-	cycleModel(direction: "forward" | "backward" = "forward"): Promise<ModelCycleResult | undefined> {
-		return this.#models.cycleModel(direction);
+	async cycleModel(
+		direction: "forward" | "backward" = "forward",
+		source: ModelChangeSource = "user",
+	): Promise<ModelCycleResult | undefined> {
+		if (source === "user") this.#dropUltracodeForUserModelPick();
+		const result = await this.#models.cycleModel(direction);
+		if (source !== "user") this.#warnIfUltracodeRepinRefused();
+		return result;
 	}
 
 	/** Resolves configured role models and the currently active role index. */
@@ -8263,16 +8661,22 @@ export class AgentSession {
 	}
 
 	/** Applies a resolved role model without changing global settings. */
-	applyRoleModel(entry: ResolvedRoleModel): Promise<void> {
-		return this.#models.applyRoleModel(entry);
+	async applyRoleModel(entry: ResolvedRoleModel, source: ModelChangeSource = "user"): Promise<void> {
+		if (source === "user") this.#dropUltracodeForUserModelPick();
+		await this.#models.applyRoleModel(entry);
+		if (source !== "user") this.#warnIfUltracodeRepinRefused();
 	}
 
 	/** Cycles the configured role models in the supplied order. */
-	cycleRoleModels(
+	async cycleRoleModels(
 		roleOrder: readonly string[],
 		direction: "forward" | "backward" = "forward",
+		source: ModelChangeSource = "user",
 	): Promise<RoleModelCycleResult | undefined> {
-		return this.#models.cycleRoleModels(roleOrder, direction);
+		if (source === "user") this.#dropUltracodeForUserModelPick();
+		const result = await this.#models.cycleRoleModels(roleOrder, direction);
+		if (source !== "user") this.#warnIfUltracodeRepinRefused();
+		return result;
 	}
 
 	/** Lists available models after applying the configured enabled-model filter. */
@@ -8283,23 +8687,49 @@ export class AgentSession {
 	/**
 	 * Selects the session thinking level and optionally persists it as the default.
 	 *
-	 * Every caller of this wrapper is an explicit user selection (model/settings
-	 * selector, RPC `set_thinking_level`, ACP, extension runtimes), so it takes
-	 * the same ultracode off-ramp as {@link cycleThinkingLevel}: drop the pending
-	 * restore so the end-of-turn handback cannot silently overwrite the level the
-	 * user just picked, and drop the subagent floor with it. Internal level
-	 * changes (retry fallback, begin/endUltracodeTurn, transcript restore) call
-	 * ModelControls directly and stay exempt.
+	 * A `"user"` call is an explicit selection (model/settings selector, RPC
+	 * `set_thinking_level`, ACP, plan-mode restore), so it takes the same
+	 * ultracode off-ramp as {@link cycleThinkingLevel}: drop the pending restore
+	 * so the end-of-turn handback cannot silently overwrite the level the user
+	 * just picked, and drop the subagent floor with it.
+	 *
+	 * An `"extension"` call is programmatic and gets no such authority: the
+	 * level is applied and then immediately re-pinned if this session is armed,
+	 * so an extension running inside an ultracode turn cannot lower the effort
+	 * the user asked for (nor strand the flag with a level below its floor).
+	 * Internal level changes (retry fallback, begin/endUltracodeTurn, transcript
+	 * restore) call ModelControls directly and stay exempt of both.
 	 */
-	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
-		this.#models.forgetUltracodeRestore();
-		if (this.settings.get("ultracode")) this.settings.override("ultracode", false);
+	setThinkingLevel(
+		level: ConfiguredThinkingLevel | undefined,
+		persist: boolean = false,
+		source: "user" | "extension" = "user",
+	): void {
+		if (source === "user") {
+			this.#models.forgetUltracodeRestore();
+			if (this.settings.get("ultracode")) {
+				this.settings.override("ultracode", false);
+				this.#ultracodeArmSeq++;
+				this.#advisors.resyncUltracodeEffort();
+			}
+		}
 		this.#models.setThinkingLevel(level, persist);
+		if (source === "extension") this.#models.repinUltracodeIfArmed();
 	}
 
-	/** Advances through the thinking selectors supported by the active model. */
+	/**
+	 * Advances through the thinking selectors supported by the active model.
+	 * ModelControls owns the off-ramp (the flag flip happens there); the
+	 * session only records the flip for the deferred hooks and advisors.
+	 */
 	cycleThinkingLevel(): ConfiguredThinkingLevel | undefined {
-		return this.#models.cycleThinkingLevel();
+		const wasArmed = this.settings.get("ultracode");
+		const next = this.#models.cycleThinkingLevel();
+		if (wasArmed && !this.settings.get("ultracode")) {
+			this.#ultracodeArmSeq++;
+			this.#advisors.resyncUltracodeEffort();
+		}
+		return next;
 	}
 
 	/** Reports whether `/fast` is enabled for the active model family. */
@@ -9191,6 +9621,11 @@ export class AgentSession {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
+		// An ultracode turn ends with the transcript it ran in: hand the borrowed
+		// level back and drop the flag before the target session's own thinking
+		// entry is restored below, so neither the pin nor the spawn floor crosses
+		// into a session that never carried the keyword.
+		this.disarmUltracodeTurn();
 		await this.#sessionBeforeSwitchReconciler?.();
 
 		await this.#bash.flushPending();
@@ -9376,16 +9811,18 @@ export class AgentSession {
 			// Restore the thinking selector. Each change persists the configured
 			// selector (`auto` or a concrete level), so prefer it: an `auto` session
 			// resumes in auto mode (reclassifying the next turn) instead of freezing at
-			// the last resolved level. Entries written before the `configured` field
-			// existed fall back to the concrete level (legacy pin-on-resume behavior).
-			// With no thinking entry, fall back to the global default so fresh sessions
-			// still classify their first turn.
+			// the last resolved level, and an ultracode pin (whose receipt is the
+			// borrowed-FROM level, see ModelControls.beginUltracodeTurn) resumes at
+			// the pre-ultracode level instead of stranded at xhigh with no handback
+			// state — the same precedence sdk.ts applies on process start. Entries
+			// written before the `configured` field existed fall back to the concrete
+			// level (legacy pin-on-resume behavior). With no thinking entry, fall back
+			// to the global default so fresh sessions still classify their first turn.
 			const restoredConfigured = sessionContext.configuredThinkingLevel;
 			const restoredThinkingLevel: ConfiguredThinkingLevel | undefined =
 				hasThinkingEntry || (defaultThinkingLevel === AUTO_THINKING && sessionContext.thinkingLevel !== "off")
-					? restoredConfigured === AUTO_THINKING
-						? AUTO_THINKING
-						: (sessionContext.thinkingLevel as ThinkingLevel | undefined)
+					? (parseConfiguredThinkingLevel(restoredConfigured) ??
+						(sessionContext.thinkingLevel as ThinkingLevel | undefined))
 					: defaultThinkingLevel;
 			this.#models.restoreThinkingLevel(restoredThinkingLevel);
 			this.#models.restoreServiceTiers(

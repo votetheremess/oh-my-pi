@@ -16,7 +16,7 @@
  */
 
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
-import { AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { AgentLifecycleManager, syncChildUltracodeAtResume } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
@@ -213,7 +213,9 @@ export class IrcBus {
 
 		// A pending `wait` from the recipient consumes the message directly —
 		// it is returned from their irc tool call and never hits the inbox or
-		// the session injection path.
+		// the session injection path. The waiter is blocked MID-turn (its own
+		// running turn already carries whatever pin it started with), so it is
+		// delivered to without touching its thinking level.
 		const waiter = this.#takeMatchingWaiter(message.to, message.from);
 		if (waiter) {
 			waiter.resolve(message);
@@ -224,6 +226,28 @@ export class IrcBus {
 		const session = this.#registry.get(message.to)?.session;
 		if (!session) {
 			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" has no live session.` };
+		}
+
+		// Session injection into an IDLE recipient STARTS a new LLM turn, inside
+		// the SENDER's current turn, so its ultracode state must mirror the live
+		// parent turn before the message lands (revive already synced; an
+		// idle/live recipient has not). A streaming recipient is joined mid-turn
+		// (steer / step-boundary interrupt) exactly like the waiter above: its
+		// running turn keeps the pin it started with, untouched. A child whose
+		// model cannot hold the xhigh pin fails the delivery loudly instead of
+		// running clamped; the message is buffered so a later `wait`/`inbox`
+		// from the recipient — which starts no turn here — can still pick it up.
+		if (!session.isStreaming) {
+			try {
+				syncChildUltracodeAtResume(message.to, session, this.#registry);
+			} catch (error) {
+				this.#enqueue(message);
+				return {
+					to: message.to,
+					outcome: "failed",
+					error: `${error instanceof Error ? error.message : String(error)} (message buffered in "${message.to}"'s inbox; not delivered)`,
+				};
+			}
 		}
 
 		try {

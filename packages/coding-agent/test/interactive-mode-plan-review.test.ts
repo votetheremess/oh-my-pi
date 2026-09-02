@@ -22,7 +22,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { AUTO_THINKING, clampAutoThinkingEffort } from "@oh-my-pi/pi-coding-agent/thinking";
+import { AUTO_THINKING, ultracodeEffortFor } from "@oh-my-pi/pi-coding-agent/thinking";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
 import { formatNumber, TempDir } from "@oh-my-pi/pi-utils";
@@ -1235,7 +1235,9 @@ describe("InteractiveMode plan review rendering", () => {
 			pickPlanOption(options, "Approve and execute with ultracode"),
 		);
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
-		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		// `true` is what a real prompt() returns for a turn that started; a
+		// falsy result means the dispatch was dropped and the arm is undone.
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(true);
 
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
@@ -1401,11 +1403,11 @@ describe("InteractiveMode plan review rendering", () => {
 		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 
-		// The pin the arming applies on the final (slow-tier) model. Guard that
-		// the fixture can distinguish a reverted level from the pin at all.
-		const expectedPin = clampAutoThinkingEffort(slow, Effort.XHigh);
-		expect(expectedPin).toBeDefined();
-		expect(expectedPin).not.toBe(ThinkingLevel.Low);
+		// The pin the arming applies on the final (slow-tier) model: exactly xhigh,
+		// never a clamp. Guard that the slow tier can honour it at all, so the
+		// fixture can distinguish a reverted level from the pin.
+		expect(ultracodeEffortFor(slow)).toBe(Effort.XHigh);
+		const expectedPin = Effort.XHigh;
 
 		let levelAtDispatch: ThinkingLevel | undefined;
 		vi.spyOn(session, "prompt").mockImplementation(async () => {
@@ -1437,6 +1439,355 @@ describe("InteractiveMode plan review rendering", () => {
 		// #applyPlanExecutionModel).
 		expect(levelAtDispatch).toBe(expectedPin);
 		expect(session.settings.get("ultracode")).toBe(true);
+	});
+
+	// The queued path: a turn is already in flight, so the approved plan lands
+	// behind it as a synthetic follow-up. Arming at ENQUEUE would yank the
+	// in-flight turn's pin and floor (and arm a turn that may still be dequeued
+	// or handed back to the editor). The arm rides the message as a delivery
+	// hook instead and fires only when the loop commits it.
+	it("defers the ultracode arm to delivery when the approved plan is queued behind an in-flight turn", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.setThinkingLevel(ThinkingLevel.Low);
+
+		let streaming = false;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		vi.spyOn(session, "abort").mockResolvedValue();
+		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(true);
+		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => {
+			streaming = true;
+			return pickPlanOption(options, "Approve and execute with ultracode");
+		});
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(followUpSpy).toHaveBeenCalledTimes(1);
+		const [text, images, options] = followUpSpy.mock.calls[0] as unknown as [
+			string,
+			unknown,
+			{ synthetic?: boolean; onDeliver?: () => void },
+		];
+		expect(images).toBeUndefined();
+		expect(options.synthetic).toBe(true);
+		expect(typeof options.onDeliver).toBe("function");
+		// The notice still leads the directive; only the arm moved.
+		expect(text.startsWith("<system-notice>")).toBe(true);
+		expect(text).toContain("approved a plan");
+
+		// Nothing armed at enqueue: the in-flight turn keeps its own effort and
+		// its spawns keep their own floor.
+		expect(session.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+
+		// Delivery is turn start: the hook is the arm.
+		options.onDeliver?.();
+		expect(session.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("undoes a direct-path arm when prompt() races into AgentBusyError, then re-queues it deferred", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.setThinkingLevel(ThinkingLevel.Low);
+
+		vi.spyOn(session, "abort").mockResolvedValue();
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		// Not streaming at the check, so the direct path arms and dispatches —
+		// and the dispatch loses the race.
+		let armedAtDispatch: boolean | undefined;
+		const promptSpy = vi.spyOn(session, "prompt").mockImplementation(async () => {
+			armedAtDispatch = session.settings.get("ultracode");
+			throw new AgentBusyError();
+		});
+		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
+			pickPlanOption(options, "Approve and execute with ultracode"),
+		);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		// The direct path did arm before dispatching (the ordering the test above
+		// this block pins)...
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(armedAtDispatch).toBe(true);
+		// ...but a dispatch that never ran must not leave the arm behind: the
+		// fallback disarms and re-queues with the same deferred hook as the
+		// queued path, so the state at enqueue is identical either way.
+		expect(followUpSpy).toHaveBeenCalledTimes(1);
+		const [, , options] = followUpSpy.mock.calls[0] as unknown as [
+			string,
+			unknown,
+			{ synthetic?: boolean; onDeliver?: () => void },
+		];
+		expect(options.synthetic).toBe(true);
+		expect(typeof options.onDeliver).toBe("function");
+		expect(session.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+
+		options.onDeliver?.();
+		expect(session.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("undoes a direct-path arm when prompt() reports the turn never started", async () => {
+		// The other way a direct dispatch drops: an abort (Esc) or preflight
+		// denial races turn setup and prompt() resolves false. No re-queue
+		// happens here, so the undo is the only thing standing between the user
+		// and a pin that outlives a turn that never ran.
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.setThinkingLevel(ThinkingLevel.Low);
+
+		vi.spyOn(session, "abort").mockResolvedValue();
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		let armedAtDispatch: boolean | undefined;
+		const promptSpy = vi.spyOn(session, "prompt").mockImplementation(async () => {
+			armedAtDispatch = session.settings.get("ultracode");
+			return false;
+		});
+		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
+			pickPlanOption(options, "Approve and execute with ultracode"),
+		);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(armedAtDispatch).toBe(true);
+		expect(followUpSpy).not.toHaveBeenCalled();
+		expect(session.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+
+	it("leaves a planning turn's own arm in place when the direct ultracode dispatch drops", async () => {
+		// The planning turn carried the keyword (or was armed the same way), so
+		// the session is armed with its handback pending. Picking the ultracode
+		// option re-arms an already-armed turn — nothing changes — and the
+		// dropped dispatch's undo must revert exactly that nothing: the pin and
+		// floor the planning turn holds stay up for the deferred re-queue.
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.setThinkingLevel(ThinkingLevel.Low);
+		session.armUltracodeTurn();
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		vi.spyOn(session, "abort").mockResolvedValue();
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		vi.spyOn(session, "prompt").mockRejectedValue(new AgentBusyError());
+		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
+			pickPlanOption(options, "Approve and execute with ultracode"),
+		);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(followUpSpy).toHaveBeenCalledTimes(1);
+		expect(session.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		// And the handback still points at the level the planning turn borrowed.
+		expect(session.userConfiguredThinkingLevel()).toBe(ThinkingLevel.Low);
+	});
+
+	// A plain approval is the user's effort decision for execution. The
+	// planning turn may have carried the keyword, and the execution turn is
+	// synthetic — it never runs the keyword-free disarm on its own — so
+	// without an explicit disarm the approved plan would execute (and spawn)
+	// under an arm the user did not pick from the menu.
+	it("disarms an armed planning session before a plain approval dispatches", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the work.");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.setThinkingLevel(ThinkingLevel.Low);
+		session.armUltracodeTurn();
+		expect(session.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		let armedAtDispatch: boolean | undefined;
+		let levelAtDispatch: ThinkingLevel | undefined;
+		const prompt = vi.spyOn(session, "prompt").mockImplementation(async () => {
+			armedAtDispatch = session.settings.get("ultracode");
+			levelAtDispatch = session.thinkingLevel;
+			return true;
+		});
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		// Disarmed BEFORE the turn started, both halves: no floor for the
+		// execution turn's spawns, and the borrowed level handed back.
+		expect(armedAtDispatch).toBe(false);
+		expect(levelAtDispatch).toBe(ThinkingLevel.Low);
+		expect(session.settings.get("ultracode")).toBe(false);
+		const [text] = prompt.mock.calls[0] ?? [];
+		expect(text?.startsWith("<system-notice>")).toBe(false);
+	});
+
+	it("disarms an armed planning session at delivery when a plain approval is queued behind an in-flight turn", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.setThinkingLevel(ThinkingLevel.Low);
+		session.armUltracodeTurn();
+
+		let streaming = false;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		vi.spyOn(session, "abort").mockResolvedValue();
+		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(true);
+		const followUpSpy = vi.spyOn(session, "followUp").mockResolvedValue();
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => {
+			streaming = true;
+			return pickPlanOption(options, "Approve and execute");
+		});
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(followUpSpy).toHaveBeenCalledTimes(1);
+		const [, , options] = followUpSpy.mock.calls[0] as unknown as [
+			string,
+			unknown,
+			{ synthetic?: boolean; onDeliver?: () => void },
+		];
+		expect(options.synthetic).toBe(true);
+		expect(typeof options.onDeliver).toBe("function");
+		// Same enqueue-vs-delivery rule as the arm: the in-flight turn keeps its
+		// pin and floor until the directive actually starts the execution turn.
+		expect(session.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		options.onDeliver?.();
+		expect(session.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+
+	// Plan mode snapshots "the level to come back to" on entry and again on
+	// exit. While an ultracode turn is in flight the live selector reads the
+	// borrowed xhigh; recording THAT would make the exit restore install the
+	// pin as the user's own configured level, with no handback left to undo it.
+	// Both snapshots must read the level the user owns.
+	it("restores the pre-ultracode level on plan-mode exit, never the borrowed pin", async () => {
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		// Same model with its own `:medium` suffix: entry is a pure thinking
+		// transition, so the exit restore is a bare setThinkingLevel(previous)
+		// and the recorded level is the only thing that decides where it lands.
+		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
+		session.settings.setModelRole("plan", "anthropic/claude-sonnet-4-5:medium");
+		session.setThinkingLevel(ThinkingLevel.Low);
+		session.armUltracodeTurn();
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		expect(session.userConfiguredThinkingLevel()).toBe(ThinkingLevel.Low);
+
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		// Empty plan: the toggle exits without a confirmation prompt.
+		await Bun.write(resolvedPlanPath, "\n");
+
+		await mode.handlePlanModeCommand();
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		// The plan role's level is the user's pick for planning: it ends the
+		// ultracode turn rather than being re-pinned over.
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(session.settings.get("ultracode")).toBe(false);
+
+		mode.planModePlanFilePath = planFilePath;
+		await mode.handlePlanModeCommand();
+		expect(mode.planModeEnabled).toBe(false);
+
+		// Back on the level the user owned before the keyword, with nothing
+		// pending to overwrite it on the next keyword-free turn.
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(session.configuredThinkingLevel()).toBe(ThinkingLevel.Low);
+		expect(session.userConfiguredThinkingLevel()).toBe(ThinkingLevel.Low);
+		expect(session.settings.get("ultracode")).toBe(false);
+	});
+
+	it("still executes the approved plan, unarmed and with a warning, when the model has no xhigh rung", async () => {
+		// Fail loud, not clamp: a model whose ladder stops at high cannot honour
+		// "exactly xhigh", so the option must not quietly run the plan at high
+		// under the ultracode name. The plan still executes; the user is told.
+		const noXhigh = session.modelRegistry.find("anthropic", "claude-sonnet-4-6");
+		if (!noXhigh) throw new Error("Expected claude-sonnet-4-6 to exist in registry");
+		expect(ultracodeEffortFor(noXhigh)).toBeUndefined();
+		await session.setModel(noXhigh);
+		session.setThinkingLevel(ThinkingLevel.Low);
+
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the work.");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+
+		const notices: Array<{ level: string; message: string; source?: string }> = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push({ level: event.level, message: event.message, source: event.source });
+		});
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
+			pickPlanOption(options, "Approve and execute with ultracode"),
+		);
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		const [text, opts] = prompt.mock.calls[0] ?? [];
+		expect(opts).toEqual({ synthetic: true });
+		expect(text?.startsWith("<system-notice>")).toBe(true);
+		// The notice tells the model the truth rather than promising a pin.
+		expect(text).toContain("NOT armed");
+		expect(session.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		const warning = notices.find(notice => notice.source === "ultracode");
+		expect(warning?.level).toBe("warning");
+		expect(warning?.message).toContain("ultracode requires xhigh");
+		expect(warning?.message).toContain("not armed");
 	});
 
 	it("retains the plan model when the slider selection matches the active plan tier", async () => {
