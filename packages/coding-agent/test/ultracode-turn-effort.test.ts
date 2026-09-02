@@ -144,6 +144,14 @@ function createHarness(options: {
 				entries.push({ thinkingLevel, configured });
 				return "entry-id";
 			},
+			// v18.1's usage-owner threading: applyAutoThinkingLevel builds
+			// { sessionId, parentId } before entering the classifier try-block,
+			// and its onUsage callback records usage. Match the real signatures
+			// (getSessionId(): string; getLeafId(): string | null;
+			// appendModelUsage(usage, owner): string) — never a tolerant Proxy.
+			getSessionId: () => "test-session",
+			getLeafId: () => null,
+			appendModelUsage: () => "usage-entry-id",
 		} as unknown as SessionManager,
 		providerSessionState: new Map(),
 		model: () => options.model,
