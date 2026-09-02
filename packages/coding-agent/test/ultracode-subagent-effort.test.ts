@@ -1,5 +1,5 @@
 /**
- * Ultracode pins EVERY subagent spawn to xhigh while it is active.
+ * Ultracode pins EVERY subagent spawn to EXACTLY xhigh while it is active.
  *
  * These drive the real `runSubprocess` and read the level it hands to
  * `createAgentSession` — `thinkingLevel` (the pinned effort) and
@@ -8,8 +8,12 @@
  * a mock that yields immediately, so nothing here talks to a model.
  *
  * The pin deliberately overrides the agent definition's own level (scout's
- * `medium`, task's `auto`), the caller's coarse `effort`, and a `task.maxEffort`
- * ceiling below xhigh. Only the model's own ladder is allowed to move it.
+ * `medium`, task's `auto`), the caller's coarse `effort`, an explicit `:level`
+ * suffix on the model pattern, and a `task.maxEffort` ceiling below xhigh.
+ * Nothing is allowed to move it — not even the model's own ladder: a model
+ * with no xhigh rung cannot satisfy the pin, and the spawn fails loudly with
+ * `UltracodeEffortError` (see `ultracodeEffortFor` in src/thinking.ts) before
+ * any session exists, instead of quietly running at a substitute level.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
@@ -18,12 +22,13 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { SETTINGS_SCHEMA, type SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { runEvalAgent } from "@oh-my-pi/pi-coding-agent/eval/agent-bridge";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { createIsolatedSettings, createSubagentSettings, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, type TaskEffort } from "@oh-my-pi/pi-coding-agent/thinking";
@@ -36,22 +41,27 @@ function modelOrThrow(provider: Parameters<typeof getBundledModel>[0], id: strin
 	return model as Model;
 }
 
-/** low → max, so an xhigh pin lands exactly on xhigh. */
+/** low → max, so an xhigh pin lands exactly on xhigh — and must NOT reach max. */
 const FULL_LADDER = modelOrThrow("openai-codex", "gpt-5.6-sol");
-/** low → high: the model tops out below xhigh, so the pin must clamp down. */
+/** low → high: the model tops out below xhigh, so the pin cannot be honoured. */
 const CAPS_AT_HIGH = modelOrThrow("anthropic", "claude-sonnet-4-6");
 /** No `thinking` block at all: no controllable effort surface to pin. */
 const NO_EFFORT_SURFACE = modelOrThrow("openai", "gpt-4o");
 /**
- * A ladder sitting entirely above xhigh. `resolveTaskEffortLevel` would throw
- * `RangeError` here under a sub-xhigh `task.maxEffort`; the clamp the pin uses
- * must land it on `max` instead.
+ * A ladder sitting entirely above xhigh. The old clamp rounded this up to
+ * `max`; the strict pin refuses it, because max is not xhigh.
  */
 const MAX_ONLY = {
 	...FULL_LADDER,
 	provider: "mock",
 	id: "mock-max-only",
 	thinking: { mode: "effort", efforts: [Effort.Max] },
+} as Model;
+/** A second full-ladder model, distinct from FULL_LADDER, for the prewalk hand-off target. */
+const PREWALK_TARGET = {
+	...FULL_LADDER,
+	provider: "mock",
+	id: "mock-prewalk-target",
 } as Model;
 
 /** Yields on the first prompt so `runSubprocess` completes without a real loop. */
@@ -119,12 +129,21 @@ function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	};
 }
 
-function createModelRegistry(model: Model): ModelRegistry {
+/**
+ * Plain object, matching the real signatures of exactly the members the spawn
+ * path reads — never a tolerant Proxy (see AGENTS.md, "Faking AgentSession").
+ * `hasConfiguredAuth` and `awaitBackgroundRefresh` are what the prewalk
+ * resolution touches; spying on `hasConfiguredAuth` proves prewalk got as far
+ * as choosing its target.
+ */
+function createModelRegistry(model: Model, ...extra: Model[]): ModelRegistry {
 	return {
 		authStorage: {},
 		refresh: async () => {},
-		getAvailable: () => [model],
+		awaitBackgroundRefresh: async () => {},
+		getAvailable: () => [model, ...extra],
 		getApiKey: async () => "test-key",
+		hasConfiguredAuth: (_model: Model) => true,
 	} as unknown as ModelRegistry;
 }
 
@@ -146,6 +165,10 @@ interface SpawnOptions {
 	/** The caller's coarse per-spawn effort. */
 	effort?: TaskEffort;
 	maxEffort?: Effort;
+	/** Explicit `:level` suffix on the task role's model pattern. */
+	modelSuffix?: Effort;
+	/** Agent-definition `prewalk` frontmatter; the registry then also offers PREWALK_TARGET. */
+	prewalk?: string;
 }
 
 async function spawn(options: SpawnOptions) {
@@ -153,23 +176,29 @@ async function spawn(options: SpawnOptions) {
 		options.maxEffort === undefined ? undefined : { "task.maxEffort": options.maxEffort },
 	);
 	if (options.ultracode) settings.override("ultracode", true);
-	settings.setModelRole("task", `${options.model.provider}/${options.model.id}`);
+	const pattern = `${options.model.provider}/${options.model.id}`;
+	settings.setModelRole("task", options.modelSuffix === undefined ? pattern : `${pattern}:${options.modelSuffix}`);
 	const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(yieldEmittingSession()));
+	const modelRegistry =
+		options.prewalk === undefined
+			? createModelRegistry(options.model)
+			: createModelRegistry(options.model, PREWALK_TARGET);
+	const hasConfiguredAuth = vi.spyOn(modelRegistry, "hasConfiguredAuth");
 
 	const result = await runSubprocess({
 		cwd: "/tmp",
-		agent: baseAgent,
+		agent: options.prewalk === undefined ? baseAgent : { ...baseAgent, prewalk: options.prewalk },
 		task: "do work",
 		index: 0,
 		enableLsp: false,
 		id: options.id,
 		settings,
-		modelRegistry: createModelRegistry(options.model),
+		modelRegistry,
 		thinkingLevel: options.thinkingLevel,
 		effort: options.effort,
 	});
 
-	return { result, forwarded: spy.mock.calls[0]?.[0], spy };
+	return { result, forwarded: spy.mock.calls[0]?.[0], spy, hasConfiguredAuth };
 }
 
 describe("ultracode subagent effort pin", () => {
@@ -240,6 +269,59 @@ describe("ultracode subagent effort pin", () => {
 		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
 	});
 
+	it("caps a caller-supplied effort of hi at xhigh instead of letting it reach max", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-caps-caller-hi",
+			model: FULL_LADDER,
+			ultracode: true,
+			effort: "hi",
+		});
+
+		// `hi` on a low→max ladder resolves to max without ultracode; under the
+		// pin it is exactly xhigh, so the pin caps as well as raises.
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.thinkingLevel).not.toBe(Effort.Max);
+	});
+
+	it("resolves a caller-supplied effort of hi to max while ultracode is off", async () => {
+		// The control for the cap above: proves `hi` really does reach max on
+		// this ladder, so the xhigh result under ultracode is the pin's doing.
+		const { result, forwarded } = await spawn({
+			id: "ultracode-off-caller-hi",
+			model: FULL_LADDER,
+			effort: "hi",
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.Max);
+	});
+
+	it("overrides an explicit :max suffix on the model pattern", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-overrides-max-suffix",
+			model: FULL_LADDER,
+			ultracode: true,
+			modelSuffix: Effort.Max,
+		});
+
+		// The suffix is the strongest non-ultracode selector (it outranks the
+		// agent definition); the pin still wins, and lands below it on purpose.
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("honours an explicit :max suffix while ultracode is off", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-off-max-suffix",
+			model: FULL_LADDER,
+			modelSuffix: Effort.Max,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.Max);
+	});
+
 	it("is not capped by task.maxEffort, and raises the ceiling that rides into the session", async () => {
 		const { result, forwarded } = await spawn({
 			id: "ultracode-ignores-max-effort",
@@ -256,35 +338,72 @@ describe("ultracode subagent effort pin", () => {
 		expect(forwarded?.thinkingLevelCeiling).toBe(Effort.XHigh);
 	});
 
-	it("clamps down to a model that tops out at high", async () => {
+	it("rides the pin in as the ceiling even when the caller passed no effort at all", async () => {
 		const { result, forwarded } = await spawn({
-			id: "ultracode-clamps-to-high",
+			id: "ultracode-ceiling-without-effort",
+			model: FULL_LADDER,
+			ultracode: true,
+			thinkingLevel: AUTO_THINKING,
+		});
+
+		// Without ultracode a missing `effort` means no ceiling (see the off
+		// control above). Under ultracode the ceiling is ALWAYS the pin: retry
+		// fallback inside the child re-clamps against it, so it is what stops a
+		// swapped-in model from climbing to max or sliding below xhigh.
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.thinkingLevelCeiling).toBe(Effort.XHigh);
+	});
+
+	it("refuses to spawn on a model that tops out at high, naming the ladder", async () => {
+		const { result, spy } = await spawn({
+			id: "ultracode-refuses-high-ladder",
 			model: CAPS_AT_HIGH,
 			ultracode: true,
 			thinkingLevel: AUTO_THINKING,
 		});
 
-		expect(result.exitCode).toBe(0);
-		expect(forwarded?.thinkingLevel).toBe(Effort.High);
+		// Not clamped to high: that is the substitute the contract forbids. The
+		// failure is loud (exit 1) and actionable (model + the rungs it has), and
+		// it happens before any session is created.
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("ultracode requires xhigh");
+		expect(result.stderr).toContain(CAPS_AT_HIGH.id);
+		expect(result.stderr).toContain("exposes [low, medium, high]");
+		expect(spy).not.toHaveBeenCalled();
 	});
 
-	it("resolves max for a model exposing only max instead of throwing", async () => {
+	it("spawns that same model normally when ultracode is off, proving the pin is what refused it", async () => {
 		const { result, forwarded } = await spawn({
-			id: "ultracode-max-only-model",
+			id: "ultracode-off-high-ladder",
+			model: CAPS_AT_HIGH,
+			thinkingLevel: ThinkingLevel.Medium,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Medium);
+	});
+
+	it("refuses to spawn on a model exposing only max instead of rounding up to it", async () => {
+		const { result, spy } = await spawn({
+			id: "ultracode-refuses-max-only",
 			model: MAX_ONLY,
 			ultracode: true,
 			effort: "hi",
 			maxEffort: Effort.Low,
 		});
 
-		// `resolveTaskEffortLevel(model, "hi", Effort.Low)` would have thrown
-		// RangeError and killed the spawn outright.
-		expect(result.exitCode).toBe(0);
-		expect(result.stderr ?? "").not.toContain("no supported thinking effort");
-		expect(forwarded?.thinkingLevel).toBe(Effort.Max);
+		// Neither the old RangeError (task.maxEffort blamed for a ceiling
+		// ultracode supplied) nor the old clamp to max: max is not xhigh.
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).not.toContain("no supported thinking effort");
+		expect(result.stderr).toContain("ultracode requires xhigh");
+		expect(result.stderr).toContain("mock-max-only");
+		expect(result.stderr).toContain("exposes [max]");
+		expect(spy).not.toHaveBeenCalled();
 	});
 
-	it("still fails that same spawn when ultracode is off, proving the clamp is what saves it", async () => {
+	it("still fails that same spawn when ultracode is off, but for the ordinary ceiling reason", async () => {
 		const { result, spy } = await spawn({
 			id: "ultracode-off-max-only-model",
 			model: MAX_ONLY,
@@ -292,25 +411,82 @@ describe("ultracode subagent effort pin", () => {
 			maxEffort: Effort.Low,
 		});
 
+		// The control: the refusal above is ultracode's, not this pre-existing
+		// task.maxEffort failure wearing a new message.
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain(
 			"mock/mock-max-only has no supported thinking effort at or below task.maxEffort=low",
 		);
+		expect(result.stderr).not.toContain("ultracode requires xhigh");
 		expect(spy).not.toHaveBeenCalled();
 	});
 
-	it("falls through to the normal selectors for a model with no controllable effort surface", async () => {
-		const { result, forwarded } = await spawn({
-			id: "ultracode-no-effort-surface",
+	it("refuses to spawn on a model with no controllable effort surface", async () => {
+		const { result, spy } = await spawn({
+			id: "ultracode-refuses-no-effort-surface",
 			model: NO_EFFORT_SURFACE,
 			ultracode: true,
 			thinkingLevel: ThinkingLevel.Low,
 		});
 
+		// The old behaviour fell through to the agent's own selector, which ran
+		// the spawn at low under an ultracode turn. A model that cannot express
+		// xhigh at all cannot satisfy the pin either.
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("ultracode requires xhigh");
+		expect(result.stderr).toContain(NO_EFFORT_SURFACE.id);
+		expect(result.stderr).toContain("exposes no controllable effort");
+		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it("spawns a no-effort-surface model normally when ultracode is off", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-off-no-effort-surface",
+			model: NO_EFFORT_SURFACE,
+			thinkingLevel: ThinkingLevel.Low,
+		});
+
 		expect(result.exitCode).toBe(0);
-		// Forcing xhigh onto a model that cannot express it would be an invalid
-		// level downstream; the agent's own selector must survive instead.
 		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+});
+
+// Prewalk exists to cheapen a run at its first edit/write by handing off to a
+// fast target with its own (lower) thinking level — exactly the step out from
+// under xhigh the pin forbids. Under ultracode the hand-off must not be armed.
+describe("ultracode suppresses the prewalk hand-off", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("arms prewalk from the agent definition while ultracode is off", async () => {
+		// The control: proves the fixture's prewalk target resolves and would
+		// have ridden into the session, so its absence below is the pin's doing.
+		const { result, forwarded, hasConfiguredAuth } = await spawn({
+			id: "ultracode-off-prewalk",
+			model: FULL_LADDER,
+			prewalk: `${PREWALK_TARGET.provider}/${PREWALK_TARGET.id}`,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(hasConfiguredAuth).toHaveBeenCalledWith(expect.objectContaining({ id: PREWALK_TARGET.id }));
+		expect(forwarded?.prewalk?.target.id).toBe(PREWALK_TARGET.id);
+	});
+
+	it("hands no prewalk into the session while ultracode is armed", async () => {
+		const { result, forwarded, hasConfiguredAuth } = await spawn({
+			id: "ultracode-suppresses-prewalk",
+			model: FULL_LADDER,
+			ultracode: true,
+			prewalk: `${PREWALK_TARGET.provider}/${PREWALK_TARGET.id}`,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		// Suppressed at the source, not resolved-then-dropped: the target was
+		// never even looked up.
+		expect(forwarded?.prewalk).toBeUndefined();
+		expect(hasConfiguredAuth).not.toHaveBeenCalled();
 	});
 });
 
@@ -432,5 +608,152 @@ describe("ultracode override inheritance into child settings", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(forwarded?.settings?.get("ultracode")).toBe(false);
+	});
+});
+
+// The pin is BORROWED, even for a child constructed directly at xhigh. When
+// the parent's turn ends, the lifecycle sync disarms the child at its next
+// resume boundary, and `endUltracodeTurn` hands back `#levelBeforeUltracode` —
+// which a child never captured, because it never ran `beginUltracodeTurn`.
+// `ultracodeRestoreLevel` seeds that capture with the level the child would
+// have run at WITHOUT the pin. Dropping it leaves every disarmed child parked
+// at xhigh as if that were its own choice.
+describe("ultracode restore level rides into the child", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("forwards the agent definition's own level as the restore level under ultracode", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-restore-agent-level",
+			model: FULL_LADDER,
+			ultracode: true,
+			thinkingLevel: ThinkingLevel.Medium,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.thinkingLevelCeiling).toBe(Effort.XHigh);
+		expect(forwarded?.ultracodeRestoreLevel).toBe(ThinkingLevel.Medium);
+	});
+
+	it("prefers an explicit :level suffix as the restore level, exactly as the unpinned spawn would run", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-restore-suffix",
+			model: FULL_LADDER,
+			ultracode: true,
+			thinkingLevel: ThinkingLevel.Medium,
+			modelSuffix: Effort.Low,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		// Precedence without the pin is suffix > agent default, so the handback
+		// lands where the unpinned spawn would have: low, not medium.
+		expect(forwarded?.ultracodeRestoreLevel).toBe(Effort.Low);
+	});
+
+	it("keeps auto as the restore level, so a disarmed child resumes classifying", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-restore-auto",
+			model: FULL_LADDER,
+			ultracode: true,
+			thinkingLevel: AUTO_THINKING,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.ultracodeRestoreLevel).toBe(AUTO_THINKING);
+	});
+
+	it("forwards no restore level while ultracode is off", async () => {
+		// Control: outside an armed turn nothing is borrowed, so seeding a
+		// handback would make the child's first disarm rewrite a level it owns.
+		const { result, forwarded } = await spawn({
+			id: "ultracode-off-no-restore",
+			model: FULL_LADDER,
+			thinkingLevel: ThinkingLevel.Medium,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(forwarded?.ultracodeRestoreLevel).toBeUndefined();
+	});
+});
+
+// Two isolation flavours share one snapshot loop. `createIsolatedSettings` is
+// "the parent's settings, detached": every schema key by value into a runtime
+// override layer, with NONE of the headless-subagent policy stamps, for
+// surfaces the user still drives (the Agents Hub, /tan). `createSubagentSettings`
+// is that plus the stamps. The split must not drift: a stamp leaking into the
+// isolated flavour would silently yolo an interactive clone, and a snapshot
+// key lost from the subagent flavour would drop the grandchild's ultracode
+// floor while every level assertion above stayed green.
+describe("createIsolatedSettings vs createSubagentSettings", () => {
+	/** The keys createSubagentSettings rewrites on top of the snapshot. */
+	const SUBAGENT_STAMPS: Partial<Record<SettingPath, true>> = {
+		"tools.approvalMode": true,
+		"advisor.enabled": true,
+		"tier.openai": true,
+		"tier.anthropic": true,
+		"tier.google": true,
+	};
+
+	function armedParent(): Settings {
+		const parent = Settings.isolated({
+			"tools.approvalMode": "always-ask",
+			"advisor.enabled": true,
+			"task.maxConcurrency": 3,
+		});
+		// The runtime override layer, exactly how the keyword arms it: the
+		// snapshot must read the merged value, not the persisted base.
+		parent.override("ultracode", true);
+		return parent;
+	}
+
+	it("createIsolatedSettings keeps the parent's approval mode and advisor, and the armed flag", () => {
+		const parent = armedParent();
+		const isolated = createIsolatedSettings(parent);
+
+		expect(isolated.get("tools.approvalMode")).toBe("always-ask");
+		expect(isolated.get("advisor.enabled")).toBe(true);
+		expect(isolated.get("ultracode")).toBe(true);
+		expect(isolated.get("task.maxConcurrency")).toBe(3);
+	});
+
+	it("createIsolatedSettings is detached: later parent flips do not reach it and its own writes do not leak back", () => {
+		const parent = armedParent();
+		const isolated = createIsolatedSettings(parent);
+
+		parent.override("ultracode", false);
+		expect(isolated.get("ultracode")).toBe(true);
+
+		isolated.override("task.maxConcurrency", 9);
+		expect(parent.get("task.maxConcurrency")).toBe(3);
+	});
+
+	it("createSubagentSettings is the same snapshot plus exactly the subagent stamps", () => {
+		const parent = armedParent();
+		const isolated = createIsolatedSettings(parent);
+		const subagent = createSubagentSettings(parent);
+
+		// The stamps, verbatim from the previous (pre-split) implementation.
+		expect(subagent.get("tools.approvalMode")).toBe("yolo");
+		expect(subagent.get("advisor.enabled")).toBe(false);
+		// Every other schema key resolves identically through both flavours —
+		// enumerated from the schema so a new key cannot fall out of the check.
+		for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			if (SUBAGENT_STAMPS[key]) continue;
+			expect([key, subagent.get(key)]).toEqual([key, isolated.get(key)]);
+		}
+		expect(subagent.get("ultracode")).toBe(true);
+	});
+
+	it("createSubagentSettings still lets caller overrides win over the stamps", () => {
+		const parent = armedParent();
+		const subagent = createSubagentSettings(parent, { "advisor.enabled": true });
+
+		expect(subagent.get("advisor.enabled")).toBe(true);
+		expect(subagent.get("tools.approvalMode")).toBe("yolo");
 	});
 });

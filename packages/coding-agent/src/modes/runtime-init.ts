@@ -90,9 +90,15 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getAllTools: () => session.getAllToolInfos(),
 			setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
 			getCommands: () => getSessionSlashCommands(session),
+			// `runExtensionSetModel` tags the swap "extension" so an armed turn
+			// re-pins on the new model instead of taking the user off-ramp.
 			setModel: model => runExtensionSetModel(session, model),
 			getThinkingLevel: () => session.thinkingLevel,
-			setThinkingLevel: level => session.setThinkingLevel(level),
+			// Extensions are never a user surface: their level changes must not
+			// run the user-only ultracode off-ramp (forget restore + flag false);
+			// an armed turn re-pins after the change. Always non-persistent: a
+			// runtime nudge never rewrites user settings.
+			setThinkingLevel: level => session.setThinkingLevel(level, false, "extension"),
 			getServiceTiers: () => session.serviceTierByFamily,
 			setServiceTier: (family, tier) => session.setServiceTierFamily(family, tier),
 			getSessionName: () => session.sessionManager.getSessionName(),

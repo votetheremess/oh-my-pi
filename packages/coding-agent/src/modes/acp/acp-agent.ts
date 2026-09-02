@@ -52,7 +52,7 @@ import {
 	type ExtensionUIDialogOptions,
 	getExtensionUISelectOptionLabel,
 } from "../../extensibility/extensions";
-import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
+import { runExtensionCompact, runExtensionSetModel } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
@@ -2556,16 +2556,12 @@ export class AcpAgent implements Agent {
 				getAllTools: () => record.session.getAllToolInfos(),
 				setActiveTools: toolNames => record.session.setActiveToolsByName(toolNames),
 				getCommands: () => getSessionSlashCommands(record.session),
-				setModel: async model => {
-					const apiKey = await record.session.modelRegistry.getApiKey(model);
-					if (!apiKey) {
-						return false;
-					}
-					await record.session.setModel(model);
-					return true;
-				},
+				// Extensions are never a user surface: their model/level changes are
+				// attributed "extension", so an armed ultracode turn re-pins instead
+				// of taking the user-only off-ramp (forget restore + flag false).
+				setModel: model => runExtensionSetModel(record.session, model),
 				getThinkingLevel: () => record.session.thinkingLevel,
-				setThinkingLevel: level => record.session.setThinkingLevel(level),
+				setThinkingLevel: level => record.session.setThinkingLevel(level, false, "extension"),
 				getServiceTiers: () => record.session.serviceTierByFamily,
 				setServiceTier: (family, tier) => record.session.setServiceTierFamily(family, tier),
 				getSessionName: () => record.session.sessionManager.getSessionName(),

@@ -409,6 +409,12 @@ export interface CreateAgentSessionOptions {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Hard ceiling on the session's thinking effort (e.g. a task spawn's `task.maxEffort`-capped hint); retry-fallback recovery re-clamps to it. */
 	thinkingLevelCeiling?: Effort;
+	/**
+	 * The level the user owns when `thinkingLevel` is a borrowed ultracode pin
+	 * (a task child spawned inside an armed turn): disarm hands back to it.
+	 * Absent = `thinkingLevel` is the user's own selection.
+	 */
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 	/** OpenAI service-tier override for this session. `null` omits `service_tier`. */
 	openAIServiceTier?: ServiceTier | null;
 	/** Models available for cycling (Ctrl+P in interactive mode) */
@@ -3674,6 +3680,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			pruneToolDescriptions: inlineToolDescriptors,
 			thinkingLevel: autoThinking ? AUTO_THINKING : effectiveThinkingLevel,
 			thinkingLevelCeiling: options.thinkingLevelCeiling,
+			ultracodeRestoreLevel: options.ultracodeRestoreLevel,
 			initialRetryFallback,
 			prewalk: options.prewalk,
 			planYolo: options.planYolo,

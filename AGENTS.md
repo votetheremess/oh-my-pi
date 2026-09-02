@@ -446,7 +446,46 @@ lock anyone out. Retired machinery lives in `~/.omp/retired/`.
 - Plan approval dispatches a SYNTHETIC prompt, and synthetic turns never scan for magic
   keywords, so a typed keyword cannot reach the execution turn. That is what
   "Approve and execute with ultracode" in the plan review exists for. Arm effort only
-  AFTER `#exitPlanMode`, which restores the pre-plan model and would revert the pin.
+  AFTER `#exitPlanMode`, which restores the pre-plan model and would revert the pin —
+  and on the queued path (a turn already in flight) never at enqueue: the arm rides the
+  synthetic follow-up as its `onDeliver` hook (`armUltracodeTurnDeferred()`), the same
+  `ASIDE_MESSAGE_COMMIT` rider a queued typed keyword uses. The direct path arms via
+  `armUltracodeTurnWithUndo()` and runs the undo when `prompt()` returns false or
+  throws. A PLAIN approval disarms (`disarmUltracodeTurn()` direct /
+  `disarmUltracodeTurnDeferred()` queued) — the execution turn is synthetic and would
+  otherwise inherit the planning turn's arm. Plan-mode enter/exit snapshots read
+  `userConfiguredThinkingLevel()` (the level the user owns), never the borrowed pin.
+- Queue modes differ on purpose. A FOLLOW-UP starts a turn: keyword arms, keyword-free
+  disarms, both at delivery. A STEER joins the running turn and is ARM-ONLY: keyword
+  arms at delivery, keyword-free attaches no rider at all (a mid-turn "also do X" must
+  not yank the pin and floor out of the workflow it joins). `steer()`/`followUp()` RPC
+  entries carry the same riders as `prompt()`'s queue branches. Every arm/disarm bumps
+  `#ultracodeArmSeq`; a dropped turn's undo captures it at creation and stands down if
+  anything flipped since. A queued keyword-free disarm rider instead yields to an arm
+  that fired in the SAME synchronous commit batch (`#ultracodeArmedInBatch`, cleared by
+  a microtask — the agent loop commits a batch in one synchronous `for`): a plan
+  directive's arm ahead of an older keyword-free follow-up in one batch leaves that
+  turn armed, while the same follow-up delivered as its own later turn (the default
+  `followUpMode`) disarms. An enqueue-time sequence was tried first and made that
+  later turn run armed.
+- `createIsolatedSettings` (executor.ts) is the pure snapshot — every schema key by
+  value into an isolated override layer, NO subagent stamps — for the Agents Hub
+  architect and the legacy extension shim; `createSubagentSettings` = that + the
+  yolo/advisor-off/tier stamps, and `/tan` keeps it (headless clone, yolo is
+  load-bearing). Both carry the parent's live `ultracode` override by value.
+  `syncChildUltracodeAtResume` decides via `ultracodePinRefusal()` BEFORE writing the
+  child's flag: refused → throw (ceiling vs no-rung worded differently) with the flag
+  never raised (a child that arrived stale-flagged is disarmed first, so no child is
+  ever flagged-but-unpinned).
+- The ultracode effort contract is one helper, `ultracodeEffortFor` in `src/thinking.ts`:
+  exactly `Effort.XHigh` when the ladder has the rung, `undefined` otherwise, never any
+  other level. Both the session pin (`ModelControls.beginUltracodeTurn` /
+  `repinUltracodeIfArmed`) and the spawn pin (`executor.ts`) resolve through it, so they
+  cannot disagree. The session side adds one more refusal: a hard `thinkingLevelCeiling`
+  below xhigh (`ModelControls.canPinUltracode()` / `ultracodePinRefusal()` →
+  `"ceiling"`), and the notice's `effortPinned` is that exact predicate (root-only), so
+  it never promises a floor the arm refused. NEVER reintroduce `clampAutoThinkingEffort(model, Effort.XHigh)` on an
+  ultracode path — that was the old clamp, and the user rejected it (deviation iv).
 
 **Deliberate deviations from official Claude Code's ultracode (2.1.211), recorded so no
 audit re-litigates them:** (i) CC's keyword is a turn-scoped orchestration opt-in ONLY —
@@ -457,7 +496,55 @@ pre-expansion prompt and never fires on a slash-prefixed one; the fork scans the
 text (upstream's pre-existing pattern for the other three keywords), so a slash-command or
 template body and skill args can deliberately carry the keyword — code-span masking keeps
 a backticked mention inert. (iii) Intended, not a leak: a subagent spawned by an ultracode
-turn stays pinned for its whole lifetime, even if it outlives the turn.
+turn stays pinned until the child's next RESUME BOUNDARY (follow-up turn, hub wake,
+revive — `syncChildUltracodeAtResume`) after the parent's turn has ended; at that
+boundary it disarms and hands back to its restore level (`ultracodeRestoreLevel`, the
+level it would have run at unpinned, threaded from the executor and persisted in
+`session_init`). Between the parent's disarm and that boundary the child keeps xhigh —
+mid-run, nothing polls the parent. (iv) **Strict
+xhigh, fail loud (user decision, 2026-09-02).** The pin is EXACTLY xhigh — never max,
+never below — for the turn and every LLM agent that runs during it. The earlier design
+clamped to the model's ladder (a `[max]` ladder pinned max, a `[..high]` ladder pinned
+high, a model with no effort surface fell through to its own selector). The user's
+rationale: a clamp spends the pinned budget at a level they did not ask for while the
+notice tells the model it is running at xhigh, and nothing in the UI says otherwise; a
+wrong effort that announces itself is recoverable, a silent one is not. So a model with no
+xhigh rung cannot satisfy ultracode: the main-session arm does NOT pin and does NOT set
+the `ultracode` override (nothing is floored), posts a `warning` notice (source
+`ultracode`, message `ultracode requires xhigh; <model> exposes [...]; this turn is not
+armed`) and renders the hidden notice's `{{#unless effortPinned}}` branch; spawn paths
+throw `UltracodeEffortError` before any session exists; retry fallback skips such
+candidates; auxiliary agents (advisor, security coordinator) throw and the caller posts a
+notice and skips that agent. Never clamp silently.
+
+**Hardening pass (2026-09-02), the four reviewer findings and the spawn-entry gaps, all
+fixed with tests in `scripts/ultracode-tests.txt`:** (1) armed state leaked across session
+transitions — FIXED: `AgentSession.disarmUltracodeTurn()` (override → false +
+`endUltracodeTurn`) runs in `newSession`/`switchSession`. (2) a user model pick left the
+pin and floor up — FIXED: the session wrappers `setModel`/`setModelTemporary`/`cycleModel`
+/`applyRoleModel`/`cycleRoleModels` disarm first (`#dropUltracodeForUserModelPick` →
+`disarmUltracodeTurn`, so a level-less pick lands on the pre-ultracode level, not the
+borrowed xhigh); genuinely internal swaps (retry fallback, prewalk, compaction promotion,
+transcript restore) call ModelControls directly and end with `repinUltracodeIfArmed()`,
+keyed on the settings flag so an inheriting child re-pins too. Role switches and
+plan-mode transitions go through the session wrappers as USER picks and END the turn —
+they do not re-pin (wave-2 correction of an earlier claim here). (3) a dropped dispatch stranded the arm — FIXED:
+`#applyUltracodeTurnState` returns an undo closure reverting exactly what it changed
+(override write and pin/handback; a no-op when re-arming an already-armed turn), run when
+`#promptWithMessage` returns false or throws, on both the `prompt()` and
+`promptCustomMessage` direct paths. (4) plan approval armed at enqueue on the queued path
+— FIXED: delivery-hook arming via `FollowUpOptions.onDeliver` (see the plan-approval
+bullet above). Spawn-entry gaps: arming is root-only (`agentKind: "sub"`
+makes `#applyUltracodeTurnState` and the queue riders no-ops, so a child neither arms
+from a user-attributed message nor disarms the flag it inherited) — that guard, not
+attribution, is what protects children: `sendUserMessage` and the `/tan` work prompt are
+user messages by contract and stay user-attributed (wave-2 reverted wave-1's
+`attribution: "agent"` on them; IRC hub steering between agents stays agent-attributed); and `setThinkingLevel(level, persist, source)`
+takes the off-ramp only for `source: "user"` — the extension runtimes wired in
+`executor.ts`/`persisted-revive.ts` pass `"extension"` and the armed turn re-pins over
+them (closes open edge (b) below). Open edge (a) (collab peer `chat`) is NOT closed by
+this pass: `collab/host.ts` still routes a peer's `chat` into `session.prompt` with no
+attribution marker.
 
 **Recovery refs.** The newest `ultracode-verified-<date>` tag marks the last state whose
 gate was actually green; older dated tags mark earlier ones. Deliberately no commit count
@@ -503,15 +590,17 @@ known-churn spots: docs/settings.md (twice) and `#queueUserMessage` in agent-ses
 where upstream's new `timestamp?: number` latency anchor (f9a00c7313, db0fa518c3) and
 the fork's `onDeliver` hook compose as two independent trailing params — resolution
 adversarially reviewed, both intents preserved. rerere recorded all three resolutions.
-**Known-open edges (2026-08-31 review, latent, none introduced by the rebase):** (a) a
-collab peer's `chat` (collab/host.ts routing into `session.prompt` with no
-synthetic/attribution marker) passes the `userAuthoredTurn` gate, so a remote peer can
-arm/disarm ultracode; (b) an extension calling `setThinkingLevel` inside a subagent hits
-the off-ramp and silently drops that subagent's floor; (c) `createSubagentSettings`
-snapshots every schema key, so the child's isolated Settings bakes `ultracode: true` as
-its own base value — this is the mechanism behind deliberate deviation (iii), listed so
-nobody mistakes it for a leak; (d) no test pins the `timestamp ?? Date.now()` pass-through
-in the hoisted `#queueUserMessage` message const (upstream shipped it untested too).
+**Known-open edges (2026-08-31 review, latent, none introduced by the rebase; status
+re-checked 2026-09-02):** (a) STILL OPEN — a collab peer's `chat` (collab/host.ts routing
+into `session.prompt` with no synthetic/attribution marker) passes the `userAuthoredTurn`
+gate, so a remote peer can arm/disarm ultracode on a root session (on a child it is now
+harmless: arming is root-only); (b) CLOSED by the 2026-09-02 hardening pass —
+`setThinkingLevel(level, persist, "extension")` no longer takes the off-ramp, and the
+armed turn re-pins over the extension's level; (c) `createSubagentSettings` snapshots
+every schema key, so the child's isolated Settings bakes `ultracode: true` as its own
+base value — this is the mechanism behind deliberate deviation (iii), listed so nobody
+mistakes it for a leak; (d) no test pins the `timestamp ?? Date.now()` pass-through in
+the hoisted `#queueUserMessage` message const (upstream shipped it untested too).
 
 **Upstream watch (verified 2026-08-25, tags v17.4.0→v18.0.5).** Upstream has no
 ultracode equivalent and gained none in that window: the keyword machinery and all three

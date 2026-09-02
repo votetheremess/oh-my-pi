@@ -22,8 +22,9 @@ import {
 	type MessageCountOptions,
 	Tokenizer,
 } from "@oh-my-pi/pi-agent-core";
-import { type AuthCredential, SqliteAuthCredentialStore, type TSchema } from "@oh-my-pi/pi-ai";
+import { type AuthCredential, Effort, SqliteAuthCredentialStore, type TSchema } from "@oh-my-pi/pi-ai";
 import { piEscapeRegexLiteral, piJoinPath } from "@oh-my-pi/pi-ai/providers/cursor-pi-args";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getKeybindings, type Keybinding, Text } from "@oh-my-pi/pi-tui";
 import {
 	getAgentDbPath,
@@ -31,9 +32,15 @@ import {
 	getProjectDir,
 	isCompiledBinary,
 	parseFrontmatter as parseOmpFrontmatter,
+	Snowflake,
 } from "@oh-my-pi/pi-utils";
 import { getPackageDir as getOmpPackageDir } from "../config";
 import { formatKeyHints } from "../config/keybindings";
+import {
+	formatModelStringWithRouting,
+	resolveConfiguredModelPatterns,
+	resolveModelOverride,
+} from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { findScopedSettings, type SettingPath, Settings } from "../config/settings";
 import { EditTool } from "../edit";
@@ -52,6 +59,8 @@ import {
 	truncateHead,
 	truncateTail,
 } from "../session/streaming-output";
+import { createIsolatedSettings } from "../task/executor";
+import { UltracodeEffortError, ultracodeEffortFor } from "../thinking";
 import type { Tool, ToolSession } from "../tools";
 import { BashTool } from "../tools/bash";
 import { GlobTool } from "../tools/glob";
@@ -1346,12 +1355,80 @@ export type LegacyPiCreateAgentSessionOptions = CreateAgentSessionOptions & {
 	resourceLoader?: ResourceLoader;
 };
 
-export async function createAgentSession(
-	options: LegacyPiCreateAgentSessionOptions = {},
+/**
+ * Apply the live session's ultracode contract to a legacy spawn request.
+ *
+ * A legacy extension that spawns a session off the LIVE session's Settings
+ * is spawning one of the ultracode turn's agents when that turn is armed.
+ * Three things follow. The live object is never shared: the spawned session's
+ * runtime overrides would otherwise land on the interactive session that
+ * loaded the extension, so it gets an isolated snapshot (which still carries
+ * `ultracode: true`, flooring its own spawns) — isolation only, none of the
+ * headless-subagent stamps (yolo approval, advisors off) a legacy caller
+ * never asked for. The effort is exactly xhigh: the caller's `thinkingLevel`
+ * cannot lower it, and a model with no xhigh rung is refused up front rather
+ * than clamped — the SDK does NOT validate the pin itself; it clamps
+ * `thinkingLevel` onto whatever model it resolves, so the model is resolved
+ * HERE (against the live settings, like the agents hub) when the caller left
+ * it implicit. And the session is a child kind: a root session would disarm
+ * itself on its first keyword-free user prompt, dropping the inherited floor
+ * before it spawns anything, whereas a child only ever re-pins.
+ *
+ * A model that cannot be resolved up front (no registry on the request) is
+ * still checked once the SDK has picked one, see
+ * {@link refuseUnpinnableUltracodeSession}.
+ */
+function applyLiveUltracodeContract(requested: LegacyPiCreateAgentSessionOptions): LegacyPiCreateAgentSessionOptions {
+	const liveSettings = requested.settings;
+	if (!liveSettings?.get("ultracode")) return requested;
+	let model = requested.model;
+	if (model === undefined && requested.modelRegistry) {
+		const patterns = resolveConfiguredModelPatterns(liveSettings.getModelRole("default"), liveSettings);
+		model = resolveModelOverride(patterns, requested.modelRegistry, liveSettings).model;
+	}
+	if (model !== undefined && ultracodeEffortFor(model) === undefined) {
+		throw new UltracodeEffortError(formatModelStringWithRouting(model), getSupportedEfforts(model));
+	}
+	const childId = `Legacy-${Snowflake.next()}`;
+	return {
+		...requested,
+		settings: createIsolatedSettings(liveSettings),
+		thinkingLevel: Effort.XHigh,
+		thinkingLevelCeiling: Effort.XHigh,
+		agentId: requested.agentId ?? childId,
+		parentTaskPrefix: requested.parentTaskPrefix ?? childId,
+	};
+}
+
+/**
+ * Backstop for {@link applyLiveUltracodeContract} when the model was only
+ * resolvable by the SDK: a session that came up on a model without the xhigh
+ * rung is running clamped under the ultracode name, which is exactly the
+ * silent failure the contract forbids. Tear it down before any prompt runs
+ * and fail loudly instead.
+ */
+async function refuseUnpinnableUltracodeSession(
+	result: CreateAgentSessionResult,
+	armed: boolean,
 ): Promise<CreateAgentSessionResult> {
+	const model = result.session.model;
+	if (!armed || ultracodeEffortFor(model) !== undefined) return result;
+	await result.session.dispose();
+	throw new UltracodeEffortError(
+		model ? formatModelStringWithRouting(model) : "no model",
+		model ? getSupportedEfforts(model) : [],
+	);
+}
+
+export async function createAgentSession(
+	requested: LegacyPiCreateAgentSessionOptions = {},
+): Promise<CreateAgentSessionResult> {
+	const armed = requested.settings?.get("ultracode") === true;
+	const options = applyLiveUltracodeContract(requested);
+
 	const loader = options.resourceLoader;
 	if (!loader) {
-		return ompCreateAgentSession(options);
+		return refuseUnpinnableUltracodeSession(await ompCreateAgentSession(options), armed);
 	}
 
 	if (loader instanceof DefaultResourceLoader && !loader.loaded) {
@@ -1418,7 +1495,7 @@ export async function createAgentSession(
 		forwarded.appendSystemPrompt = state.appendSystemPrompt.join("\n\n");
 	}
 
-	return ompCreateAgentSession(forwarded);
+	return refuseUnpinnableUltracodeSession(await ompCreateAgentSession(forwarded), armed);
 }
 
 /**

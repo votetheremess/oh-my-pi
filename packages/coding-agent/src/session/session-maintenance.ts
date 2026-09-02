@@ -51,6 +51,7 @@ import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/to
 import type { AssistantMessage, CodexCompactionContext, Message, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -65,7 +66,7 @@ import type { MemoryBackendOperationContext } from "../memory-backend/types";
 import type { NonMessageTokenSource } from "../modes/utils/context-usage";
 import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
-import type { ConfiguredThinkingLevel } from "../thinking";
+import { type ConfiguredThinkingLevel, UltracodeEffortError, ultracodeEffortFor } from "../thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
 import { findCompactMode } from "./compact-modes";
@@ -2105,6 +2106,18 @@ export class SessionMaintenance {
 		if (contextWindow <= 0) return false;
 		const targetModel = await this.resolveContextPromotionTarget(currentModel, contextWindow);
 		if (!targetModel) return false;
+		// An armed ultracode turn pins exactly xhigh, and the swap below only
+		// re-pins when the incoming model has the rung: a target without it would
+		// leave the turn running under the ultracode name at some other effort.
+		// Keep the current model and let the overflow fall through to compaction.
+		if (this.#host.settings.get("ultracode") && ultracodeEffortFor(targetModel) === undefined) {
+			const reason = new UltracodeEffortError(
+				`${targetModel.provider}/${targetModel.id}`,
+				getSupportedEfforts(targetModel),
+			);
+			this.#host.emitNotice("warning", `Context promotion skipped: ${reason.message}`, "compaction");
+			return false;
+		}
 
 		try {
 			await this.#host.setModelTemporary(targetModel, undefined, { ephemeral: true });
