@@ -20,10 +20,13 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { runEvalAgent } from "@oh-my-pi/pi-coding-agent/eval/agent-bridge";
+import { runEvalWorkpool } from "@oh-my-pi/pi-coding-agent/eval/workpool-bridge";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -31,6 +34,7 @@ import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createIsolatedSettings, createSubagentSettings, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { WorkPoolRegistry } from "@oh-my-pi/pi-coding-agent/task/workpool";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, type TaskEffort } from "@oh-my-pi/pi-coding-agent/thinking";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -112,6 +116,11 @@ function yieldEmittingSession(): AgentSession {
 		// instantly-caught-up, matching the real signatures.
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForAdvisorCatchup: async (_timeoutMs: number) => true,
+		// v18.1.16 (74bdf4c65c `feat(coding-agent): clarify subagent model badges`) publishes
+		// the advisor state to the agent registry on every `setActiveSession`, so
+		// `runSubprocess` now reads this off the session it is handed. Matches the real
+		// signature; no advisor is ever active on this fake.
+		isAdvisorActive: () => false,
 	};
 	return session as unknown as AgentSession;
 }
@@ -503,15 +512,26 @@ describe("ultracode suppresses the prewalk hand-off", () => {
  * Plain object, not a Proxy: only the members the structured-subagent seam and
  * the executor actually read, each matching the real ToolSession signature.
  */
+const jobManagers = new Set<AsyncJobManager>();
+
 function frontendToolSession(options: { model: Model; ultracode?: boolean }): ToolSession {
 	const settings = Settings.isolated();
 	// Flipped exactly the way the keyword flips it: the non-persisted runtime layer.
 	if (options.ultracode) settings.override("ultracode", true);
 	settings.setModelRole("task", `${options.model.provider}/${options.model.id}`);
+	// v18.1.16 (05bb0c1989 `feat: reengineered evaluation, added WorkPool`) made the eval
+	// frontends handle-based: `runEvalAgent` and a workpool push register the spawn as a
+	// background job on the session's manager and return at once, so the spawn - and the
+	// pin computed for it - happens inside that job. A real manager, so the job runs.
+	const manager = new AsyncJobManager({});
+	jobManagers.add(manager);
 	return {
 		cwd: "/tmp",
 		settings,
 		modelRegistry: createModelRegistry(options.model),
+		asyncJobManager: manager,
+		getAgentId: () => "Main",
+		getArtifactsDir: () => null,
 		getSessionSpawns: () => "*",
 		getSessionFile: () => null,
 		enableLsp: false,
@@ -520,21 +540,34 @@ function frontendToolSession(options: { model: Model; ultracode?: boolean }): To
 	} as unknown as ToolSession;
 }
 
+/** Settle the background job an eval frontend registered, so its spawn has happened. */
+async function settleEvalJob(session: ToolSession, id: string): Promise<void> {
+	const job = session.asyncJobManager?.getJob(id);
+	if (!job) throw new Error(`eval frontend registered no job ${id}`);
+	await job.promise;
+	if (job.status === "failed") throw new Error(`eval job ${id} failed: ${job.errorText ?? "unknown"}`);
+}
+
 function mockFrontendSpawnSeams() {
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [baseAgent], projectAgentsDir: null });
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(yieldEmittingSession()));
 }
 
 describe("ultracode pin through the real spawn frontends", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const manager of jobManagers) await manager.dispose();
+		jobManagers.clear();
+		AgentRegistry.resetGlobalForTests();
+		WorkPoolRegistry.resetForTests();
 	});
 
 	it("pins an eval agent() spawn to xhigh end-to-end through the bridge", async () => {
 		const spy = mockFrontendSpawnSeams();
 		const session = frontendToolSession({ model: FULL_LADDER, ultracode: true });
 
-		await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+		const handle = await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+		await settleEvalJob(session, handle.id);
 
 		expect(spy).toHaveBeenCalledTimes(1);
 		const forwarded = spy.mock.calls[0]?.[0];
@@ -552,13 +585,34 @@ describe("ultracode pin through the real spawn frontends", () => {
 		const spy = mockFrontendSpawnSeams();
 		const session = frontendToolSession({ model: FULL_LADDER });
 
-		await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+		const handle = await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+		await settleEvalJob(session, handle.id);
 
 		// The control: proves the pin above came from the parent's live flag,
 		// not from anything constant about the eval path.
 		const forwarded = spy.mock.calls[0]?.[0];
 		expect(forwarded?.thinkingLevel).toBeUndefined();
 		expect(forwarded?.settings?.get("ultracode")).toBe(false);
+	});
+
+	it("pins a workpool() worker spawn to xhigh through the pool's own dispatch", async () => {
+		const spy = mockFrontendSpawnSeams();
+		const session = frontendToolSession({ model: FULL_LADDER, ultracode: true });
+
+		// The v18.1.16 fan-out primitive the ultracode notice now teaches. Its
+		// workers are spawned by the pool's own dispatch (workpool.ts #startTurn ->
+		// runStructuredSubagent), not by the agent() bridge, so a pin that only
+		// covered the bridge would let the recommended fan-out path run cold.
+		const created = await runEvalWorkpool({ op: "create", agent: "task", name: "pinned" }, { session });
+		expect(created).toMatchObject({ name: "pinned", agent: "task" });
+		await runEvalWorkpool({ op: "push", name: "pinned", items: ["do work"] }, { session });
+		// The pool job settles once every item's batch has run, i.e. after the spawn.
+		await settleEvalJob(session, "pinned");
+
+		expect(spy).toHaveBeenCalledTimes(1);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.settings?.get("ultracode")).toBe(true);
 	});
 
 	it("pins a task-kind structured-subagent spawn identically", async () => {

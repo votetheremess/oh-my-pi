@@ -340,6 +340,7 @@ import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
 import {
 	attachQueuedMessageDeliveryEffect,
+	hasQueuedMessageDeliveryEffect,
 	isAdvisorCard,
 	isDisplayableQueuedMessage,
 	isHiddenUserCompanion,
@@ -1074,6 +1075,20 @@ export class AgentSession {
 					this.#irc.queueAside(records);
 					logger.debug("IRC wake turn deferred behind the running turn");
 					return;
+				}
+				// A stranded user aside (its normalization await outlasted the run it
+				// was meant to join) STARTS this turn instead of joining one, so it
+				// takes the same off-ramp a typed message would on an idle session:
+				// keyword-free, it ends ultracode; with the keyword, its attached arm
+				// hook fires at commit and re-pins. Only ever a root's own text -
+				// peer IRC and extension asides carry no user attribution and leave
+				// the armed state exactly as the previous turn left it.
+				if (
+					this.#agentKind !== "sub" &&
+					records.some(record => record.role === "user" && record.attribution === "user") &&
+					!records.some(hasQueuedMessageDeliveryEffect)
+				) {
+					this.disarmUltracodeTurn();
 				}
 				try {
 					finishObservation = this.#ircWakeTurnObserver?.(records);
@@ -6087,6 +6102,7 @@ export class AgentSession {
 		effortApplied: boolean;
 		effortPinned: boolean;
 		maxConcurrency: number;
+		evalTools: boolean;
 	} {
 		const tools = this.getActiveToolNames();
 		return {
@@ -6106,6 +6122,7 @@ export class AgentSession {
 			// promises a floor the spawns will refuse to run under.
 			effortPinned: this.canPinUltracode(),
 			maxConcurrency: this.settings.get("task.maxConcurrency"),
+			evalTools: this.settings.get("eval.tools.enabled"),
 		};
 	}
 
@@ -7405,7 +7422,12 @@ export class AgentSession {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
 			const records: AgentMessage[] = [];
 			if (imageDescriptionNotice) records.push(imageDescriptionNotice);
-			const record: AgentMessage = { role: "user", content, attribution: "user", timestamp: timestamp ?? Date.now() };
+			const record: AgentMessage = {
+				role: "user",
+				content,
+				attribution: "user",
+				timestamp: timestamp ?? Date.now(),
+			};
 			// The ultracode turn-state effect rides the aside record too: the aside
 			// poll commits it into the live context, which is when the hook fires.
 			if (onDeliver) attachQueuedMessageDeliveryEffect(record, onDeliver);
@@ -7861,17 +7883,38 @@ export class AgentSession {
 		let deliveredAsAside = false;
 		if (options?.deliverAs === "aside") {
 			if (this.isStreaming) {
-				await this.#queueUserMessage(text, images, "aside", undefined, undefined, this.#ultracodeDeliveryHook(text, "aside"));
+				await this.#queueUserMessage(
+					text,
+					images,
+					"aside",
+					undefined,
+					undefined,
+					this.#ultracodeDeliveryHook(text, "aside"),
+				);
 				return;
 			}
 			// Idle: fall through to the prompt flow below (starts a turn, like an omitted
 			// deliverAs) — there is no live run to inject an aside into.
 			deliveredAsAside = true;
 		} else if (options?.deliverAs === "followUp") {
-			await this.#queueUserMessage(text, images, "followUp", undefined, undefined, this.#ultracodeDeliveryHook(text, "followUp"));
+			await this.#queueUserMessage(
+				text,
+				images,
+				"followUp",
+				undefined,
+				undefined,
+				this.#ultracodeDeliveryHook(text, "followUp"),
+			);
 			return;
 		} else if (options?.deliverAs === "steer") {
-			await this.#queueUserMessage(text, images, "steer", undefined, undefined, this.#ultracodeDeliveryHook(text, "steer"));
+			await this.#queueUserMessage(
+				text,
+				images,
+				"steer",
+				undefined,
+				undefined,
+				this.#ultracodeDeliveryHook(text, "steer"),
+			);
 			return;
 		}
 

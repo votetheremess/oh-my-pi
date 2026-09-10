@@ -48,6 +48,8 @@ const ULTRACODE_WORD = magicKeywordRegex("ultracode");
  *   substitute for; the orchestration contract still ships.
  * - `maxConcurrency` is the live `task.maxConcurrency`; 0 means unbounded and
  *   the cap sentence is omitted entirely, matching the system prompt.
+ * - `evalTools` is the live `eval.tools.enabled`; off, the notice never names
+ *   `tool()`/`tools=`, which the kernel would reject.
  */
 export function renderUltracodeNotice({
 	workflowAvailable,
@@ -55,6 +57,7 @@ export function renderUltracodeNotice({
 	effortApplied,
 	effortPinned,
 	maxConcurrency,
+	evalTools,
 	viaPlanApproval,
 }: {
 	workflowAvailable: boolean;
@@ -62,6 +65,7 @@ export function renderUltracodeNotice({
 	effortApplied?: boolean;
 	effortPinned?: boolean;
 	maxConcurrency?: number;
+	evalTools?: boolean;
 	viaPlanApproval?: boolean;
 }): string {
 	return prompt
@@ -71,6 +75,7 @@ export function renderUltracodeNotice({
 			effortApplied: effortApplied ?? true,
 			effortPinned: effortPinned ?? true,
 			MAX_CONCURRENCY: normalizeConcurrencyLimit(maxConcurrency ?? 0),
+			evalTools: evalTools ?? false,
 			viaPlanApproval: viaPlanApproval ?? false,
 		})
 		.trim();

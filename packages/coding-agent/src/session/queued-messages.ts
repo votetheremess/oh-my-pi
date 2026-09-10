@@ -117,6 +117,11 @@ export function attachQueuedMessageDeliveryEffect(message: AgentMessage, effect:
 	Object.defineProperty(message, ASIDE_MESSAGE_COMMIT, { configurable: true, value: effect });
 }
 
+/** Whether {@link attachQueuedMessageDeliveryEffect} armed this message with a delivery effect. */
+export function hasQueuedMessageDeliveryEffect(message: AgentMessage): boolean {
+	return ASIDE_MESSAGE_COMMIT in message;
+}
+
 /** Converts a queued user message to editor-restorable content. */
 export function toRestoredQueuedMessage(message: AgentMessage): RestoredQueuedMessage {
 	return { text: queueChipText(message), images: queuedImageContent(message) };

@@ -276,7 +276,8 @@ describe("AgentSession magic keyword settings", () => {
 		// The keyword promises a dynamic workflow, so the API to author one has to
 		// be in the notice; naming it without carrying it is the whole defect.
 		expect(notice).toContain("agent(");
-		expect(notice).toContain("parallel(");
+		expect(notice).toContain("workpool(");
+		expect(notice).not.toContain("parallel(");
 		expect(notice).toContain("THIS TURN");
 	});
 
@@ -297,7 +298,7 @@ describe("AgentSession magic keyword settings", () => {
 		const notice = promptMessages.find(message => message.customType === "ultracode-notice")?.content ?? "";
 		expect(notice).toContain("xhigh");
 		expect(notice).not.toContain("agent(");
-		expect(notice).not.toContain("parallel(");
+		expect(notice).not.toContain("workpool(");
 		expect(created.settings.get("ultracode")).toBe(true);
 	});
 

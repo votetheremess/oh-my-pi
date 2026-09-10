@@ -554,6 +554,53 @@ script moves it only when a rebase actually runs, so it can lag many commits. Re
 of them with `git log --oneline <ref>..HEAD` before trusting it, and re-point the newest
 tag at HEAD after the last commit of a session, never before.
 
+**Upstream watch refresh (verified 2026-09-09, tags v18.1.4→v18.1.16, 711 upstream
+commits, during the v18.1.16 rebase).** The biggest window so far and the first that
+changed the CONTRACT the fork teaches, not just its seams. (1) Upstream rewrote the eval
+kernel (05bb0c1989 "reengineered evaluation, added WorkPool"): `parallel()`/`pipeline()`
+are gone from both preludes; `agent()` returns an `AgentHandle` immediately, results come
+from `.wait()`/`wait(handles, {raiseErrors})`, and bounded fan-out is `workpool()`
+(`.push()`; results auto-deliver; the pool name is its job id; bounded by
+`task.maxConcurrency`, handles are NOT bounded). The fork's `ultracode-notice.md` still
+taught the old API and the fork's own gate PINNED that text, so the gate was green on
+guidance that would ReferenceError in a live turn — notice rewritten (script/barriers/
+patterns), gate flipped, plus a new test that ties every backticked helper the notice
+names to a `globalThis.<name> =` export in the real JS prelude, so the next rename goes
+red in the gate instead of in a turn. `renderUltracodeNotice` gained `evalTools`
+(mirrors upstream's `tool()`/`tools=` gate). Both eval frontends were traced to the pin
+chokepoint: `agent()` (handle job → `runStructuredSubagent` → `runSubprocess`) and
+`workpool()` (pool dispatch → same seam; follow-up turns via `runSubagentFollowUpTurn` →
+`syncChildUltracodeAtResume`); a workpool frontend case now sits beside the agent() one.
+(2) Upstream added a third queue mode, `streamingBehavior: "aside"` (non-interrupting,
+folded in at the next step boundary). Resolution: `#ultracodeDeliveryHook` accepts
+`"aside"` and treats it like a steer (arm-only). One real hole the review panel found and
+this pass closed: a stranded user aside (normalization await outlasting the run it meant
+to join) STARTS a fresh turn via `#resumeStrandedIrcAsides` → `#wakeForIrc`, and an
+arm-only record carries no disarm, so that turn inherited the previous pin — `#wakeForIrc`
+now takes the user off-ramp right before `agent.prompt(records)` when a root's
+user-attributed record starts the wake and no record carries a delivery hook (a keyword
+aside's hook still arms at commit). Tested with the stranded shape (4 aside cases). Fold
+paths (plan mode, post-interrupt) still never fire hooks — by design, no turn starts.
+(3) Fixture tax: `isAdvisorActive` (74bdf4c65c) on the fake AgentSession;
+`asyncJobManager`/`getAgentId`/`getArtifactsDir` on the fake ToolSession, and the eval
+bridge tests now settle the registered job before asserting. (4) Tooling: upstream moved
+from biome to oxlint+oxfmt (`bun run check:tools`); format touched files with
+`node_modules/.bin/oxfmt <files>`, never biome (it reflows at 80 cols). (5) Gate
+infrastructure: the checkout's tests load the gitignored
+`packages/natives/native/pi_natives.darwin-arm64.node`, which went stale silently when
+upstream's native API changed (`vcsDiscover` missing → 11 red plan-review tests unrelated
+to the fork); `ultracode-update.sh` now syncs that prebuilt from
+`@oh-my-pi/pi-natives-darwin-arm64@<repo version>` before every gate (stamped in
+`~/.omp/.ultracode-natives-<tag>`). Rebase conflicts: the known doc-churn spots (rerere),
+plus `workflow.ts`/`workflow-notice.md` (upstream's `evalTools`/`embedded` params vs the
+fork's earlier embed hook — upstream's shape kept, files byte-identical to upstream after
+the fork commit that had introduced the hook), and `#queueUserMessage`/`sendUserMessage`
+for the aside branch. Quiet: model-controls.ts (0 commits), turn-recovery.ts (reads
+only), persisted-revive.ts, session-advisors.ts, every runtime `setThinkingLevel` still
+`"extension"`-tagged, new `/switch`/`/model <sel>` surfaces take the user off-ramp.
+Outside the contract, noted not fixed: `completion()` and the `read ?q=` image question
+run at their own fixed effort (not subagents; the notice says so for `completion()`).
+
 **Upstream watch refresh (verified 2026-09-02, tags v18.0.11→v18.1.3, during the
 v18.1.3 rebase).** Quiet seams again: keyword subsystem, executor floor,
 `createSubagentSettings` snapshot loop, `ASIDE_MESSAGE_COMMIT`, settings-schema

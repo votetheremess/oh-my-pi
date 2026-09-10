@@ -8,6 +8,7 @@ import {
 	ULTRACODE_NOTICE,
 } from "@oh-my-pi/pi-coding-agent/modes/ultracode";
 import { WORKFLOW_NOTICE } from "@oh-my-pi/pi-coding-agent/modes/workflow";
+import javascriptPrelude from "../../src/eval/js/shared/prelude.txt" with { type: "text" };
 
 beforeAll(() => {
 	// highlightUltracode/highlightOrchestrate read the global theme's color mode.
@@ -129,40 +130,60 @@ describe("ultracode orchestration contract", () => {
 	const withoutTooling = renderUltracodeNotice({ workflowAvailable: false });
 
 	it("carries the executable helper API, not a pointer to it", () => {
-		for (const helper of ["agent(", "parallel(", "pipeline(", "phase(", "log(", "budget.total"]) {
+		for (const helper of ["workpool(", "agent(", "wait(", "phase(", "log(", "budget.total"]) {
 			expect(withTooling).toContain(helper);
 		}
 		// Worked scripts, not a list of names: the model has to see the shape.
-		expect(withTooling).toContain("await parallel(");
+		expect(withTooling).toContain("await workpool(");
+		expect(withTooling).toContain("await wait(");
 		expect(withTooling).toContain("```js");
 	});
 
-	it("describes both helpers as barriers, because both are", () => {
-		// Guards against the notice claiming pipeline() streams items
-		// independently. In THIS runtime pipeline() runs one bounded pool per
-		// stage (src/eval/js/shared/prelude.txt), and prelude.py says so outright:
-		// "Every item clears stage N before any item enters stage N+1". Telling the
-		// model to reach for pipeline() to AVOID a barrier buys the barrier.
-		expect(withTooling).toContain("BARRIER PER STAGE");
-		expect(withTooling).not.toContain("DEFAULT TO pipeline()");
-		expect(withTooling).not.toContain("NO barrier between stages");
+	it("names only helpers the JS kernel actually exports", () => {
+		// v18.1.16 (05bb0c1989) replaced parallel()/pipeline() with handles and
+		// workpool(). A notice teaching a helper the prelude no longer installs
+		// sends the model into a ReferenceError; tie every backticked call the
+		// notice makes to a `globalThis.<name> =` export in the real prelude, so
+		// the next rename goes red here instead of in a live turn.
+		const exported = new Set([...javascriptPrelude.matchAll(/globalThis\.(\w+) = /g)].map(m => m[1]));
+		const named = new Set([...withTooling.matchAll(/`(\w+)\(/g)].map(m => m[1]));
+		for (const name of ["workpool", "agent", "wait", "completion", "phase", "log"]) {
+			expect(named.has(name)).toBe(true);
+		}
+		for (const name of named) {
+			expect(exported.has(name)).toBe(true);
+		}
+		expect(withTooling).not.toContain("parallel(");
+		expect(withTooling).not.toContain("pipeline(");
+	});
+
+	it("describes the pool as barrier-free and wait() as the only barrier, because that is the runtime", () => {
+		// A pool delivers each batch as it settles (workpool.ts: per-batch jobs,
+		// results auto-deliver); wait() blocks until every listed handle settles
+		// (prelude.txt `wait`). Telling the model to stage a pool to AVOID a
+		// barrier, or that wait() streams, misdescribes both.
+		expect(withTooling).toContain("A pool has NO barrier");
+		expect(withTooling).toContain("`wait()` IS a barrier");
+		expect(withTooling).not.toContain("BARRIER PER STAGE");
 		// The shape that does give independent per-item progress.
-		expect(withTooling).toContain("put the WHOLE per-item chain in one thunk");
+		expect(withTooling).toContain("put the WHOLE per-item chain in one pool item");
 	});
 
 	it("tells the truth about failure propagation, which decides whether a fan-out survives", () => {
-		// agent() throws a ToolError on every failure path (src/eval/agent-bridge.ts)
-		// and parallel() re-raises the lowest-index error, discarding every result
-		// that succeeded (prelude.txt __pool). A notice promising null returns plus
+		// A failed handle makes .wait() throw (prelude.txt resolveHandleSnapshot),
+		// and wait() with the default raiseErrors re-throws the first failure and
+		// discards the rest of the results array; only raiseErrors:false keeps an
+		// Error in the failed slot. A notice promising null returns plus
 		// `.filter(Boolean)` would describe a defence that can never fire.
-		expect(withTooling).toContain("it never returns null");
-		expect(withTooling).toContain("discards the entire results array");
-		expect(withTooling).toContain("put the try/catch INSIDE each risky thunk");
+		expect(withTooling).toContain("it never resolves null");
+		expect(withTooling).toContain("every sibling result is discarded with it");
+		expect(withTooling).toContain("`raiseErrors: false`");
+		expect(withTooling).toContain("raise_errors");
 		// The budget throw is gated on `turnBudget?.hard` (agent-bridge.ts): only a
 		// `+Nk!`/Goal-Mode ceiling refuses the spawn. Claiming ANY exhausted
 		// budget throws would invite the model to skip its own
 		// budget.remaining() gate under a soft +Nk that enforces nothing.
-		expect(withTooling).toContain("hits a hard (`+Nk!`/Goal Mode) budget ceiling THROWS");
+		expect(withTooling).toContain("only under a hard (`+Nk!`/Goal Mode) budget ceiling");
 		expect(withTooling).not.toContain("exhausts the turn budget");
 	});
 
@@ -225,7 +246,7 @@ describe("ultracode orchestration contract", () => {
 	});
 
 	it("prescribes no fan-out API when the tools to run it are inactive", () => {
-		for (const helper of ["agent(", "parallel(", "pipeline(", "phase("]) {
+		for (const helper of ["agent(", "workpool(", "wait(", "phase("]) {
 			expect(withoutTooling).not.toContain(helper);
 		}
 		// Silence would read as "orchestrate anyway"; the notice must say why not.
@@ -265,15 +286,33 @@ describe("ultracode notice renders live session facts", () => {
 	});
 
 	it("states the live concurrency cap instead of a hardcoded default", () => {
+		// The cap is the pool's worker ceiling (workpool.ts limit() reads the
+		// live task.maxConcurrency); handles are unbounded, and the notice must
+		// say which is which or the model fans out through the wrong one.
 		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 8 })).toContain(
-			"at most 8 thunks at once",
+			"at most 8 workers at once",
 		);
 		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 32 })).toContain(
-			"at most 32 thunks at once",
+			"at most 32 workers at once",
+		);
+		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 8 })).toContain(
+			"Handles are NOT bounded",
 		);
 		// 0 is "unlimited" for task.maxConcurrency, so any stated cap would be a
 		// lie — and the system prompt in the same context window omits it too.
 		expect(renderUltracodeNotice({ workflowAvailable: true, maxConcurrency: 0 })).not.toContain("at most");
+	});
+
+	it("names tool()/tools= only when eval-defined tools are enabled", () => {
+		// eval.tools.enabled off: the kernel rejects `tools=`, so naming it hands
+		// the model an option that throws. Mirrors upstream's workflowz gate.
+		const withTools = renderUltracodeNotice({ workflowAvailable: true, evalTools: true });
+		const withoutTools = renderUltracodeNotice({ workflowAvailable: true, evalTools: false });
+		expect(withTools).toContain("`tool(fn,");
+		expect(withTools).toContain(", tools}");
+		expect(withoutTools).not.toContain("`tool(");
+		expect(withoutTools).not.toContain("tools}");
+		expect(withoutTools).not.toContain("tools=");
 	});
 
 	it("states the pin as exactly xhigh, never a clamp, when the harness applied it", () => {

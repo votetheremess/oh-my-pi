@@ -18,7 +18,7 @@
  * `UltracodeEffortError`. See the "refuses" cases and the AgentSession wiring
  * block for the user-visible half.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -721,7 +721,8 @@ describe("AgentSession ultracode turn wiring", () => {
 		});
 		const notices: CreatedSession["notices"] = [];
 		created.subscribe(event => {
-			if (event.type === "notice") notices.push({ level: event.level, message: event.message, source: event.source });
+			if (event.type === "notice")
+				notices.push({ level: event.level, message: event.message, source: event.source });
 		});
 		return { session: created, settings, notices };
 	}
@@ -1051,6 +1052,111 @@ describe("AgentSession ultracode turn wiring", () => {
 
 		expect(created.settings.get("ultracode")).toBe(false);
 		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	// --- asides: a non-interrupting join, arm-only, unless it strands into a fresh turn ---
+
+	/**
+	 * Un-forces streaming and drives the stranded-aside resume the way a mode
+	 * teardown does once the session is idle; resolves with the records the
+	 * fire-and-forget wake handed to agent.prompt, awaiting that call itself.
+	 */
+	async function resumeStranded(
+		target: AgentSession,
+		promptSpy: Mock<AgentSession["agent"]["prompt"]>,
+	): Promise<AgentMessage[]> {
+		const woke = Promise.withResolvers<AgentMessage[]>();
+		promptSpy.mockImplementation(async (records: unknown) => {
+			woke.resolve(records as AgentMessage[]);
+		});
+		Object.defineProperty(target, "isStreaming", { configurable: true, get: () => false });
+		await target.runModeExitTeardown(async () => {});
+		return woke.promise;
+	}
+
+	it("an aside joining a running turn is arm-only: keyword arms at delivery, keyword-free attaches nothing", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+		forceStreaming(session);
+
+		// v18.1.16's third queue mode: folded in at the next step boundary rather
+		// than interrupting, so like a steer it must never yank the pin out from
+		// under the turn it joins.
+		await session.prompt("also mind the tests", { streamingBehavior: "aside" });
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+
+		await session.prompt("ultracode the rest of this turn", { streamingBehavior: "aside" });
+		expect(created.settings.get("ultracode")).toBe(false);
+		// Deliver both asides exactly as the loop's aside poll does: the wake path
+		// hands the stranded records to agent.prompt, whose commit fires the hooks.
+		const records = await resumeStranded(session, promptSpy);
+		const [plain, keyword] = records.filter(m => m.role === "user");
+		expect(queuedHook(plain)).toBeUndefined();
+		deliverQueued(keyword);
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("a keyword-free user aside that strands into a fresh turn ends ultracode like any turn-starting message", async () => {
+		// The aside's normalization await can outlast the run it meant to join;
+		// #resumeStrandedIrcAsides then STARTS a turn from it. An arm-only aside
+		// carries no disarm hook, so without the wake-time off-ramp that fresh
+		// turn would silently inherit the previous turn's xhigh pin.
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+		await session.prompt("please ultracode this refactor");
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		forceStreaming(session);
+		await session.prompt("now the keyword-free next step", { streamingBehavior: "aside" });
+		// Still joined to the (forced) running turn: nothing flips at enqueue.
+		expect(created.settings.get("ultracode")).toBe(true);
+
+		await resumeStranded(session, promptSpy);
+		expect(created.settings.get("ultracode")).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("a stranded aside carrying the keyword keeps its arm: the wake off-ramp defers to the hook", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+		await session.prompt("please ultracode this refactor");
+		expect(created.settings.get("ultracode")).toBe(true);
+
+		forceStreaming(session);
+		await session.prompt("ultracode the follow-on too", { streamingBehavior: "aside" });
+		const records = await resumeStranded(session, promptSpy);
+
+		// No disarm churn ahead of the arm: the flag never dropped, and the
+		// record's own hook re-pins at commit.
+		expect(created.settings.get("ultracode")).toBe(true);
+		deliverQueued(records.find(m => m.role === "user"));
+		expect(created.settings.get("ultracode")).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("a child never takes the stranded-aside off-ramp", async () => {
+		const created = await createSession({ agentKind: "sub", ultracode: true, thinkingLevel: Effort.XHigh });
+		session = created.session;
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+
+		forceStreaming(session);
+		await session.prompt("keyword-free child aside", { streamingBehavior: "aside" });
+		await resumeStranded(session, promptSpy);
+
+		// The parent's flag is the parent's to end; the child's turn inherits it.
+		expect(created.settings.get("ultracode")).toBe(true);
 	});
 
 	// --- fail-loud: a model with no xhigh rung ----------------------------------
@@ -1623,7 +1729,11 @@ describe("AgentSession ultracode turn wiring", () => {
 	it("refuses to flag a child whose effort ceiling caps the pin below xhigh, and says so", async () => {
 		// The rung exists; the ceiling is what refuses. The message has to name
 		// the ceiling, or the operator goes looking for a missing tier.
-		const created = await createSession({ agentKind: "sub", thinkingLevel: Effort.Low, thinkingLevelCeiling: Effort.High });
+		const created = await createSession({
+			agentKind: "sub",
+			thinkingLevel: Effort.Low,
+			thinkingLevelCeiling: Effort.High,
+		});
 		session = created.session;
 		expect(session.ultracodePinRefusal()).toBe("ceiling");
 		const { registry, childId } = registryWith(Settings.isolated({ ultracode: true }), session);
