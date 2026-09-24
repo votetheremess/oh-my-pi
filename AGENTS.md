@@ -575,7 +575,9 @@ settings-schema, the notice loop in agent-session (`#createMagicKeywordNotices`)
 hidden-companion set in queued-messages and the pi-tui gradients all derive from, and
 added a fifth keyword (`jevify`). The fork's old highlight-chainer, `containsUltracode`
 / `highlightUltracode`, `WORKFLOW_NOTICE` and the hand-coded `#ultracodeNoticeFacts`
-are gone; ultracode is now one `rootOnly` row (`requires: ["task", "eval"]`) whose
+are gone; ultracode is now one `rootOnly` row (`requires: []`: the notice always ships,
+and its template carries its own reduced "work solo" branch when `task`/`eval` are not
+both enabled) whose
 `notice(context)` renders from the shared `MagicKeywordContext` (extended in the fork
 with `effortApplied`/`effortPinned`/`maxConcurrency`/`waitTool`). Rebase mechanics:
 the 29-commit history could not be replayed (26 conflicted files, the seams all moved),
