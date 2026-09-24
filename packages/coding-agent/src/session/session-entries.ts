@@ -7,6 +7,7 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { CompactionMethod } from "./compaction-methods";
 
@@ -259,6 +260,15 @@ export interface SessionInitEntry extends SessionEntryBase {
 	advisor?: string;
 	/** True when the subagent ran inside an isolation worktree: never revivable, transcript-only after park. Absent on older files. */
 	isolated?: boolean;
+	/** True when the subagent was spawned inside an ultracode turn; a cold revive re-pins xhigh from it when the parent's live settings are unavailable. */
+	ultracode?: boolean;
+	/**
+	 * The thinking level the child would have run at WITHOUT ultracode (only
+	 * written next to `ultracode`). A cold revive seeds the child's hand-back
+	 * from it so a later disarm restores this level instead of leaving the
+	 * borrowed xhigh behind as if the user had chosen it.
+	 */
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

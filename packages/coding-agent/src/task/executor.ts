@@ -9,6 +9,7 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import type { Rule } from "../capability/rule";
@@ -48,7 +49,7 @@ import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
-import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
+import { AgentLifecycleManager, type AgentReviver, syncChildUltracodeAtResume } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
@@ -64,6 +65,8 @@ import {
 	prewalkWouldBeNoop,
 	resolveTaskEffortLevel,
 	type TaskEffort,
+	UltracodeEffortError,
+	ultracodeEffortFor,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
@@ -977,15 +980,43 @@ function inheritedSubagentServiceTiers(
 		: (inheritedServiceTier ?? {});
 }
 
+/**
+ * Every schema key of `baseSettings`, read by value. The single source for
+ * both isolation flavours below, so a key resolved through the parent's
+ * runtime overrides (e.g. an armed `ultracode`) lands identically in each.
+ */
+function snapshotSettings(baseSettings: Settings): Partial<Record<SettingPath, unknown>> {
+	const snapshot: Partial<Record<SettingPath, unknown>> = {};
+	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+		snapshot[key] = baseSettings.get(key);
+	}
+	return snapshot;
+}
+
+/**
+ * A frozen-at-call copy of `settings` as an isolated runtime override layer:
+ * later parent-side flips (ultracode arm/disarm, model-role edits) do not
+ * reach it, and its own `override()`s never leak back. Carries NONE of the
+ * subagent policy stamps — no yolo approval, no advisor-off, no tier rewrite —
+ * so surfaces that need "the parent's settings, detached" (an interactive
+ * hub or /tan session the user still drives) start from the parent's exact
+ * policy rather than a headless subagent's.
+ */
+export function createIsolatedSettings(settings: Settings): Settings {
+	return Settings.isolated(snapshotSettings(settings), { storage: settings.getStorage() });
+}
+
+/**
+ * {@link createIsolatedSettings} plus the headless-subagent policy stamps
+ * (approval yolo, advisor off, `tier.subagent` resolution) and caller
+ * overrides, all applied in one override layer.
+ */
 export function createSubagentSettings(
 	baseSettings: Settings,
 	overrides?: Partial<Record<SettingPath, unknown>>,
 	inheritedServiceTier?: ServiceTierByFamily | null,
 ): Settings {
-	const snapshot: Partial<Record<SettingPath, unknown>> = {};
-	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
-		snapshot[key] = baseSettings.get(key);
-	}
+	const snapshot = snapshotSettings(baseSettings);
 	// Resolve the subagent's per-family tiers from `tier.subagent` ("inherit" =
 	// match the parent's live tiers when a live session supplied them, else the
 	// subagent's own configured tier.* settings). The result is stamped back onto
@@ -3211,6 +3242,10 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	resetYieldTurnState(session.getToolByName("yield"));
 	const ref = AgentRegistry.global().get(id);
 	const sessionFile = ref?.sessionFile ?? undefined;
+	// A live (not revived) child still carries its spawn-time ultracode
+	// snapshot; the follow-up runs inside the PARENT's current turn, so mirror
+	// the parent's live flag and re-pin (or fail loudly) before prompting.
+	syncChildUltracodeAtResume(id, session, AgentRegistry.global());
 
 	const monitor = createSubagentRunMonitor({
 		index,
@@ -3636,11 +3671,38 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// through to the normal selectors below.
 			// The ceiling outlives initial resolution: it rides into the session so
 			// retry-fallback recovery can never clamp effort back up past it.
-			const spawnEffortCeiling = options.effort !== undefined ? settings.get("task.maxEffort") : undefined;
+			// Ultracode pins every spawn to EXACTLY xhigh while it is active — never
+			// max, never below — deliberately overriding the agent definition's own
+			// pinned effort (scout's `medium`, task's `auto`), any explicit `:level`
+			// suffix, and the caller's `effort`. `ultracodeEffortFor` is the same
+			// helper the session-side pin in `ModelControls.beginUltracodeTurn`
+			// uses, so a subagent and its parent resolve the pin identically.
+			//
+			// A model with no xhigh rung (max-only, topping out at high, or no
+			// controllable effort surface) cannot satisfy ultracode. Silently
+			// clamping it to the nearest rung would spend the user's pinned budget
+			// at a level they did not ask for, so the spawn fails loudly instead —
+			// BEFORE any session or subprocess exists — and the task tool / eval
+			// `agent()` reports the ladder the model actually exposes.
+			//
+			// Under ultracode the ceiling is ALWAYS the pin (not only when the
+			// caller passed `effort`): retry-fallback recovery inside the child
+			// re-clamps against this ceiling, so pinning it means the child can
+			// neither climb above xhigh nor drop below it after a model swap.
+			// `task.maxEffort` is ignored for the ride, since a ceiling below the pin
+			// would drag the pin down. Non-ultracode spawns keep their exact
+			// previous ceiling behaviour.
+			const ultracodeEffortLevel = settings.get("ultracode") ? ultracodeEffortFor(model) : undefined;
+			if (settings.get("ultracode") && model && ultracodeEffortLevel === undefined) {
+				throw new UltracodeEffortError(formatModelStringWithRouting(model), getSupportedEfforts(model));
+			}
+			const spawnEffortCeiling =
+				ultracodeEffortLevel ?? (options.effort !== undefined ? settings.get("task.maxEffort") : undefined);
 			const effortLevel =
-				options.effort !== undefined
+				ultracodeEffortLevel ??
+				(options.effort !== undefined
 					? resolveTaskEffortLevel(model, options.effort, spawnEffortCeiling)
-					: undefined;
+					: undefined);
 			if (model) {
 				const displayLevel = effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : undefined);
 				progress.resolvedModelIdentity = formatModelStringWithRouting(model);
@@ -3650,11 +3712,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						? formatModelSelectorValue(progress.resolvedModelIdentity, displayLevel)
 						: progress.resolvedModelIdentity;
 			}
-			// Precedence: caller `effort` > explicit `:level` suffix on the resolved
-			// model pattern > agent-definition default (e.g. task's `auto`) >
-			// pattern-derived level.
-			const effectiveThinkingLevel =
-				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
+			// Precedence: ultracode floor > caller `effort` > explicit `:level` suffix
+			// on the resolved model pattern > agent-definition default (e.g. task's
+			// `auto`) > pattern-derived level.
+			//
+			// `configuredThinkingLevel` is what the child would run at with NO
+			// ultracode (the caller's `effort` is a per-spawn hint the pin also
+			// overrides, so it sits above it). Under ultracode it rides into the
+			// child as `ultracodeRestoreLevel`: the pin is borrowed, and a disarm
+			// (parent's turn ended, follow-up without the keyword) hands the child
+			// back to this level instead of leaving xhigh behind as its own choice.
+			const configuredThinkingLevel = explicitThinkingLevel
+				? resolvedThinkingLevel
+				: (thinkingLevel ?? resolvedThinkingLevel);
+			const effectiveThinkingLevel = effortLevel ?? configuredThinkingLevel;
+			const ultracodeRestoreLevel = ultracodeEffortLevel !== undefined ? configuredThinkingLevel : undefined;
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManagerPromise = sessionFile
@@ -3673,12 +3745,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// session-level --prewalk. The bundled generic `task` agent has no
 			// frontmatter default; the `task.prewalk` toggle (default off) arms it.
 			// Resolution failures skip prewalk instead of failing the spawn.
+			// Under ultracode the whole hand-off is suppressed: prewalk exists to
+			// cheapen the run at the first edit/write, which is exactly what the pin
+			// forbids — a mid-run switch to a fast/cheap target (with its own lower
+			// thinking level) would step out from under xhigh.
 			let prewalk: Prewalk | undefined;
 			const prewalkPattern = resolveAgentPrewalkPattern({
 				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
 				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
 			});
-			if (prewalkPattern) {
+			if (prewalkPattern && ultracodeEffortLevel !== undefined) {
+				logger.debug("ultracode pin suppresses prewalk for this spawn", {
+					agent: agent.name,
+					pattern: prewalkPattern,
+				});
+			} else if (prewalkPattern) {
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
 				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
 				const target = resolvedPrewalk.model;
@@ -3777,6 +3858,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
 				thinkingLevel: effectiveThinkingLevel,
 				thinkingLevelCeiling: spawnEffortCeiling,
+				ultracodeRestoreLevel,
 				// A revived session restores the tier history it persisted (including
 				// tiers a provider rejected or an extension changed since spawn); only
 				// the fresh spawn resolves the per-agent override.
@@ -4019,6 +4101,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// stamp the contract so cold revival leaves them transcript-only
 				// even when the workspace was retained for recovery.
 				isolated: worktree !== undefined || undefined,
+				// Persisted (only when armed) so a cold revive — new process, parent's
+				// live settings gone — can still tell the child was spawned inside an
+				// ultracode turn and re-pin it. The restore level rides along so that
+				// revive can rebuild the hand-back the live spawn had.
+				ultracode: settings.get("ultracode") || undefined,
+				ultracodeRestoreLevel,
 			});
 
 			abortSignal.addEventListener(
@@ -4067,9 +4155,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						setActiveTools: (toolNames: string[]) =>
 							session.setActiveToolsByName(toolNames.filter(name => !isParentOwnedTool(name))),
 						getCommands: () => getSessionSlashCommands(session),
+						// `runExtensionSetModel` tags the swap "extension" so an armed turn
+						// re-pins on the new model instead of taking the user off-ramp.
 						setModel: model => runExtensionSetModel(session, model),
 						getThinkingLevel: () => session.thinkingLevel,
-						setThinkingLevel: level => session.setThinkingLevel(level),
+						// Extensions are never a user surface: their level changes must not
+						// run the user-only ultracode off-ramp (forget restore + flag false).
+						// Always non-persistent: a runtime nudge never rewrites user settings.
+						setThinkingLevel: level => session.setThinkingLevel(level, false, "extension"),
 						getServiceTiers: () => session.serviceTierByFamily,
 						setServiceTier: (family, tier) => session.setServiceTierFamily(family, tier),
 						getSessionName: () => session.sessionManager.getSessionName(),

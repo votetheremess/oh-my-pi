@@ -8,7 +8,7 @@ Settings are stored as plain YAML mappings. Every key, its type, default, and en
 - For custom model definitions in `models.yml`, see [Models](./models.md).
 - For instruction files discovered into the agent context (`AGENTS.md`, `.omp/`, etc.), see [Context files](./context-files.md).
 - For the full catalog of environment variables, see [Environment variables](./environment-variables.md).
-- For prompt words that activate specialized per-turn behavior, see [Magic keywords](./magic-keywords.md).
+- For prompt words that activate specialized per-turn behavior (`ultrathink`, `orchestrate`, `workflowz`, `jevify`, `ultracode`), see [Magic keywords](./magic-keywords.md).
 
 ## Where settings live
 
@@ -458,6 +458,8 @@ thinkingBudgets:
 | `thinkingBudgets.max`             | number  | `32768` | Token budget for `max`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `providers.autoThinkingMaxEffort` | enum    | `xhigh` | Highest effort `defaultThinkingLevel: auto` may resolve. `xhigh` keeps the classifier one tier below the top, so only `ultrathink` reaches `max`; `max` lets the classifier bill the top tier on models that expose it. The local on-device classifier stays capped at `xhigh` either way. This governs what `auto` _resolves_: a model whose ladder offers nothing under the ceiling gets no auto level at all, and one whose metadata requires explicit effort still receives its lowest supported effort from the transport — on a `["max"]` ladder that is `max`, because the model accepts nothing else. |
 
+A turn that carries [`ultracode`](./magic-keywords.md) overrides this row: that turn is pinned at exactly `xhigh` (a model without that rung is left alone and told so, never clamped to a neighbour), the difficulty classifier is bypassed, and a same-turn `ultrathink` no longer reaches `max`. The borrowed level is handed back on the next user turn that does not carry the word.
+
 ### Sampling
 
 A value of `-1` means "use the provider/model default" — `omp` does not send that parameter.
@@ -853,7 +855,7 @@ Every schema path not individually tabulated in this catalog is explicitly defer
 - Agent behavior and safety: `ask.*`, `eval.*`, `features.*`, `goal.*`, `loop.*`, `model.loopGuard.*`, `model.toolCallLoopGuard.*`, `prewalk.*`, `recap.*`, `tools.*`, and `vault.*`.
 - Execution and content: `commit.*`, `completion.*`, `edit.*`, `error.*`, `extensionHandlers.*`, `generate_image.*`, `git.*`, `images.*`, `live.*`, `paste.*`, `power.*`, `read.*`, `shellMinimizer.*`, `speech.*`, `terminal.*`, and `title.*`.
 - Interface and startup: `display.*`, `statusLine.*`, `startup.*`, `stt.*`, `tui.*`, and `ttsr.*`.
-- Ungrouped keys: `setupVersion`, `proseOnlyThinking`, `omitThinking`, `externalThinking`, `includeWorkspaceTree`, `autocompleteMaxVisible`, `emojiAutocomplete`, `disabledExtensions`, `inlineToolDescriptors`, and `treeFilterMode`.
+- Ungrouped keys: `setupVersion`, `proseOnlyThinking`, `omitThinking`, `externalThinking`, `includeWorkspaceTree`, `autocompleteMaxVisible`, `emojiAutocomplete`, `disabledExtensions`, `inlineToolDescriptors`, `treeFilterMode`, and the turn flag `ultracode` (set at runtime by the [ultracode keyword](./magic-keywords.md) for the turn that carries it, never persisted by it, and written back to `false` by the next user turn without the word).
 
 These settings follow the same schema-defined type and default rules shown above.
 

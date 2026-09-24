@@ -59,6 +59,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isRecord, logger, Snowflake, stringifyJson } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -73,7 +74,7 @@ import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendOperationContext } from "../memory-backend/types";
 import { computeNonMessageTokens, type NonMessageTokenSource } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { type ConfiguredThinkingLevel, UltracodeEffortError, ultracodeEffortFor } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
 import { findCompactMode } from "./compact-modes";
@@ -3171,6 +3172,18 @@ export class SessionMaintenance {
 		if (contextWindow <= 0) return false;
 		const targetModel = await this.resolveContextPromotionTarget(currentModel, contextWindow);
 		if (!targetModel) return false;
+		// An armed ultracode turn pins exactly xhigh, and the swap below only
+		// re-pins when the incoming model has the rung: a target without it would
+		// leave the turn running under the ultracode name at some other effort.
+		// Keep the current model and let the overflow fall through to compaction.
+		if (this.#host.settings.get("ultracode") && ultracodeEffortFor(targetModel) === undefined) {
+			const reason = new UltracodeEffortError(
+				`${targetModel.provider}/${targetModel.id}`,
+				getSupportedEfforts(targetModel),
+			);
+			this.#host.emitNotice("warning", `Context promotion skipped: ${reason.message}`, "compaction");
+			return false;
+		}
 
 		try {
 			await this.#host.setModelTemporary(targetModel, undefined, { ephemeral: true });

@@ -1,6 +1,7 @@
 import type { Agent, AgentMessage, AgentToolResult, AgentTurnEndContext } from "@oh-my-pi/pi-agent-core";
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -12,7 +13,12 @@ import planYoloHandoffPrompt from "../prompts/system/plan-yolo-handoff.md" with 
 import prewalkChecklistPrompt from "../prompts/system/prewalk-checklist.md" with { type: "text" };
 import prewalkContinuePrompt from "../prompts/system/prewalk-continue.md" with { type: "text" };
 import prewalkPlanPrompt from "../prompts/system/prewalk-plan.md" with { type: "text" };
-import { type ConfiguredThinkingLevel, prewalkWouldBeNoop } from "@oh-my-pi/pi-tui/thinking";
+import {
+	type ConfiguredThinkingLevel,
+	prewalkWouldBeNoop,
+	UltracodeEffortError,
+	ultracodeEffortFor,
+} from "@oh-my-pi/pi-tui/thinking";
 import { isMCPToolName } from "../tools/builtin-names";
 import {
 	replaceTabs,
@@ -68,6 +74,12 @@ export interface PrewalkCoordinatorHost {
 	settings: Pick<Settings, "get">;
 	model(): Model | undefined;
 	configuredThinkingLevel(): ConfiguredThinkingLevel | undefined;
+	/**
+	 * Whether an ultracode turn is armed on the session (the runtime `ultracode`
+	 * flag). Optional so upstream's own host fixtures (test/plan-autosave.test.ts
+	 * builds a bare literal) keep compiling without fork edits; absent = never armed.
+	 */
+	ultracodeArmed?(): boolean;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	setModelTemporary(
 		model: Model,
@@ -149,6 +161,18 @@ export class PrewalkCoordinator {
 		);
 	}
 
+	/**
+	 * Why an armed ultracode turn refuses a hand-off onto `target`, or
+	 * `undefined` when the switch may proceed. Ultracode pins exactly xhigh
+	 * and the internal swap only re-pins when the incoming model has the rung;
+	 * a target without it would carry the turn on at some other effort under
+	 * the ultracode name, so the hand-off is refused loudly instead.
+	 */
+	#ultracodeRefusal(target: Model): UltracodeEffortError | undefined {
+		if (!this.#host.ultracodeArmed?.() || ultracodeEffortFor(target) !== undefined) return undefined;
+		return new UltracodeEffortError(`${target.provider}/${target.id}`, getSupportedEfforts(target));
+	}
+
 	/** Advances the one-way prewalk switch at a completed assistant-turn boundary. */
 	async advanceAtTurnEnd(liveMessages: AgentMessage[], context: AgentTurnEndContext | undefined): Promise<void> {
 		const prewalk = this.#prewalk;
@@ -204,6 +228,14 @@ export class PrewalkCoordinator {
 		const target = prewalk.target;
 		if (this.#isNoop(prewalk)) {
 			this.#disarmNoop(prewalk);
+			return;
+		}
+		// The prewalk's one-way moment is this edit; a refused hand-off cancels
+		// it rather than re-trying (and re-warning) at every later edit.
+		const refusal = this.#ultracodeRefusal(target);
+		if (refusal) {
+			this.#clearPrewalkState();
+			this.#host.emitNotice("warning", `Prewalk cancelled: ${refusal.message}`, "prewalk");
 			return;
 		}
 		await this.#host.setModelTemporary(target, prewalk.thinkingLevel, { ephemeral: true });
@@ -399,12 +431,25 @@ export class PrewalkCoordinator {
 		this.#host.setPlanProposalHandler(null);
 		this.#planYolo = undefined;
 		this.#planYoloPreviousNonMCPPresentation = undefined;
-		await this.#host.setModelTemporary(planYolo.target, planYolo.thinkingLevel, { ephemeral: true });
-		this.#host.emitNotice(
-			"info",
-			`Plan-yolo: plan approved, switched to ${planYolo.target.provider}/${planYolo.target.id} to implement "${resolvedTitle}".`,
-			"plan-yolo",
-		);
+		// The approval stands either way; only the model hand-off is subject to
+		// the ultracode admit-check. Implementation continues on the plan model
+		// (which IS pinned) when the target cannot take the pin.
+		const refusal = this.#ultracodeRefusal(planYolo.target);
+		const implementingModel = refusal ? this.#host.model() : planYolo.target;
+		if (refusal) {
+			this.#host.emitNotice(
+				"warning",
+				`Plan-yolo: plan approved, model switch skipped: ${refusal.message}`,
+				"plan-yolo",
+			);
+		} else {
+			await this.#host.setModelTemporary(planYolo.target, planYolo.thinkingLevel, { ephemeral: true });
+			this.#host.emitNotice(
+				"info",
+				`Plan-yolo: plan approved, switched to ${planYolo.target.provider}/${planYolo.target.id} to implement "${resolvedTitle}".`,
+				"plan-yolo",
+			);
+		}
 		this.#host.agent.steer({
 			role: "custom",
 			customType: PLAN_YOLO_HANDOFF_MESSAGE_TYPE,
@@ -414,7 +459,12 @@ export class PrewalkCoordinator {
 			timestamp: Date.now(),
 		});
 		return {
-			content: [{ type: "text", text: `Plan approved. Implementing now with ${planYolo.target.id}.` }],
+			content: [
+				{
+					type: "text",
+					text: `Plan approved. Implementing now with ${implementingModel?.id ?? planYolo.target.id}.`,
+				},
+			],
 			details: { planFilePath, title: resolvedTitle, planExists: true },
 		};
 	}

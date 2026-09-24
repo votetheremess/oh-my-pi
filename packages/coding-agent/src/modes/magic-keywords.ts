@@ -3,6 +3,7 @@ import jevifyNotice from "../prompts/system/jevify-notice.md" with { type: "text
 import orchestrateNotice from "../prompts/system/orchestrate-notice.md" with { type: "text" };
 import ultrathinkNotice from "../prompts/system/ultrathink-notice.md" with { type: "text" };
 import workflowNotice from "../prompts/system/workflow-notice.md" with { type: "text" };
+import { renderUltracodeNoticeFor } from "./ultracode";
 
 /**
  * Magic keywords: standalone lowercase prose words in a user prompt that
@@ -12,7 +13,10 @@ import workflowNotice from "../prompts/system/workflow-notice.md" with { type: "
  * from it: the `magicKeywords.<id>` settings (settings-schema), the notice
  * injection and `<id>-notice` message types (agent-session, queued-messages),
  * and the editor/bubble gradients (`setMagicKeywords` in pi-tui). Adding a
- * keyword means one row here plus its notice template under `prompts/system/`.
+ * keyword means one row here plus its notice template under `prompts/system/`;
+ * `rootOnly` rows additionally skip task-spawned child sessions and
+ * agent-attributed prompts (a subagent's task text), where the turn state
+ * they describe is never set.
  */
 
 /** Session facts a keyword notice may render against. */
@@ -25,6 +29,14 @@ export interface MagicKeywordContext {
 	scoutAvailable: boolean;
 	/** `eval.tools.enabled`: whether `@tool`-defined kernel tools exist. */
 	evalTools: boolean;
+	/** Whether the xhigh effort pin reaches the wire (false once `externalThinking` routes reasoning through the `think` tool). */
+	effortApplied: boolean;
+	/** Whether this session can pin the turn to exactly xhigh (model exposes the tier, ceiling allows it, not a child). */
+	effortPinned: boolean;
+	/** `task.maxConcurrency`: the live worker cap; 0 means unbounded. */
+	maxConcurrency: number;
+	/** Whether the `wait` tool is enabled, so a notice may tell the model to block on it. */
+	waitTool: boolean;
 }
 
 /** One magic keyword: trigger word, gradient, settings copy, and the notice it injects. */
@@ -41,6 +53,9 @@ export interface MagicKeyword {
 	description: string;
 	/** Tools that must all be enabled for the notice to apply; the notice is skipped otherwise. */
 	requires: readonly string[];
+	/** Skip on task-spawned child sessions and agent-attributed prompts: the
+	 * turn state the notice describes is set only by a root's user-authored turn. */
+	rootOnly?: boolean;
 	/** Render the hidden notice queued ahead of the user message. */
 	notice: (context: MagicKeywordContext) => string;
 }
@@ -103,6 +118,19 @@ export const MAGIC_KEYWORDS = [
 		// The contract is entirely about the eval kernel's `judge()` helper.
 		requires: ["eval"],
 		notice: () => JEVIFY_NOTICE,
+	},
+	{
+		id: "ultracode",
+		word: "ultracode",
+		hue: [280, 400],
+		label: "Ultracode Keyword",
+		description:
+			"Let standalone ultracode run that turn and every subagent it spawns at exactly xhigh effort under the workflow orchestration contract",
+		// The notice always ships: its template carries the effort layer and its own
+		// reduced branch for sessions where `task`/`eval` are not both active.
+		requires: [],
+		rootOnly: true,
+		notice: renderUltracodeNoticeFor,
 	},
 ] as const satisfies readonly MagicKeyword[];
 

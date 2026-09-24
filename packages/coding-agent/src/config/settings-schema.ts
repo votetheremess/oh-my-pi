@@ -2222,6 +2222,16 @@ export const SETTINGS_SCHEMA = {
 	},
 	...MAGIC_KEYWORD_SETTINGS,
 
+	// Turn state, not a preference, and deliberately absent from the settings UI:
+	// the ultracode keyword writes it through the runtime override layer
+	// (Settings.override), which never reaches disk, and the next user turn
+	// without the keyword writes it back to false. It exists so the task executor
+	// can see that this turn's spawns run at the ultracode floor.
+	ultracode: {
+		type: "boolean",
+		default: false,
+	},
+
 	// Notifications
 	"completion.notify": {
 		type: "enum",

@@ -111,6 +111,7 @@ import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
+import planModeApprovedUltracodePrompt from "../prompts/system/plan-mode-approved-ultracode.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
 import { formatCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-renderer";
@@ -379,7 +380,18 @@ function formatHudNoteMarker(count: number): string {
 type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop", "budget"]);
-const PLAN_KEEP_CONTEXT_OPTION_INDEX = 2;
+/**
+ * Execute the approved plan as an ultracode turn.
+ *
+ * Plan approval dispatches a synthetic prompt, and synthetic turns never scan for
+ * magic keywords, so an `ultracode` typed into the PLANNING turn cannot reach the
+ * EXECUTION turn — the phase that actually spawns the subagents. This option is
+ * how the operator carries it across that boundary. It obeys the same
+ * per-keyword settings gate as the typed keyword (`magicKeywords.enabled` +
+ * `magicKeywords.ultracode`): a keyword the operator switched off must not
+ * resurface as a menu entry.
+ */
+const PLAN_EXECUTE_ULTRACODE_LABEL = "Approve and execute with ultracode";
 const PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT = 95;
 const PLAN_SAVE_AND_QUIT_OPTION = "Save and quit";
 const PLAN_SAVE_TITLE_LINE_LIMIT = 6;
@@ -3677,11 +3689,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Capture the pre-plan model so #exitPlanMode can restore it. Only the
 		// entry path records this — a mid-planning role change (below) leaves the
 		// active model on the plan role, so overwriting here would restore the old
-		// plan model instead of the user's real pre-plan model.
+		// plan model instead of the user's real pre-plan model. The level is the
+		// USER's own, never a borrowed ultracode pin: restoring xhigh as "the
+		// configured level" on plan exit would strand the session there.
 		this.#planModePreviousModelState = currentModel
 			? {
 					model: currentModel,
-					thinkingLevel: this.session.configuredThinkingLevel(),
+					thinkingLevel: this.session.userConfiguredThinkingLevel(),
 				}
 			: undefined;
 
@@ -3749,14 +3763,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	/** Apply any deferred model switch after the current stream ends. */
+	/**
+	 * Apply any deferred model switch after the current stream ends. A RESTORE
+	 * (or the plan role landing late), not the user picking a model: `internal`
+	 * keeps an armed ultracode turn's pin and floor across the swap.
+	 */
 	async flushPendingModelSwitch(): Promise<void> {
 		const pending = this.#pendingModelSwitch;
 		this.#pendingModelSwitch = undefined;
 		this.#pendingPlanModelSwitch = false;
 		if (!pending) return;
 		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+			await this.session.setModelTemporary(pending.model, pending.thinkingLevel, undefined, "internal");
 		} catch (error) {
 			this.showWarning(
 				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
@@ -4066,7 +4084,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const planModeModelState = this.session.model
 			? {
 					model: this.session.model,
-					thinkingLevel: this.session.configuredThinkingLevel(),
+					thinkingLevel: this.session.userConfiguredThinkingLevel(),
 				}
 			: undefined;
 		this.session.setPlanModeState(undefined);
@@ -4094,7 +4112,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (
 				planModeModelState &&
 				(!modelsAreEqual(this.session.model, planModeModelState.model) ||
-					this.session.configuredThinkingLevel() !== planModeModelState.thinkingLevel)
+					this.session.userConfiguredThinkingLevel() !== planModeModelState.thinkingLevel)
 			) {
 				try {
 					await this.#restorePlanPreviousModel(planModeModelState);
@@ -4603,6 +4621,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			preserveContext?: boolean;
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
+			/** Run the execution turn as an ultracode turn (see PLAN_EXECUTE_ULTRACODE_LABEL). */
+			executionUltracode?: boolean;
 		},
 	): Promise<boolean> {
 		const previousPresentation = this.#planModePreviousToolPresentation ?? {
@@ -4746,11 +4766,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		// markPlanReferenceSent fires only on the dispatch path so the synthetic
 		// plan-approved prompt is the source of the reference injection.
 		this.session.markPlanReferenceSent();
-		const planModePrompt = prompt.render(planModeApprovedPrompt, {
+		const planModeDirective = prompt.render(planModeApprovedPrompt, {
 			planFilePath: options.planFilePath,
 			planContent,
 			contextPreserved: options.preserveContext === true,
 		});
+		// The ultracode notice rides on the synthetic directive because the
+		// synthetic path does not build keyword notices. `ultracodeArmNotice` is a
+		// pure render: the ARM itself happens below, as late as possible, so the
+		// state never flips for a turn that has not started (see the dispatch
+		// branches). The turn stays synthetic, so nothing disarms it, and the next
+		// keyword-free user turn hands the borrowed effort back.
+		const planModePrompt = options.executionUltracode
+			? prompt.render(planModeApprovedUltracodePrompt, {
+					ultracodeNotice: this.session.ultracodeArmNotice(),
+					planModeDirective,
+				})
+			: planModeDirective;
 		// Close the review overlay only now — after the async title write and plan
 		// prompt are prepared, immediately before the execution turn is queued. The
 		// synthetic prompt below blocks in `session.prompt` for the whole run, so
@@ -4771,19 +4803,47 @@ export class InteractiveMode implements InteractiveModeContext {
 		// execution directive behind it as a synthetic follow-up. If `isStreaming`
 		// flips true between the check and dispatch (the same fire-and-forget race
 		// noted below), catch `AgentBusyError` and fall back to the same queue.
+		//
+		// Ultracode arms at the moment the execution turn actually STARTS, never at
+		// enqueue, and always AFTER #exitPlanMode and any executionModel
+		// application above: #exitPlanMode restores the pre-plan model state, which
+		// would revert the pinned thinking level (the hazard documented for
+		// executionModel). Queued directive: the flip rides the follow-up as its
+		// delivery hook, so a directive that waits behind an in-flight turn cannot
+		// raise (or drop) that turn's pin and floor early, and a dropped directive
+		// leaves no flip behind. Direct dispatch: flip immediately before `prompt`.
+		//
+		// A plain approval is the user's effort decision for execution: the
+		// planning turn may have carried the keyword, and a synthetic turn never
+		// runs the keyword-free disarm on its own, so it is disarmed here
+		// explicitly rather than inheriting the planning arm.
+		const applyExecutionUltracodeState = options.executionUltracode
+			? this.session.armUltracodeTurnDeferred()
+			: this.session.disarmUltracodeTurnDeferred();
+		const followUpOptions = { synthetic: true, onDeliver: applyExecutionUltracodeState };
 		if (this.session.isStreaming) {
-			await this.session.followUp(planModePrompt, undefined, {
-				synthetic: true,
-			});
-		} else {
-			try {
-				await this.session.prompt(planModePrompt, { synthetic: true });
-			} catch (error) {
-				if (!(error instanceof AgentBusyError)) throw error;
-				await this.session.followUp(planModePrompt, undefined, {
-					synthetic: true,
-				});
-			}
+			await this.session.followUp(planModePrompt, undefined, followUpOptions);
+			return true;
+		}
+		// The undo reverts exactly this arm (and nothing an in-flight keyword turn
+		// already holds) when the prompt never starts a turn: an abort/denial
+		// dropping the dispatch (reported through `onDropped` — prompt() itself
+		// resolves `true` for any forwarded prompt), or the AgentBusyError race,
+		// which re-queues the directive with the same flip as its delivery hook.
+		let undoArm: (() => void) | undefined;
+		if (options.executionUltracode) undoArm = this.session.armUltracodeTurnWithUndo().undo;
+		else this.session.disarmUltracodeTurn();
+		try {
+			await this.session.prompt(planModePrompt, { synthetic: true, onDropped: undoArm });
+		} catch (error) {
+			undoArm?.();
+			if (!(error instanceof AgentBusyError)) throw error;
+			// The direct arm already warned once when the model cannot take the
+			// pin; re-arming at delivery would only repeat the warning.
+			const deferredOptions =
+				options.executionUltracode && !this.session.canPinUltracode() ? { synthetic: true } : followUpOptions;
+			await this.session.followUp(planModePrompt, undefined, deferredOptions);
+			return true;
 		}
 		return true;
 	}
@@ -5519,16 +5579,29 @@ export class InteractiveMode implements InteractiveModeContext {
 		let feedback = "";
 		const annotationStateKey = this.#resolvePlanFilePath(planFilePath);
 
+		// Same per-keyword settings check the keyword scan applies
+		// (AgentSession's #magicKeywordEnabled): with either switch off, the
+		// ultracode option is dropped from the menu AND ignored on the arming
+		// path below, so a disabled keyword cannot arm a turn through the menu.
+		// `magicKeywords.ultracode` stays a string literal here: it is a bundle
+		// marker the ultracode installer greps for (scripts/ultracode-markers.txt
+		// in this package).
+		const ultracodeEnabled =
+			this.session.settings.get("magicKeywords.enabled") && this.session.settings.get("magicKeywords.ultracode");
+		// The keep-context disable targets its live index: the list's shape
+		// depends on the ultracode gate above.
+		const planOptions = [
+			"Approve and execute",
+			...(ultracodeEnabled ? [PLAN_EXECUTE_ULTRACODE_LABEL] : []),
+			"Approve and compact context",
+			keepContextLabel,
+			"Refine plan",
+			PLAN_SAVE_AND_QUIT_OPTION,
+		];
 		const choice = await this.showPlanReview(
 			planContent,
 			"Plan mode - next step",
-			[
-				"Approve and execute",
-				"Approve and compact context",
-				keepContextLabel,
-				"Refine plan",
-				PLAN_SAVE_AND_QUIT_OPTION,
-			],
+			planOptions,
 			{
 				helpText,
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
@@ -5544,7 +5617,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					if (state.annotations.length > 0) this.#planReviewAnnotationState.set(annotationStateKey, state);
 					else this.#planReviewAnnotationState.delete(annotationStateKey);
 				},
-				disabledIndices: keepContextDisabled ? [PLAN_KEEP_CONTEXT_OPTION_INDEX] : undefined,
+				disabledIndices: keepContextDisabled ? [planOptions.indexOf(keepContextLabel)] : undefined,
 			},
 			{ slider },
 		);
@@ -5568,7 +5641,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
+		if (
+			choice === "Approve and execute" ||
+			choice === PLAN_EXECUTE_ULTRACODE_LABEL ||
+			choice === "Approve and compact context" ||
+			choice === keepContextLabel
+		) {
 			try {
 				// Prefer in-overlay edits (already in memory) over a disk re-read. The
 				// overlay mirrors edits as they happen, and approval awaits one final
@@ -5613,8 +5691,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				const executionDispatched = await this.#approvePlan(latestPlanContent, {
 					planFilePath,
 					title: details.title,
-					preserveContext: choice !== "Approve and execute",
+					preserveContext: choice !== "Approve and execute" && choice !== PLAN_EXECUTE_ULTRACODE_LABEL,
 					compactBeforeExecute: choice === "Approve and compact context",
+					executionUltracode: ultracodeEnabled && choice === PLAN_EXECUTE_ULTRACODE_LABEL,
 					executionModel,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);

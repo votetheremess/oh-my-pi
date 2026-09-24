@@ -25,6 +25,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { ArtifactManager } from "./artifacts";
@@ -2893,6 +2894,8 @@ export class SessionManager {
 		readSummarize?: boolean;
 		advisor?: string;
 		isolated?: boolean;
+		ultracode?: boolean;
+		ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -3733,6 +3736,8 @@ export interface PersistedSessionInit {
 	readSummarize?: boolean;
 	advisor?: string;
 	isolated?: boolean;
+	ultracode?: boolean;
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 }
 
 /**
@@ -3758,6 +3763,8 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			spawns: entry.spawns,
 			advisor: entry.advisor,
 			isolated: entry.isolated,
+			ultracode: entry.ultracode,
+			ultracodeRestoreLevel: entry.ultracodeRestoreLevel,
 		};
 	}
 	return init;

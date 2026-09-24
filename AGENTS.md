@@ -345,3 +345,382 @@ Location: `packages/*/CHANGELOG.md` (per package).
 2. Run `bun run release`.
 
 The script handles version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
+
+<!-- FORK-LOCAL: not upstream's. Strip this section before any upstream PR. -->
+
+## Local ultracode fork (this checkout only)
+
+This checkout is not a plain clone: `origin` is upstream (`can1357/oh-my-pi`) and the
+branch `feat/ultracode-keyword` carries a local `ultracode` magic keyword rebased onto
+each release tag. Nothing here exists upstream.
+
+**How it reaches the running omp (zero-stock-mutation, since 2026-08-25).** Stock omp is
+installed by bun as the npm bundle (`~/.bun/bin/omp` symlink →
+`<pkg>/dist/cli.js`) and is NEVER modified — not the launcher, not the package, not any
+file bun installed. The fork is one ADDED subdirectory inside the installed package:
+`<pkg>/dist/ultracode/`, the `bun run gen:bundle` output built from this checkout plus a
+`VERSION` stamp. The fish wrapper (`~/.config/fish/functions/omp.fish`) runs that bundle
+(`bun <pkg>/dist/ultracode/cli.js`) only when the launcher is still bun's symlink AND the
+stamp matches the installed package version; on any doubt it runs `command omp`. There is
+deliberately NO self-heal: if something reinstalls stock and wipes the subdir, omp keeps
+working feature-less until `omp update` re-applies. The worst state this design can
+produce is "stock omp, feature absent" — never a broken omp. `omp update` routes to
+`~/.omp/ultracode-update.sh`: fetch → rebase onto the npm-latest tag (rerere) → gate
+(typecheck + `scripts/ultracode-tests.txt`) → `bun install -g
+@oh-my-pi/pi-coding-agent@<latest>` (pins the bundle world; also the universal recovery
+command) → gen:bundle → stage + atomic rename into the subdir → session-boot smoke, with
+`rm -rf` of the subdir on any post-install failure. Sibling files (templates, docs-index)
+ship inside the subdir; `@oh-my-pi/pi-natives` resolves up the node_modules tree to the
+npm-published prebuilt, so the bundle can never pair with mismatched natives. Non-fish
+invocations (scripts, other agents) always run stock. `--remove` deletes the subdir.
+
+**Incident, 2026-08-25 (why the two prior carry designs are retired).** The bundle-era
+design patched stock `dist/cli.js` in place; at v18 its updater path expired (majors
+switch the launcher to a standalone binary — `shouldForceBinaryUpdate`, where an explicit
+`omp.dist` wins in both directions) and the replacement design compiled a binary locally
+(`bun run build`) and swapped it in at the launcher. That binary embedded a STALE local
+`pi_natives` build (version-sentinel mismatch), passed `--version`, `--help`, and all
+three marker greps, and then crashed at session-module import on every real launch: omp
+was unusable until stock was reinstalled by hand. The self-heal made it worse, not
+better: markers present + stamp matched meant the healer called the broken install
+healthy. Lessons, each load-bearing in the current design: (1) never install a locally
+compiled binary — run the bundle under bun inside the published package so natives are
+npm's own; (2) never modify a stock artifact — additive-only, so every failure degrades
+to stock; (3) `--version` is not a boot test — the gate's acceptance is a headless
+session boot (`timeout 15 bun cli.js </dev/null` + crash-signature grep), proven to
+catch the incident artifact and pass a good bundle before it was trusted; (4) no
+auto-heal — a wrapper that can only choose between two intact artifacts cannot loop or
+lock anyone out. Retired machinery lives in `~/.omp/retired/`.
+
+**Rules that are load-bearing, learned the hard way:**
+
+- NEVER run stock `omp update` (or omp's updater in any form) on this machine: on a
+  major bump it replaces the bun symlink launcher with a standalone binary, which ends
+  the bundle world the fork rides in. `ultracode-update.sh` uses `bun install -g` for
+  stock updates instead, which pins the bundle world and doubles as total recovery
+  (`bun install -g @oh-my-pi/pi-coding-agent@latest`). The fish wrapper routes
+  `omp update` accordingly; non-fish `omp update` is the one remaining foot-gun.
+- Install-time feature verification (`verify_markers`) greps the identifiers in
+  `packages/coding-agent/scripts/ultracode-markers.txt` against the freshly built bundle.
+  Never use prose as a marker: the original markers were two sentences inside
+  `ultracode-notice.md` and a copy edit nearly broke installation, with a message
+  claiming the feature was missing. `test/ultracode-markers.test.ts` enforces the
+  contract — it strips comment lines first, because the bundler strips comments and a
+  marker surviving only in a doc comment is absent from the shipped bundle.
+- Bundling preserves string literals but mangles local identifiers, so markers must be
+  settings paths, `customType` values, or UI labels — never internal symbol names.
+- **Markers prove the strings shipped, never that the feature works.** A textually clean
+  rebase can still break the fork: on v17.3.2 upstream changed
+  `createMagicKeywordSession` to take a `ModelRegistry` instead of a temp-dir path and
+  stopped returning `authStorage`, the fork's added tests kept passing the old argument,
+  and 15 tests failed while all three markers sat present in the installed bundle. So
+  installs are gated on `check:types` plus `scripts/ultracode-tests.txt`. That list is
+  repo-owned and `test/ultracode-markers.test.ts` fails when a listed path is missing or
+  when an ultracode-named test file is absent from the list — a hand-maintained gate that
+  quietly stops covering things is worse than no gate. `ultracode-update.sh` likewise
+  refuses an empty list. Keep the list narrow: upstream ships test files that already
+  fail on a clean checkout, so gating on the full suite would block updates on someone
+  else's red.
+- **Faking `AgentSession` is a recurring tax, once per release or so.**
+  `test/ultracode-subagent-effort.test.ts` hands `runSubprocess` a hand-rolled fake
+  session behind `as unknown as AgentSession`. That opaque cast is upstream's own house
+  pattern in ~50 test files, so the compiler cannot flag a missing member, and upstream
+  updates its fakes in the same commit that adds a method — a sweep this out-of-tree
+  fixture is invisible to. v17.4.0 (`fix(hub): prevented stale agent refs from blocking
+  wait`) made the agent registry mirror run-state on every spawn, so `syncSessionStatus`
+  called `session.subscribeRunState()` and killed all ten spawns. Fix by adding the
+  member to the stub, matching the real signature.
+  - Diagnosing it is the slow part, because `runSubprocess` catches the TypeError and
+    reports only `exitCode: 1`. The symptom is every assertion in the file failing on
+    exit code, *including* the `ultracode: false` controls — that pattern means the
+    harness died, not the feature. Dump the whole result object (`stderr` and `error`
+    carry the stack) instead of reading the effort logic.
+  - Do NOT make the stub tolerate unknown members with a Proxy returning noops. Tried
+    and reverted: any predicate-shaped member then reads truthy forever, hanging an
+    internal wait loop so the suite stalls with no output at all. A stub that breaks
+    loudly once per release beats a clever one that can hang.
+  - Gate failures cost nothing: `ultracode-update.sh` gates BEFORE touching the stock
+    install, so the previous stock+fork pair stays active. Only a post-install boot-smoke
+    failure removes the fork subdir — `--status` then reads `ultracode : ABSENT` and fish
+    runs stock until the gate is green again. Either way that is the gate working, not a
+    second bug.
+- Keep the branch's footprint out of files upstream churns. Measure before adding a
+  hunk: `git log --oneline <prev-tag>..<tag> -- <file> | wc -l`. `CHANGELOG.md` saw 23
+  commits in a single release window and is deliberately left untouched;
+  `docs/magic-keywords.md` is the feature's documentation instead.
+- `rerere` is enabled in this checkout, so a conflict resolved once replays on later rebases.
+- Ultracode's subagent floor lives in `src/task/executor.ts` and reads
+  `settings.get("ultracode")`. An out-of-tree extension can NOT replace it: extensions
+  cannot register settings keys, and plan-mode subagents load no extensions at all
+  (`structured-subagent.ts`: `preloadedExtensionPaths: restrictToolNames ? [] : …`).
+  This is why the feature stays in-tree.
+- Plan approval dispatches a SYNTHETIC prompt, and synthetic turns never scan for magic
+  keywords, so a typed keyword cannot reach the execution turn. That is what
+  "Approve and execute with ultracode" in the plan review exists for. Arm effort only
+  AFTER `#exitPlanMode`, which restores the pre-plan model and would revert the pin —
+  and on the queued path (a turn already in flight) never at enqueue: the arm rides the
+  synthetic follow-up as its `onDeliver` hook (`armUltracodeTurnDeferred()`), the same
+  `ASIDE_MESSAGE_COMMIT` rider a queued typed keyword uses. The direct path arms via
+  `armUltracodeTurnWithUndo()` and runs the undo when `prompt()` returns false or
+  throws. A PLAIN approval disarms (`disarmUltracodeTurn()` direct /
+  `disarmUltracodeTurnDeferred()` queued) — the execution turn is synthetic and would
+  otherwise inherit the planning turn's arm. Plan-mode enter/exit snapshots read
+  `userConfiguredThinkingLevel()` (the level the user owns), never the borrowed pin.
+- Queue modes differ on purpose. A FOLLOW-UP starts a turn: keyword arms, keyword-free
+  disarms, both at delivery. A STEER joins the running turn and is ARM-ONLY: keyword
+  arms at delivery, keyword-free attaches no rider at all (a mid-turn "also do X" must
+  not yank the pin and floor out of the workflow it joins). `steer()`/`followUp()` RPC
+  entries carry the same riders as `prompt()`'s queue branches. Every arm/disarm bumps
+  `#ultracodeArmSeq`; a dropped turn's undo captures it at creation and stands down if
+  anything flipped since. A queued keyword-free disarm rider instead yields to an arm
+  that fired in the SAME synchronous commit batch (`#ultracodeArmedInBatch`, cleared by
+  a microtask — the agent loop commits a batch in one synchronous `for`): a plan
+  directive's arm ahead of an older keyword-free follow-up in one batch leaves that
+  turn armed, while the same follow-up delivered as its own later turn (the default
+  `followUpMode`) disarms. An enqueue-time sequence was tried first and made that
+  later turn run armed.
+- `createIsolatedSettings` (executor.ts) is the pure snapshot — every schema key by
+  value into an isolated override layer, NO subagent stamps — for the Agents Hub
+  architect and the legacy extension shim; `createSubagentSettings` = that + the
+  yolo/advisor-off/tier stamps, and `/tan` keeps it (headless clone, yolo is
+  load-bearing). Both carry the parent's live `ultracode` override by value.
+  `syncChildUltracodeAtResume` decides via `ultracodePinRefusal()` BEFORE writing the
+  child's flag: refused → throw (ceiling vs no-rung worded differently) with the flag
+  never raised (a child that arrived stale-flagged is disarmed first, so no child is
+  ever flagged-but-unpinned).
+- The ultracode effort contract is one helper, `ultracodeEffortFor` in
+  `packages/tui/src/thinking.ts` (moved with upstream's v18.3.0 pi-tui decoupling; the
+  bundle inlines pi-tui, so the marker still ships):
+  exactly `Effort.XHigh` when the ladder has the rung, `undefined` otherwise, never any
+  other level. Both the session pin (`ModelControls.beginUltracodeTurn` /
+  `repinUltracodeIfArmed`) and the spawn pin (`executor.ts`) resolve through it, so they
+  cannot disagree. The session side adds one more refusal: a hard `thinkingLevelCeiling`
+  below xhigh (`ModelControls.canPinUltracode()` / `ultracodePinRefusal()` →
+  `"ceiling"`), and the notice's `effortPinned` is that exact predicate (root-only), so
+  it never promises a floor the arm refused. NEVER reintroduce `clampAutoThinkingEffort(model, Effort.XHigh)` on an
+  ultracode path — that was the old clamp, and the user rejected it (deviation iv).
+
+**Deliberate deviations from official Claude Code's ultracode (2.1.211), recorded so no
+audit re-litigates them:** (i) CC's keyword is a turn-scoped orchestration opt-in ONLY —
+it never changes reasoning effort; xhigh there comes solely from the separate
+session-scoped `/effort ultracode` mode. The fork deliberately fuses the two onto the
+keyword: a turn-scoped xhigh pin replacing CC's dropped session mode. (ii) CC scans the
+pre-expansion prompt and never fires on a slash-prefixed one; the fork scans the expanded
+text (upstream's pre-existing pattern for the other three keywords), so a slash-command or
+template body and skill args can deliberately carry the keyword — code-span masking keeps
+a backticked mention inert. (iii) Intended, not a leak: a subagent spawned by an ultracode
+turn stays pinned until the child's next RESUME BOUNDARY (follow-up turn, hub wake,
+revive — `syncChildUltracodeAtResume`) after the parent's turn has ended; at that
+boundary it disarms and hands back to its restore level (`ultracodeRestoreLevel`, the
+level it would have run at unpinned, threaded from the executor and persisted in
+`session_init`). Between the parent's disarm and that boundary the child keeps xhigh —
+mid-run, nothing polls the parent. (iv) **Strict
+xhigh, fail loud (user decision, 2026-09-02).** The pin is EXACTLY xhigh — never max,
+never below — for the turn and every LLM agent that runs during it. The earlier design
+clamped to the model's ladder (a `[max]` ladder pinned max, a `[..high]` ladder pinned
+high, a model with no effort surface fell through to its own selector). The user's
+rationale: a clamp spends the pinned budget at a level they did not ask for while the
+notice tells the model it is running at xhigh, and nothing in the UI says otherwise; a
+wrong effort that announces itself is recoverable, a silent one is not. So a model with no
+xhigh rung cannot satisfy ultracode: the main-session arm does NOT pin and does NOT set
+the `ultracode` override (nothing is floored), posts a `warning` notice (source
+`ultracode`, message `ultracode requires xhigh; <model> exposes [...]; this turn is not
+armed`) and renders the hidden notice's `{{#unless effortPinned}}` branch; spawn paths
+throw `UltracodeEffortError` before any session exists; retry fallback skips such
+candidates; auxiliary agents (advisor, security coordinator) throw and the caller posts a
+notice and skips that agent. Never clamp silently.
+
+**Hardening pass (2026-09-02), the four reviewer findings and the spawn-entry gaps, all
+fixed with tests in `scripts/ultracode-tests.txt`:** (1) armed state leaked across session
+transitions — FIXED: `AgentSession.disarmUltracodeTurn()` (override → false +
+`endUltracodeTurn`) runs in `newSession`/`switchSession`. (2) a user model pick left the
+pin and floor up — FIXED: the session wrappers `setModel`/`setModelTemporary`/`cycleModel`
+/`applyRoleModel`/`cycleRoleModels` disarm first (`#dropUltracodeForUserModelPick` →
+`disarmUltracodeTurn`, so a level-less pick lands on the pre-ultracode level, not the
+borrowed xhigh); genuinely internal swaps (retry fallback, prewalk, compaction promotion,
+transcript restore) call ModelControls directly and end with `repinUltracodeIfArmed()`,
+keyed on the settings flag so an inheriting child re-pins too. Role switches and
+plan-mode transitions go through the session wrappers as USER picks and END the turn —
+they do not re-pin (wave-2 correction of an earlier claim here). (3) a dropped dispatch stranded the arm — FIXED:
+`#applyUltracodeTurnState` returns an undo closure reverting exactly what it changed
+(override write and pin/handback; a no-op when re-arming an already-armed turn), run when
+`#promptWithMessage` returns false or throws, on both the `prompt()` and
+`promptCustomMessage` direct paths. (4) plan approval armed at enqueue on the queued path
+— FIXED: delivery-hook arming via `FollowUpOptions.onDeliver` (see the plan-approval
+bullet above). Spawn-entry gaps: arming is root-only (`agentKind: "sub"`
+makes `#applyUltracodeTurnState` and the queue riders no-ops, so a child neither arms
+from a user-attributed message nor disarms the flag it inherited) — that guard, not
+attribution, is what protects children: `sendUserMessage` and the `/tan` work prompt are
+user messages by contract and stay user-attributed (wave-2 reverted wave-1's
+`attribution: "agent"` on them; IRC hub steering between agents stays agent-attributed); and `setThinkingLevel(level, persist, source)`
+takes the off-ramp only for `source: "user"` — the extension runtimes wired in
+`executor.ts`/`persisted-revive.ts` pass `"extension"` and the armed turn re-pins over
+them (closes open edge (b) below). Open edge (a) (collab peer `chat`) is NOT closed by
+this pass: `collab/host.ts` still routes a peer's `chat` into `session.prompt` with no
+attribution marker.
+
+**Recovery refs.** The newest `ultracode-verified-<date>` tag marks the last state whose
+gate was actually green; older dated tags mark earlier ones. Deliberately no commit count
+here — an earlier revision of this line carried one and the very commit that wrote it made
+it stale. The branch `feat/ultracode-keyword-pre-sync` is NOT a backup of latest work: the
+script moves it only when a rebase actually runs, so it can lag many commits. Resolve any
+of them with `git log --oneline <ref>..HEAD` before trusting it, and re-point the newest
+tag at HEAD after the last commit of a session, never before.
+
+**Upstream watch refresh (verified 2026-09-24, tags v18.1.16→v18.3.0, during the
+v18.3.0 rebase - a squash-and-port, see below).** The first window that touched the
+keyword subsystem itself: upstream centralized every magic keyword into one table
+(`packages/coding-agent/src/modes/magic-keywords.ts`, `MAGIC_KEYWORDS`) that
+settings-schema, the notice loop in agent-session (`#createMagicKeywordNotices`), the
+hidden-companion set in queued-messages and the pi-tui gradients all derive from, and
+added a fifth keyword (`jevify`). The fork's old highlight-chainer, `containsUltracode`
+/ `highlightUltracode`, `WORKFLOW_NOTICE` and the hand-coded `#ultracodeNoticeFacts`
+are gone; ultracode is now one `rootOnly` row (`requires: ["task", "eval"]`) whose
+`notice(context)` renders from the shared `MagicKeywordContext` (extended in the fork
+with `effortApplied`/`effortPinned`/`maxConcurrency`/`waitTool`). Rebase mechanics:
+the 29-commit history could not be replayed (26 conflicted files, the seams all moved),
+so the fork delta v18.1.16..1551a5bd47 was squashed into one commit and ported by six
+file-owner agents onto v18.3.0, then folded into a single `feat(ultracode)` commit; the
+old history stays reachable from `ultracode-verified-2026-09-09`. Other seams: `hub` is
+gone as a tool (`wait` is its own tool; the notice's `waitTool` branch reads the DIRECT
+surface, `getActiveToolNames()`, because under a Codex Code Mode partition `wait` stays
+enabled but is not callable); `workflowAvailable` deliberately reads
+`getEnabledToolNames()` (fixes an old-fork Code Mode mismatch where the reduced
+"work solo" branch rendered while `agent()`/`workpool()` were live through the eval
+bridge); `prompt()` now resolves `true` for every forwarded prompt, so the plan-approval
+undo rides a new `PromptOptions.onDropped` that `#dispatchPrompt` fires when an
+abort/preflight denial drops the dispatch (`test/interactive-mode-plan-review.test.ts`
+"undoes a direct-path arm when an abort races the dispatch" drives a REAL drop by
+aborting inside the dispatch - proven red without the wiring); the agents-hub architect
+is created in `modes/agents-hub-deps.ts` (pi-tui owns the overlay now); the eval bridge
+tests use the handle-based `runEvalAgent` + `AsyncJobManager` settle; `Effort` moved to
+`@oh-my-pi/pi-catalog/effort`. Notice-gate rule restored to upstream's: every
+non-synthetic prompt gets its keyword notices, including agent-attributed ones (a parent
+writing `orchestrate` into a task brief hands the child that contract); only the
+`rootOnly` ultracode row and the arm itself stay user-authored-and-root (old fork had
+narrowed ALL notices, a loss the review caught). Review residue, recorded not fixed:
+(a) upstream's `jevify-notice.md` still describes `judge()` returning a
+`JudgmentHandle` with `.wait()`, which v18.3.0's kernel rejects (`wait()` throws on
+non-agent handles; `judge()` returns answers directly, CHANGELOG 18.2.x) - both keywords
+in one prompt inject contradicting contracts; upstream bug, candidate PR, the fork's
+notice states the correct API; (b) `#tryFireworksFastFallback` (turn-recovery.ts) swaps
+model without `repinUltracodeIfArmed`, unlike the two retry-chain sites - pre-existing,
+uncertain trigger (fast/base pairs share ladders), untouched; (c) the architect session
+is a child-kind session by fork design (shares the owner's AsyncJobManager; upstream
+keeps secondary top-level sessions job-less per #1923) - intentional, unchanged.
+
+**Upstream watch refresh (verified 2026-09-09, tags v18.1.4→v18.1.16, 711 upstream
+commits, during the v18.1.16 rebase).** The biggest window so far and the first that
+changed the CONTRACT the fork teaches, not just its seams. (1) Upstream rewrote the eval
+kernel (05bb0c1989 "reengineered evaluation, added WorkPool"): `parallel()`/`pipeline()`
+are gone from both preludes; `agent()` returns an `AgentHandle` immediately, results come
+from `.wait()`/`wait(handles, {raiseErrors})`, and bounded fan-out is `workpool()`
+(`.push()`; results auto-deliver; the pool name is its job id; bounded by
+`task.maxConcurrency`, handles are NOT bounded). The fork's `ultracode-notice.md` still
+taught the old API and the fork's own gate PINNED that text, so the gate was green on
+guidance that would ReferenceError in a live turn — notice rewritten (script/barriers/
+patterns), gate flipped, plus a new test that ties every backticked helper the notice
+names to a `globalThis.<name> =` export in the real JS prelude, so the next rename goes
+red in the gate instead of in a turn. `renderUltracodeNotice` gained `evalTools`
+(mirrors upstream's `tool()`/`tools=` gate). Both eval frontends were traced to the pin
+chokepoint: `agent()` (handle job → `runStructuredSubagent` → `runSubprocess`) and
+`workpool()` (pool dispatch → same seam; follow-up turns via `runSubagentFollowUpTurn` →
+`syncChildUltracodeAtResume`); a workpool frontend case now sits beside the agent() one.
+(2) Upstream added a third queue mode, `streamingBehavior: "aside"` (non-interrupting,
+folded in at the next step boundary). Resolution: `#ultracodeDeliveryHook` accepts
+`"aside"` and treats it like a steer (arm-only). One real hole the review panel found and
+this pass closed: a stranded user aside (normalization await outlasting the run it meant
+to join) STARTS a fresh turn via `#resumeStrandedIrcAsides` → `#wakeForIrc`, and an
+arm-only record carries no disarm, so that turn inherited the previous pin — `#wakeForIrc`
+now takes the user off-ramp right before `agent.prompt(records)` when a root's
+user-attributed record starts the wake and no record carries a delivery hook (a keyword
+aside's hook still arms at commit). Tested with the stranded shape (4 aside cases). Fold
+paths (plan mode, post-interrupt) still never fire hooks — by design, no turn starts.
+(3) Fixture tax: `isAdvisorActive` (74bdf4c65c) on the fake AgentSession;
+`asyncJobManager`/`getAgentId`/`getArtifactsDir` on the fake ToolSession, and the eval
+bridge tests now settle the registered job before asserting. (4) Tooling: upstream moved
+from biome to oxlint+oxfmt (`bun run check:tools`); format touched files with
+`node_modules/.bin/oxfmt <files>`, never biome (it reflows at 80 cols). (5) Gate
+infrastructure: the checkout's tests load the gitignored
+`packages/natives/native/pi_natives.darwin-arm64.node`, which went stale silently when
+upstream's native API changed (`vcsDiscover` missing → 11 red plan-review tests unrelated
+to the fork); `ultracode-update.sh` now syncs that prebuilt from
+`@oh-my-pi/pi-natives-darwin-arm64@<repo version>` before every gate (stamped in
+`~/.omp/.ultracode-natives-<tag>`). Rebase conflicts: the known doc-churn spots (rerere),
+plus `workflow.ts`/`workflow-notice.md` (upstream's `evalTools`/`embedded` params vs the
+fork's earlier embed hook — upstream's shape kept, files byte-identical to upstream after
+the fork commit that had introduced the hook), and `#queueUserMessage`/`sendUserMessage`
+for the aside branch. Quiet: model-controls.ts (0 commits), turn-recovery.ts (reads
+only), persisted-revive.ts, session-advisors.ts, every runtime `setThinkingLevel` still
+`"extension"`-tagged, new `/switch`/`/model <sel>` surfaces take the user off-ramp.
+Outside the contract, noted not fixed: `completion()` and the `read ?q=` image question
+run at their own fixed effort (not subagents; the notice says so for `completion()`).
+
+**Upstream watch refresh (verified 2026-09-02, tags v18.0.11→v18.1.3, during the
+v18.1.3 rebase).** Quiet seams again: keyword subsystem, executor floor,
+`createSubagentSettings` snapshot loop, `ASIDE_MESSAGE_COMMIT`, settings-schema
+magicKeywords group, plan-review flow — zero relevant upstream commits. Two real
+intersections, both handled: (1) upstream added a pre-dispatch `isStreaming` re-check to
+`prompt()` (dispatch-race loser queues instead of erroring), which broke commit 22's
+"enqueue IS turn start on the direct path" assumption — the direct-path
+`#applyUltracodeTurnState` now sits BELOW that re-check and the requeue passes the
+delivery hook (with `undefined` filling upstream's new `preprocessed` param);
+adaptation adversarially reviewed clean on five axes (no reader of turn state in the
+moved span, no double/zero application on any path, no dropped upstream hunk, no test
+asserting the old position). (2) The fixture tax again: usage-owner threading
+(73949b6a6b, 80605a93e7) makes `applyAutoThinkingLevel` call
+`sessionManager.getSessionId()/getLeafId()` BEFORE the classifier try-block —
+stub taught `getSessionId`/`getLeafId`/`appendModelUsage` with real signatures.
+Checked-clean beyond the seams: vibe-exit's `agent.replaceQueues` and every other
+caller filter/slice the EXISTING message arrays (object identity preserved), so the
+non-enumerable delivery hook survives queue rewrites; a rider disappears only when its
+whole message is deliberately removed, which is correct. Still untested (recorded, not
+fixed): the re-check-branch delivery hook has no direct test (the wiring tests
+forceStreaming through the early branch); in-place rewind across an armed turn
+(believed benign: restore path re-arms). General note: upstream removed `hub` from
+`READ_ONLY_TOOL_NAMES`. Operational: upstream re-pointed pre-publish tag v18.1.4;
+`ultracode-update.sh` now fetches tags with `--force`.
+
+**Upstream watch refresh (verified 2026-08-31, tags v18.0.5→v18.0.11, during the
+v18.0.11 rebase).** Same negative result: the keyword subsystem had ZERO upstream
+commits in the window (magic-keywords.ts, markdown-prose.ts, magic-keyword-boundary.ts,
+ultrathink/workflow/orchestrate modes, queued-messages.ts), the effort-resolution block
+in executor.ts is untouched, `ASIDE_MESSAGE_COMMIT` is untouched (`git log -S` empty),
+and no AgentSession spawn-path member was added (only `getEnabledToolNames` appears in
+the executor window diff, already stubbed). Rebase conflicts were confined to the three
+known-churn spots: docs/settings.md (twice) and `#queueUserMessage` in agent-session.ts,
+where upstream's new `timestamp?: number` latency anchor (f9a00c7313, db0fa518c3) and
+the fork's `onDeliver` hook compose as two independent trailing params — resolution
+adversarially reviewed, both intents preserved. rerere recorded all three resolutions.
+**Known-open edges (2026-08-31 review, latent, none introduced by the rebase; status
+re-checked 2026-09-02):** (a) STILL OPEN — a collab peer's `chat` (collab/host.ts routing
+into `session.prompt` with no synthetic/attribution marker) passes the `userAuthoredTurn`
+gate, so a remote peer can arm/disarm ultracode on a root session (on a child it is now
+harmless: arming is root-only); (b) CLOSED by the 2026-09-02 hardening pass —
+`setThinkingLevel(level, persist, "extension")` no longer takes the off-ramp, and the
+armed turn re-pins over the extension's level; (c) `createSubagentSettings` snapshots
+every schema key, so the child's isolated Settings bakes `ultracode: true` as its own
+base value — this is the mechanism behind deliberate deviation (iii), listed so nobody
+mistakes it for a leak; (d) no test pins the `timestamp ?? Date.now()` pass-through in
+the hoisted `#queueUserMessage` message const (upstream shipped it untested too).
+
+**Upstream watch (verified 2026-08-25, tags v17.4.0→v18.0.5).** Upstream has no
+ultracode equivalent and gained none in that window: the keyword machinery and all three
+notice files are byte-identical across the tags, and the effort plumbing nearly so —
+`model-controls.ts` gained `setScopedModels` in that window (additive, nowhere near the
+fork's turn-pin seam); `orchestrate`
+and `workflowz` remain prompt-only (no effort or subagent side effects); `ultrathink`'s
+effort effect exists only under auto-thinking (stateless per-turn reclassification); the
+eval `agent()` bridge exposes no effort parameter at all, and upstream's merged effort
+policy is a per-spawn CEILING (`task.maxEffort`, #6794) — the opposite direction of the
+fork's pin. Watch items: issue #2159 (the closest open request — a session-wide,
+session-persistent ultracode-parity mode; the fork deliberately ships the turn-scoped
+keyword variant instead), PR #5117
+("Ultra reasoning mode" — open, unmerged, weaker: session-persistent, no subagent pin,
+no workflow contract), #7962 (plan-approval orchestration mode — the fork's plan-review
+option's slot), #7963 (keyword-consolidation RFC, undecided). PLAN: after the fork setup
+is re-verified end-to-end, propose upstreaming the feature as a PR answering #2159, with
+a description that says it answers the issue's ultracode-parity spirit while rejecting
+its central session-persistence ask —
+ONLY with the user's explicit approval, which has not been given yet; strip this whole
+FORK-LOCAL section from any PR branch.

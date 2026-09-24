@@ -1,0 +1,39 @@
+# Strings that prove a built bundle carries the local ultracode feature.
+#
+# ~/.omp/ultracode-update.sh (verify_markers) greps EVERY one of these in the
+# bundle it just built and refuses to apply when any is missing — fail closed:
+# an unreadable or empty list means "cannot verify", never "verified". Nothing
+# else reads this file. In particular the fish wrapper never greps markers: it
+# gates only on the launcher symlink and the VERSION stamp, and it deliberately
+# has NO self-heal — the worst state the carry design can produce is stock omp
+# with the feature absent. test/ultracode-markers.test.ts asserts each marker
+# still exists in src/, so removing a marker fails here instead of quietly
+# breaking the update script.
+#
+# Pick identifiers, never prose. The original markers were two English sentences
+# inside ultracode-notice.md; rewriting that prose came within one line of
+# breaking installation, with a failure message claiming the feature was absent.
+# Bundling preserves string literals but mangles local variable names, so a
+# settings path, a wire-level customType, or a user-visible label all survive --
+# an internal identifier would not. Since the magic-keyword registry (v18.2+),
+# the per-keyword settings key and the `<id>-notice` customType are BUILT from
+# the row's `id` at runtime and never appear as contiguous literals, so a marker
+# must be a string the source spells out verbatim.
+#
+# Blank lines and `#` comments are ignored.
+
+# The registry row's settings-panel label (src/modes/magic-keywords.ts). A
+# literal in the table, so it lands in the bundle; changes only if the row's
+# copy is renamed.
+Ultracode Keyword
+
+# Settings path, spelled out verbatim by the plan-review gate in
+# src/modes/interactive-mode.ts (`settings.get("magicKeywords.ultracode")`),
+# which must stay a string literal for this marker to survive. The schema key
+# itself is derived from the row and never appears as a literal.
+magicKeywords.ultracode
+
+# The plan-review option (src/modes/interactive-mode.ts). Carries ultracode
+# across the plan -> execute boundary, which a synthetic execution turn cannot
+# do via the keyword.
+Approve and execute with ultracode

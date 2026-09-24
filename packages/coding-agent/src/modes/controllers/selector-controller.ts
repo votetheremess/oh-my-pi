@@ -580,6 +580,7 @@ export class SelectorController {
 				() => this.ctx.session.effectiveExtensionRoots,
 				activeModelPattern,
 				defaultModelPattern,
+				this.ctx.session.getAgentId(),
 			),
 			{ onCancel: () => done() },
 		);
