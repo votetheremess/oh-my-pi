@@ -647,8 +647,10 @@ infrastructure: the checkout's tests load the gitignored
 `packages/natives/native/pi_natives.darwin-arm64.node`, which went stale silently when
 upstream's native API changed (`vcsDiscover` missing → 11 red plan-review tests unrelated
 to the fork); `ultracode-update.sh` now syncs that prebuilt from
-`@oh-my-pi/pi-natives-darwin-arm64@<repo version>` before every gate (stamped in
-`~/.omp/.ultracode-natives-<tag>`). Rebase conflicts: the known doc-churn spots (rerere),
+`@oh-my-pi/pi-natives-<os>-<arch>@<repo version>` before every gate (stamped in
+`~/.omp/.ultracode-natives-<tag>`; `<arch>` is npm's word — `arm64`/`x64` — mapped from
+`uname -m`, whose Linux spellings `aarch64`/`x86_64` broke the sync on every Linux box
+until 2026-09-27). Rebase conflicts: the known doc-churn spots (rerere),
 plus `workflow.ts`/`workflow-notice.md` (upstream's `evalTools`/`embedded` params vs the
 fork's earlier embed hook — upstream's shape kept, files byte-identical to upstream after
 the fork commit that had introduced the hook), and `#queueUserMessage`/`sendUserMessage`
