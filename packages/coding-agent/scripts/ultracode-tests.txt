@@ -22,10 +22,14 @@
 # files whose names do not — so adding a test file and forgetting this list, or
 # deleting a listed entry, fails in the repo instead of quietly shrinking the gate.
 #
-# The upstream files at the end exercise production paths the fork changed
-# (ModelControls, the IRC resume sync, the Agents Hub, /tan). Their hand-rolled
-# fakes broke on the v18.9.0 port while every fork-named test stayed green, so
-# they ride the gate too.
+# The upstream files at the end drive production code the fork changed
+# (effort's ModelControls, agent-message's IRC delivery, the selector's Agents
+# Hub, /tan) through hand-rolled fakes. They only keep those fakes complete: a
+# fake missing a member fork code reads turns them red, which is how they broke
+# on the v18.9.0 port while every fork-named test stayed green. Unless a file
+# says otherwise they do NOT assert the fork's behaviour on those paths; the
+# selector file additionally asserts the Agents Hub owner id and the
+# settings-panel thinking-level off-ramp.
 #
 # Paths are relative to packages/coding-agent. Blank lines and `#` comments are ignored.
 
@@ -34,6 +38,7 @@ test/ultracode-turn-effort.test.ts
 test/ultracode-subagent-effort.test.ts
 test/ultracode-effort-recovery.test.ts
 test/ultracode-spawn-surfaces.test.ts
+test/ultracode-wiring.test.ts
 test/agent-session-magic-keywords.test.ts
 test/modes/ultracode.test.ts
 test/modes/magic-keywords.test.ts

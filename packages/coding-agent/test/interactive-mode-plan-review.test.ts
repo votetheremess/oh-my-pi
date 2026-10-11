@@ -1,8 +1,15 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Agent, AgentBusyError, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import {
+	Agent,
+	AgentBusyError,
+	ASIDE_MESSAGE_COMMIT,
+	type CommittableAsideMessage,
+	ThinkingLevel,
+} from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
@@ -1236,11 +1243,14 @@ describe("InteractiveMode plan review rendering", () => {
 		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) =>
 			pickPlanOption(options, "Approve and execute with ultracode"),
 		);
-		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(true);
 
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
+		// Like plain "Approve and execute", the ultracode option starts the
+		// execution turn on a cleared context, not the planning transcript.
+		expect(clear).toHaveBeenCalledTimes(1);
 		// This is the flag src/task/executor.ts reads to floor every spawn of this
 		// turn at xhigh. Without it the approved plan executes cold.
 		expect(cfgUltracode.get(session.settings)).toBe(true);
@@ -1498,6 +1508,51 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.thinkingLevel).toBe(Effort.XHigh);
 	});
 
+	// The queued directive's notice is rendered at ENQUEUE, the arm at DELIVERY.
+	// A model switch in between (here to one with no xhigh rung) would leave the
+	// model reading "already pinned" on a turn the arm refused, so the approval
+	// hands its directive renderer to the deferred arm and the delivery commit
+	// re-renders the notice from the arm actually taken.
+	it("re-renders a queued ultracode approval's notice at delivery from the arm actually taken", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		session.setThinkingLevel(ThinkingLevel.Low);
+		const noXhigh = session.modelRegistry.find("anthropic", "claude-sonnet-4-6");
+		if (!noXhigh) throw new Error("Expected claude-sonnet-4-6 to exist in registry");
+		expect(ultracodeEffortFor(noXhigh)).toBeUndefined();
+
+		let streaming = false;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		vi.spyOn(session, "abort").mockResolvedValue();
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options) => {
+			streaming = true;
+			return pickPlanOption(options, "Approve and execute with ultracode");
+		});
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		const queued = session.agent.peekFollowUpQueue().find(message => message.role === "developer") as
+			| CommittableAsideMessage
+			| undefined;
+		// Read live: the delivery commit rewrites the queued content in place.
+		const queuedText = () => JSON.stringify(queued);
+		expect(queuedText()).toContain("The harness has already pinned");
+
+		await session.setModel(noXhigh);
+		queued?.[ASIDE_MESSAGE_COMMIT]?.();
+
+		expect(cfgUltracode.get(session.settings)).toBe(false);
+		expect(queuedText()).toContain("This turn is NOT armed");
+		expect(queuedText()).not.toContain("The harness has already pinned");
+		expect(queuedText()).toContain("approved a plan");
+	});
+
 	it("undoes a direct-path arm when prompt() races into AgentBusyError, then re-queues it deferred", async () => {
 		const planFilePath = "local://PLAN.md";
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
@@ -1753,6 +1808,59 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(session.configuredThinkingLevel()).toBe(ThinkingLevel.Low);
 		expect(session.userConfiguredThinkingLevel()).toBe(ThinkingLevel.Low);
+		expect(cfgUltracode.get(session.settings)).toBe(false);
+	});
+
+	// Entering plan mode is the user's choice, so it ends an armed turn every
+	// time. The plan-role switch alone only did so when it changed the model or
+	// level on the spot; with no plan role (or one matching the current model
+	// and level) the pin and the subagent floor stayed up into planning.
+	it("ends an armed ultracode turn on plan-mode entry when no plan role is configured", async () => {
+		expect(session.resolveRoleModelWithThinking("plan").model).toBeUndefined();
+		session.setThinkingLevel(ThinkingLevel.Low);
+		session.armUltracodeTurn();
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		await mode.handlePlanModeCommand();
+
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		expect(cfgUltracode.get(session.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+
+	// Mid-stream entry defers the plan-model switch to the end of the stream,
+	// and that flush is an internal swap that re-pins an armed turn. Ending the
+	// turn at entry drops the pin for the rest of the in-flight turn, and the
+	// deferred switch then lands on the plan role's own level.
+	it("ends an armed ultracode turn on plan-mode entry made mid-stream", async () => {
+		session.settings.setModelRole("plan", "anthropic/claude-opus-4-5:high");
+		session.setThinkingLevel(ThinkingLevel.Low);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		session.agent.streamFn = createMockModel({
+			handler: async () => {
+				started.resolve();
+				await release.promise;
+				return { content: ["done"] };
+			},
+		}).stream;
+
+		const turn = session.prompt("ultracode survey the scheduler");
+		await started.promise;
+		expect(session.isStreaming).toBe(true);
+		expect(cfgUltracode.get(session.settings)).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		await mode.handlePlanModeCommand();
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		expect(cfgUltracode.get(session.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+
+		release.resolve();
+		await turn;
+		await mode.flushPendingModelSwitch();
+		expect(session.model?.id).toBe("claude-opus-4-5");
+		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(cfgUltracode.get(session.settings)).toBe(false);
 	});
 

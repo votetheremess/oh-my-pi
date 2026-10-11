@@ -117,6 +117,11 @@ export interface StructuredSubagentRequest {
 	effort?: TaskEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
 	solutionSpace?: string;
+	/**
+	 * The parent's ultracode arm state when this spawn was REQUESTED; see
+	 * `ExecutorOptions.ultracodeArmed`. Absent = read at the executor's entry.
+	 */
+	ultracodeArmed?: boolean;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -556,6 +561,7 @@ function buildExecutorOptions(
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
+		ultracodeArmed: request.ultracodeArmed,
 		solutionSpace: request.solutionSpace?.trim() || undefined,
 		...(policy.schema.source === "none"
 			? {}

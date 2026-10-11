@@ -39,7 +39,8 @@ import type { MagicKeywordContext } from "./magic-keywords";
  * - `effortPinned` false: the active model exposes no xhigh rung, so the turn
  *   was NOT armed (no pin, no subagent floor) and the user was told. The
  *   notice must say so instead of promising an effort the harness refused to
- *   substitute for; the orchestration contract still ships.
+ *   substitute for; the orchestration contract still ships when
+ *   `workflowAvailable`, and the solo branch never mentions a raised effort.
  * - `maxConcurrency` is the live `task.maxConcurrency`; 0 means unbounded and
  *   the cap sentence is omitted entirely, matching the system prompt.
  * - `evalTools` is the live `eval.tools.enabled`; off, the notice never names

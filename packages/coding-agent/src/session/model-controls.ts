@@ -34,6 +34,7 @@ import {
 	type ConfiguredThinkingLevel,
 	clampAutoThinkingEffort,
 	clampThinkingLevelToCeiling,
+	parseConfiguredThinkingLevel,
 	resolveProvisionalAutoLevel,
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
@@ -77,8 +78,24 @@ export class ModelControls {
 	readonly #host: ModelControlsHost;
 	#scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	#thinkingLevel: ThinkingLevel | undefined;
-	/** Hard per-session effort ceiling (e.g. a task spawn's `task.maxEffort` cap); recovery paths re-clamp to it. */
-	readonly #thinkingLevelCeiling: Effort | undefined;
+	/**
+	 * Hard per-session effort ceiling (e.g. a task spawn's `task.maxEffort` cap); recovery paths re-clamp to it.
+	 * Mutable only for a session born armed: its spawn-time ceiling is the pin's (xhigh), and the hand-back
+	 * swaps in {@link #ultracodeRestoreCeiling}, the ceiling it would have had unpinned.
+	 */
+	#thinkingLevelCeiling: Effort | undefined;
+	/**
+	 * The ceiling a session born armed hands back to when its pin ends (`null` = no ceiling). `undefined`
+	 * means "keep the current ceiling": not born armed, unknown (legacy transcript), or already applied.
+	 */
+	#ultracodeRestoreCeiling: Effort | null | undefined;
+	/**
+	 * `configured` receipt of the last thinking entry this instance wrote, when it differs from the level it
+	 * recorded (only an ultracode pin's borrowed-FROM receipt does). A later write of the same level with a
+	 * different receipt is then still a change: otherwise the transcript keeps the pin's receipt and a resume
+	 * discards the user's explicit choice of the pinned level.
+	 */
+	#divergentReceipt: ConfiguredThinkingLevel | undefined;
 	#autoThinking = false;
 	#autoResolvedLevel: Effort | undefined;
 	/**
@@ -103,6 +120,11 @@ export class ModelControls {
 			 * the parent's turn ends and the lifecycle sync disarms it.
 			 */
 			ultracodeRestoreLevel?: ConfiguredThinkingLevel;
+			/**
+			 * The ceiling a session born armed would have had unpinned, applied when its pin hands back.
+			 * `null` = no ceiling; `undefined` = unknown (legacy transcript): keep the current ceiling.
+			 */
+			ultracodeRestoreCeiling?: Effort | null;
 			serviceTierByFamily?: ServiceTierByFamily;
 		},
 	) {
@@ -112,7 +134,21 @@ export class ModelControls {
 		this.#thinkingLevelCeiling = options.thinkingLevelCeiling;
 		// Only meaningful for a session born armed: `#levelBeforeUltracode` set
 		// means "a pin is borrowed", so an unarmed session must never carry one.
-		this.#levelBeforeUltracode = cfgUltracode.get(host.settings) ? options.ultracodeRestoreLevel : undefined;
+		const bornArmed = cfgUltracode.get(host.settings);
+		this.#ultracodeRestoreCeiling = bornArmed ? options.ultracodeRestoreCeiling : undefined;
+		// A session born AT the pin with no hand-back level (a level-less agent
+		// definition, a legacy transcript, an auxiliary spawn) would otherwise keep
+		// the borrowed xhigh as its own level once disarmed. Fall back to what it
+		// would have started at unpinned. Born armed but NOT at the pin (a root
+		// whose flag was persisted by hand) was never pinned: no hand-back.
+		this.#levelBeforeUltracode = !bornArmed
+			? undefined
+			: (options.ultracodeRestoreLevel ??
+				(options.thinkingLevel === Effort.XHigh
+					? (this.#model?.thinking?.defaultLevel ??
+						parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(host.settings)) ??
+						ThinkingLevel.Off)
+					: undefined));
 		if (options.thinkingLevel === AUTO_THINKING) {
 			// Keep auto pending until the first turn while exposing a valid wire effort.
 			this.#autoThinking = true;
@@ -208,6 +244,8 @@ export class ModelControls {
 						clampThinkingLevelToCeiling(this.#model, level, this.#thinkingLevelCeiling),
 					);
 		this.#applyThinkingLevelToAgent(this.#thinkingLevel);
+		// The restored transcript's receipt is what it is; nothing this instance wrote applies to it.
+		this.#divergentReceipt = undefined;
 	}
 
 	/** Restores an exact thinking snapshot after a failed session switch. */
@@ -327,6 +365,10 @@ export class ModelControls {
 		// configured defaultLevel; otherwise re-clamp the current level (or auto).
 		if (thinkingLevel !== undefined) {
 			this.setThinkingLevel(thinkingLevel);
+			// An internal swap that carries its own level (prewalk hand-off,
+			// plan-yolo, deferred plan-model switch) is where the session would be
+			// without the keyword, so an armed turn hands back to it.
+			this.rebaseUltracodeRestore();
 		} else {
 			this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
 		}
@@ -583,6 +625,7 @@ export class ModelControls {
 			const isChanging = !wasAuto || previousLevel !== provisional;
 			if (isChanging) {
 				this.#host.sessionManager.appendThinkingLevelChange(provisional, AUTO_THINKING);
+				this.#divergentReceipt = undefined;
 				this.#host.emit({ type: "thinking_level_changed", thinkingLevel: provisional, configured: AUTO_THINKING });
 			}
 			return;
@@ -599,13 +642,19 @@ export class ModelControls {
 		// auto resolved to medium, then the user pins medium): otherwise the latest
 		// session entry keeps `configured: "auto"` and resume re-enables auto.
 		const isChanging = wasAuto || effectiveLevel !== this.#thinkingLevel;
+		// The same holds for a receipt: picking the level an ultracode pin is
+		// holding must replace the pin's borrowed-FROM receipt, or a resume
+		// discards the pick. The wire request is unchanged, so only the record is.
+		const receipt = configuredReceipt ?? effectiveLevel;
+		const receiptChanging = this.#divergentReceipt !== undefined && receipt !== this.#divergentReceipt;
 
 		this.#thinkingLevel = effectiveLevel;
 		this.#applyThinkingLevelToAgent(effectiveLevel);
 
-		if (isChanging) {
-			this.#host.clearInheritedProviderPromptCacheKey();
-			this.#host.sessionManager.appendThinkingLevelChange(effectiveLevel, configuredReceipt ?? effectiveLevel);
+		if (isChanging || receiptChanging) {
+			if (isChanging) this.#host.clearInheritedProviderPromptCacheKey();
+			this.#host.sessionManager.appendThinkingLevelChange(effectiveLevel, receipt);
+			this.#divergentReceipt = receipt !== effectiveLevel ? receipt : undefined;
 			if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
 				cfgDefaultThinkingLevel.set(this.#host.settings, effectiveLevel);
 			}
@@ -647,6 +696,13 @@ export class ModelControls {
 	 * @returns New selector, or undefined if model doesn't support thinking
 	 */
 	cycleThinkingLevel(): ConfiguredThinkingLevel | undefined {
+		// Reaching for the effort control mid-ultracode-turn is an explicit choice:
+		// keep it, and drop the restore that would otherwise overwrite it when the
+		// turn ends. First, so a session born armed lists its unpinned selectors
+		// (the off-ramp lifts the pin's xhigh ceiling): cycling on from the pinned
+		// xhigh must reach max, not wrap to off. A no-op on an unarmed session.
+		this.forgetUltracodeRestore();
+		if (cfgUltracode.get(this.#host.settings)) cfgUltracode.override(this.#host.settings, false);
 		const levels = this.getAvailableEffortSelectors();
 		if (levels.length === 0) return undefined;
 		const configured = this.configuredThinkingLevel();
@@ -656,11 +712,6 @@ export class ModelControls {
 		const nextLevel = levels[nextIndex];
 		if (!nextLevel) return undefined;
 
-		// Reaching for the effort control mid-ultracode-turn is an explicit choice:
-		// keep it, and drop the restore that would otherwise overwrite it when the
-		// turn ends.
-		this.forgetUltracodeRestore();
-		if (cfgUltracode.get(this.#host.settings)) cfgUltracode.override(this.#host.settings, false);
 		this.setThinkingLevel(nextLevel);
 		return nextLevel;
 	}
@@ -771,19 +822,52 @@ export class ModelControls {
 	}
 
 	/**
+	 * Make the level just applied the pending hand-back. Capture-once keeps a
+	 * re-pin from overwriting the saved level with xhigh, but an internal swap
+	 * that applies a level of its own (an explicit-level temporary swap, the
+	 * retry-fallback primary restore) moves where the session would be without
+	 * the keyword, so the turn must hand back to THAT. Call it after the level
+	 * lands and before the re-pin, which then writes it as the receipt. A no-op
+	 * when nothing is pending, so unarmed sessions are untouched.
+	 */
+	rebaseUltracodeRestore(): void {
+		if (this.#levelBeforeUltracode === undefined) return;
+		this.#levelBeforeUltracode = this.configuredThinkingLevel() ?? ThinkingLevel.Off;
+	}
+
+	/**
 	 * Hand back the level {@link beginUltracodeTurn} borrowed, restoring `auto`
 	 * when that is what was running before. A no-op when the keyword never fired,
-	 * so ordinary turns cost nothing.
+	 * so ordinary turns cost nothing. A session born armed also gets back the
+	 * ceiling it would have had unpinned, before the level is re-clamped to it.
 	 */
 	endUltracodeTurn(): void {
+		this.#applyUltracodeRestoreCeiling();
 		const previous = this.#levelBeforeUltracode;
 		if (previous === undefined) return;
 		this.#levelBeforeUltracode = undefined;
 		this.setThinkingLevel(previous);
 	}
 
-	/** Forget the pending restore, leaving the current level alone. */
+	/**
+	 * Swap a born-armed session's spawn-time pin ceiling (xhigh) for the one it
+	 * would have had unpinned, once. `null` lifts the ceiling entirely.
+	 */
+	#applyUltracodeRestoreCeiling(): void {
+		const ceiling = this.#ultracodeRestoreCeiling;
+		if (ceiling === undefined) return;
+		this.#ultracodeRestoreCeiling = undefined;
+		this.#thinkingLevelCeiling = ceiling ?? undefined;
+	}
+
+	/**
+	 * Forget the pending restore, leaving the current level alone. The user's
+	 * off-ramps call this right before applying the level they picked, so a
+	 * session born armed gets its unpinned ceiling back first: an explicit
+	 * `/effort max` must not be clamped to the pin's xhigh ceiling.
+	 */
 	forgetUltracodeRestore(): void {
+		this.#applyUltracodeRestoreCeiling();
 		this.#levelBeforeUltracode = undefined;
 	}
 

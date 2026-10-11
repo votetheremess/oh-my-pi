@@ -49,6 +49,26 @@ async function persistAgentTombstone(sessionFile: string): Promise<void> {
 }
 
 /**
+ * The nearest LIVE ancestor's flag, walking through session-less parked refs;
+ * the child's own stamp when no ancestor in `registry` is live.
+ */
+function nearestLiveAncestorArmed(
+	id: string,
+	firstParentId: string,
+	session: AgentSession,
+	registry: AgentRegistry,
+): boolean {
+	const seen = new Set<string>([id]);
+	for (let parentId: string | undefined = firstParentId; parentId && !seen.has(parentId);) {
+		seen.add(parentId);
+		const parent = registry.get(parentId);
+		if (parent?.session) return cfgUltracode.get(parent.session.settings);
+		parentId = parent?.parentId;
+	}
+	return cfgUltracode.get(session.settings);
+}
+
+/**
  * Re-derive a child's ultracode state at a resume boundary (follow-up turn,
  * lifecycle revive, hub wake). The `ultracode` flag a task child carries is
  * stamped BY VALUE onto its settings overlay at spawn, so left alone it would keep flooring the
@@ -72,23 +92,22 @@ async function persistAgentTombstone(sessionFile: string): Promise<void> {
  * the child's own stamp — seeded from the persisted `session_init.ultracode`
  * on a cold revive — stands as the fallback.
  *
+ * `armedAtRequest`, when given, replaces the ancestor walk: a queued fan-out
+ * follow-up (workpool batch) was requested under a known arm state, and the
+ * worker mirrors THAT state, not whatever the root reads when the batch starts.
+ *
  * Root/main sessions (no parent) are untouched: their arm/disarm is owned by
  * the user turn itself.
  */
-export function syncChildUltracodeAtResume(id: string, session: AgentSession, registry: AgentRegistry): void {
+export function syncChildUltracodeAtResume(
+	id: string,
+	session: AgentSession,
+	registry: AgentRegistry,
+	armedAtRequest?: boolean,
+): void {
 	const ref = registry.get(id);
 	if (!ref?.parentId) return;
-	let armed = cfgUltracode.get(session.settings);
-	const seen = new Set<string>([id]);
-	for (let parentId: string | undefined = ref.parentId; parentId && !seen.has(parentId);) {
-		seen.add(parentId);
-		const parent = registry.get(parentId);
-		if (parent?.session) {
-			armed = cfgUltracode.get(parent.session.settings);
-			break;
-		}
-		parentId = parent?.parentId;
-	}
+	const armed = armedAtRequest ?? nearestLiveAncestorArmed(id, ref.parentId, session, registry);
 	if (!armed) {
 		if (cfgUltracode.get(session.settings)) session.disarmUltracodeTurn();
 		return;

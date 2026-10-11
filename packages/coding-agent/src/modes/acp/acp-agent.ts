@@ -59,6 +59,7 @@ import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibili
 import { MCPManager } from "../../mcp/manager";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
+import { cfgUltracode } from "../settings";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
@@ -1869,6 +1870,11 @@ export class AcpAgent implements Agent {
 		}
 		if (modeId === ACP_PLAN_MODE_ID) {
 			const previous = session.getPlanModeState();
+			// Entering plan mode is the client user's choice: like the TUI's
+			// #enterPlanMode it ends an armed ultracode turn (pin and subagent
+			// floor). Re-selecting plan while already in it is not an entry, and
+			// an unarmed session takes upstream's path untouched.
+			if (!previous?.enabled && cfgUltracode.get(session.settings)) session.disarmUltracodeTurn();
 			session.setPlanModeState({
 				enabled: true,
 				planFilePath: previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL,

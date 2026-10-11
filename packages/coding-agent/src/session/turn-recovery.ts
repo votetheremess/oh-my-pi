@@ -247,6 +247,14 @@ export interface TurnRecoveryHost {
 	 * builds a bare literal) keep compiling without fork edits; absent = never pinned.
 	 */
 	repinUltracodeIfArmed?(): boolean;
+	/**
+	 * Make the level just applied the armed turn's pending hand-back
+	 * (`ModelControls.rebaseUltracodeRestore`); a no-op when nothing is pending.
+	 * The primary restore calls it so a revert that lands mid-turn hands back
+	 * the user's original level, not the fallback's. Optional for the same
+	 * reason as {@link repinUltracodeIfArmed}; absent = never pinned.
+	 */
+	rebaseUltracodeRestore?(): void;
 	/** Hard per-session effort ceiling; fallback recovery must never raise thinking above it. */
 	thinkingLevelCeiling(): Effort | undefined;
 	/** User-visible notice; optional so bare host fixtures keep compiling (absent = log only). */
@@ -422,6 +430,8 @@ export class TurnRecovery {
 	#fallbackChainsValidated = false;
 	/** Prompt generation that already received the "ultracode refused every fallback" notice. */
 	#ultracodeRefusalNoticedGeneration: number | undefined;
+	/** Prompt generation that already received the "ultracode deferred the primary restore" notice. */
+	#ultracodeDeferredRevertNoticedGeneration: number | undefined;
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -2292,6 +2302,23 @@ export class TurnRecovery {
 		);
 	}
 
+	/**
+	 * Tell the user ONCE per turn that the cooldown revert to the primary is
+	 * deferred: the primary has no xhigh rung, so the armed turn stays on the
+	 * fallback (pinned at xhigh) and the revert runs on the next unarmed turn.
+	 * Keyed on the prompt generation: a turn's auto-continue retries the revert.
+	 */
+	#noticeUltracodeDeferredRevert(fallback: Model, primary: Model): void {
+		const generation = this.#host.promptGeneration();
+		if (this.#ultracodeDeferredRevertNoticedGeneration === generation) return;
+		this.#ultracodeDeferredRevertNoticedGeneration = generation;
+		this.#host.emitNotice?.(
+			"warning",
+			`ultracode: primary restore deferred — ${primary.provider}/${primary.id} lacks an xhigh rung (${getSupportedEfforts(primary).join(", ")}); this turn stays on ${fallback.provider}/${fallback.id} and the primary returns once the ultracode turn ends`,
+			"ultracode",
+		);
+	}
+
 	/** Fail-closed read of the user-owned level: hosts without the ultracode member never pinned. */
 	#userConfiguredThinkingLevel(): ConfiguredThinkingLevel | undefined {
 		return this.#host.userConfiguredThinkingLevel
@@ -2567,17 +2594,25 @@ export class TurnRecovery {
 		if (!primaryModel) return false;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
 		if (!apiKey) return false;
+		// Same admit rule as every fallback swap: an armed turn reverts only onto
+		// a primary that can pin exactly xhigh. One that cannot would carry the
+		// turn on below xhigh under the ultracode name, so the revert waits for
+		// an unarmed turn and the fallback keeps serving this one at xhigh.
+		if (!this.#ultracodeAdmitsFallback(primaryModel)) {
+			this.#noticeUltracodeDeferredRevert(currentModel, primaryModel);
+			return false;
+		}
 
-		// Compare the LIVE level against what the fallback applied to tell "user
-		// changed effort since" from "still on the fallback's level", but apply the
-		// USER-owned level either way: under an armed turn the live level is the
+		// Compare the USER-owned level against what the fallback applied to tell
+		// "user changed effort since" from "still on the fallback's level", and
+		// apply that level either way: under an armed turn the live level is the
 		// borrowed xhigh, and handing that to `setThinkingLevel` would persist the
 		// pin as the session's configured level (the re-pin below restores xhigh).
-		const currentThinkingLevel = this.#host.configuredThinkingLevel();
+		// The live pin would never match a `:level` fallback's applied level, so
+		// it would hand that level back as the user's forever.
+		const currentThinkingLevel = this.#userConfiguredThinkingLevel();
 		const thinkingToApply =
-			currentThinkingLevel === lastAppliedFallbackThinkingLevel
-				? originalThinkingLevel
-				: this.#userConfiguredThinkingLevel();
+			currentThinkingLevel === lastAppliedFallbackThinkingLevel ? originalThinkingLevel : currentThinkingLevel;
 		const primarySelector = formatModelStringWithRouting(primaryModel);
 		const previousEditMode = this.#host.resolveActiveEditMode();
 		// Clear before the swap: `setModelWithProviderSessionReset` and
@@ -2589,10 +2624,12 @@ export class TurnRecovery {
 		this.#host.sessionManager.appendModelChange(primarySelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(primarySelector);
 		this.#host.setThinkingLevel(thinkingToApply);
+		// While armed, the restored level is what the turn hands back: an arm
+		// taken on the fallback captured the fallback's level as the user's.
+		this.#host.rebaseUltracodeRestore?.();
 		// Re-pin exactly xhigh on the restored primary while the turn is still
-		// armed; a no-op once the turn has ended, and a primary that cannot pin
-		// (armed while already on a fallback) simply keeps `thinkingToApply`.
-		// Must precede the resync so the system prompt sees the pinned level.
+		// armed (admitted above); a no-op once the turn has ended. Must precede
+		// the resync so the system prompt sees the pinned level.
 		this.#host.repinUltracodeIfArmed?.();
 		await this.#host.syncAfterModelChange(previousEditMode);
 		return true;

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+	Effort,
 	ImageContent,
 	Message,
 	MessageAttribution,
@@ -3470,6 +3471,7 @@ export class SessionManager {
 		workPoolYieldItems?: WorkPoolYieldItem[];
 		ultracode?: boolean;
 		ultracodeRestoreLevel?: ConfiguredThinkingLevel;
+		ultracodeRestoreCeiling?: Effort | null;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -4366,6 +4368,7 @@ export interface PersistedSessionInit {
 	workPoolYieldItems?: WorkPoolYieldItem[];
 	ultracode?: boolean;
 	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
+	ultracodeRestoreCeiling?: Effort | null;
 }
 
 /**
@@ -4395,11 +4398,14 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			...(entry.compactionThreshold !== undefined ? { compactionThreshold: entry.compactionThreshold } : undefined),
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
 			// Carried on every extract so upstream's session_init re-record (base-prompt or
-			// work-pool change) keeps the persisted ultracode pin and its restore level for
-			// cold revive, which reads the latest entry.
+			// work-pool change) keeps the persisted ultracode pin, its restore level and its
+			// restore ceiling for cold revive, which reads the latest entry.
 			...(entry.ultracode !== undefined ? { ultracode: entry.ultracode } : undefined),
 			...(entry.ultracodeRestoreLevel !== undefined
 				? { ultracodeRestoreLevel: entry.ultracodeRestoreLevel }
+				: undefined),
+			...(entry.ultracodeRestoreCeiling !== undefined
+				? { ultracodeRestoreCeiling: entry.ultracodeRestoreCeiling }
 				: undefined),
 		};
 	}

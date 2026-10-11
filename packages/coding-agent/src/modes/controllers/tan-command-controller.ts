@@ -85,10 +85,14 @@ export class TanCommandController {
 		// front when the model has no xhigh rung — never clamped. Outside ultracode
 		// the parent's configured level carries over unchanged. The restore level is
 		// the USER's own (never the borrowed pin): a disarm hands the clone back
-		// to it instead of leaving xhigh behind as its own choice. The flag is read
-		// once here, at dispatch, and reused for the stamp and the persisted
-		// session_init, so a parent disarm before the background job runs cannot
-		// split the clone's pin from its record.
+		// to it instead of leaving xhigh behind as its own choice, under no
+		// ceiling (the clone has none unpinned). The flag is read once here, at
+		// dispatch, and reused for the stamp, the pin and the persisted
+		// session_init. The work prompt below is the clone's spawn assignment, not
+		// a resume boundary, so a parent arm or disarm before the background job
+		// prompts cannot re-mirror the clone and split its first turn from that
+		// record either. Prompts the user later types into the focused clone are
+		// resume boundaries and do mirror the parent's state at that time.
 		const ultracodeArmed = cfgUltracode.get(this.ctx.settings);
 		const ultracodeEffortLevel = ultracodeArmed ? ultracodeEffortFor(model) : undefined;
 		if (ultracodeArmed && ultracodeEffortLevel === undefined) {
@@ -102,6 +106,7 @@ export class TanCommandController {
 		const thinkingLevel = ultracodeEffortLevel ?? session.configuredThinkingLevel();
 		const ultracodeRestoreLevel =
 			ultracodeEffortLevel !== undefined ? session.userConfiguredThinkingLevel() : undefined;
+		const ultracodeRestoreCeiling = ultracodeEffortLevel !== undefined ? null : undefined;
 		const systemPrompt = [...session.systemPrompt];
 		const toolNames = session.getEnabledToolNames();
 		const modelRegistry = session.modelRegistry;
@@ -182,6 +187,7 @@ export class TanCommandController {
 								thinkingLevel,
 								thinkingLevelCeiling: ultracodeEffortLevel,
 								ultracodeRestoreLevel,
+								ultracodeRestoreCeiling,
 								systemPrompt,
 								toolNames,
 								providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
@@ -224,6 +230,7 @@ export class TanCommandController {
 							// the pin and its hand-back.
 							ultracode: ultracodeArmed || undefined,
 							ultracodeRestoreLevel,
+							ultracodeRestoreCeiling,
 						});
 						const abortClone = () => {
 							void clone?.abort();
@@ -291,11 +298,14 @@ export class TanCommandController {
 							// it is a tangential fork — its parent owns the prior conversation;
 							// this agent must focus exclusively on the user's request.
 							injectContextSwitch();
-							// The work text was typed by the user, so it is a user turn: it
-							// scans for magic keywords like any other. It cannot flip the
-							// ultracode state — the clone is a child kind (parentTaskPrefix),
-							// and children only ever re-pin the flag they inherited.
-							await clone.prompt(trimmedWork, { attribution: "user" });
+							// The work text was typed by the user, so it is a user turn and
+							// scans for magic keywords like any other. It is the clone's spawn
+							// assignment, not a resume boundary: a child kind (parentTaskPrefix)
+							// never arms or disarms from its own text, and `spawnAssignment`
+							// keeps the state fixed at dispatch instead of re-mirroring the
+							// parent now. A prompt the user later types into the focused clone
+							// is a resume boundary and does mirror the parent.
+							await clone.prompt(trimmedWork, { attribution: "user", spawnAssignment: true });
 							await clone.waitForIdle();
 							while (clone.hasPendingAsyncWork()) {
 								if (signal.aborted) throw new Error("Aborted while settling descendant work");

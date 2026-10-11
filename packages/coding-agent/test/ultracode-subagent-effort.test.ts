@@ -15,6 +15,7 @@
  * `UltracodeEffortError` (see `ultracodeEffortFor` in packages/tui/src/thinking.ts) before
  * any session exists, instead of quietly running at a substitute level.
  */
+import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -22,31 +23,53 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { all } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runEvalAgent } from "@oh-my-pi/pi-coding-agent/eval/agent-bridge";
+import { cfgEvalWorkpoolFreshAgents } from "@oh-my-pi/pi-coding-agent/eval/settings";
 import { runEvalWorkpool } from "@oh-my-pi/pi-coding-agent/eval/workpool-bridge";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { cfgUltracode } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { AgentLifecycleManager, syncChildUltracodeAtResume } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { type AgentRef, AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { cfgCompactionMidTurnEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
-import { extractSessionInit, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	extractSessionInit,
+	type PersistedSessionInit,
+	SessionManager,
+} from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
-import { createIsolatedSettings, createSubagentSettings, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import { cfgTaskMaxConcurrency } from "@oh-my-pi/pi-coding-agent/task/settings";
+import {
+	createIsolatedSettings,
+	createSubagentSettings,
+	runSubagentFollowUpTurn,
+	runSubprocess,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
+import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
+import { cfgTaskBatch, cfgTaskMaxConcurrency } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { WorkPoolRegistry } from "@oh-my-pi/pi-coding-agent/task/workpool";
 import type { WorkPoolYieldItem } from "@oh-my-pi/pi-coding-agent/task/workpool-yield";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { cfgToolsApprovalMode } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import { cfgAsyncEnabled, cfgToolsApprovalMode } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { AUTO_THINKING, type ConfiguredThinkingLevel, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import {
+	AUTO_THINKING,
+	type ConfiguredThinkingLevel,
+	type TaskEffort,
+	UltracodeEffortError,
+} from "@oh-my-pi/pi-tui/thinking";
+import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 function modelOrThrow(provider: Parameters<typeof getBundledModel>[0], id: string): Model {
 	const model = getBundledModel(provider, id);
@@ -76,13 +99,21 @@ const PREWALK_TARGET = {
 	provider: "mock",
 	id: "mock-prewalk-target",
 } as Model;
+/** FULL_LADDER plus a catalog `thinking.defaultLevel`, which the SDK picks for a level-less spawn. */
+const DEFAULTS_TO_LOW = {
+	...FULL_LADDER,
+	provider: "mock",
+	id: "mock-defaults-to-low",
+	thinking: { ...FULL_LADDER.thinking, defaultLevel: Effort.Low },
+} as Model;
 
 /**
  * Yields on the first prompt so `runSubprocess` completes without a real loop.
  * `settings` is what `createAgentSession` was handed: the real session owns
- * exactly that object, and the disposers registered on it read it back.
+ * exactly that object, and the disposers registered on it read it back. Every
+ * `session_init` the executor persists lands in `inits` when one is given.
  */
-function yieldEmittingSession(settings: Settings | undefined): AgentSession {
+function yieldEmittingSession(settings: Settings | undefined, inits?: SessionInitRecord[]): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const disposers: Array<() => void> = [];
 	let workPoolYieldItems: readonly WorkPoolYieldItem[] = [];
@@ -92,7 +123,12 @@ function yieldEmittingSession(settings: Settings | undefined): AgentSession {
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		sessionManager: {
+			appendSessionInit: (init: SessionInitRecord) => {
+				inits?.push(init);
+				return "session-init";
+			},
+		},
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
@@ -162,15 +198,23 @@ function yieldEmittingSession(settings: Settings | undefined): AgentSession {
 		setWorkPoolYieldItems: async (items: readonly WorkPoolYieldItem[]) => {
 			workPoolYieldItems = items;
 		},
+		// A kept-alive child's follow-up turn (`runSubagentFollowUpTurn`) waits out a running
+		// turn before installing its pooled yield contract and resets the reused yield tool.
+		// Real signatures: `get isStreaming(): boolean`, `getToolByName(name): AgentTool | undefined`.
+		isStreaming: false,
+		getToolByName: (_name: string) => undefined,
 	};
 	return session as unknown as AgentSession;
 }
 
+/** What the executor hands `sessionManager.appendSessionInit` (the persisted spawn contract). */
+type SessionInitRecord = PersistedSessionInit;
+
 /** `createAgentSession` stand-in handing back a yielding session that owns the forwarded settings. */
-function mockCreateAgentSession() {
+function mockCreateAgentSession(inits?: SessionInitRecord[]) {
 	return vi
 		.spyOn(sdkModule, "createAgentSession")
-		.mockImplementation(async options => createSessionResult(yieldEmittingSession(options?.settings)));
+		.mockImplementation(async options => createSessionResult(yieldEmittingSession(options?.settings, inits)));
 }
 
 /** The child's turn flag as the forwarded settings resolve it now; undefined when no settings rode in. */
@@ -231,25 +275,39 @@ interface SpawnOptions {
 	modelSuffix?: Effort;
 	/** Agent-definition `prewalk` frontmatter; the registry then also offers PREWALK_TARGET. */
 	prewalk?: string;
+	/** Agent definition to spawn instead of the level-less `task` stand-in. */
+	agent?: AgentDefinition;
+	/** Model role the agent's `@role` pattern names (default `task`). */
+	role?: string;
+	/** The parent's `defaultThinkingLevel`, stamped onto the child's settings. */
+	defaultThinkingLevel?: ConfiguredThinkingLevel;
 }
 
 async function spawn(options: SpawnOptions) {
-	const settings = Settings.isolated(
-		options.maxEffort === undefined ? undefined : { "task.maxEffort": options.maxEffort },
-	);
+	const settings = Settings.isolated({
+		...(options.maxEffort === undefined ? undefined : { "task.maxEffort": options.maxEffort }),
+		...(options.defaultThinkingLevel === undefined
+			? undefined
+			: { defaultThinkingLevel: options.defaultThinkingLevel }),
+	});
 	if (options.ultracode) cfgUltracode.override(settings, true);
 	const pattern = `${options.model.provider}/${options.model.id}`;
-	settings.setModelRole("task", options.modelSuffix === undefined ? pattern : `${pattern}:${options.modelSuffix}`);
-	const spy = mockCreateAgentSession();
+	settings.setModelRole(
+		options.role ?? "task",
+		options.modelSuffix === undefined ? pattern : `${pattern}:${options.modelSuffix}`,
+	);
+	const inits: SessionInitRecord[] = [];
+	const spy = mockCreateAgentSession(inits);
 	const modelRegistry =
 		options.prewalk === undefined
 			? createModelRegistry(options.model)
 			: createModelRegistry(options.model, PREWALK_TARGET);
 	const hasConfiguredAuth = vi.spyOn(modelRegistry, "hasConfiguredAuth");
+	const agent = options.agent ?? baseAgent;
 
 	const result = await runSubprocess({
 		cwd: "/tmp",
-		agent: options.prewalk === undefined ? baseAgent : { ...baseAgent, prewalk: options.prewalk },
+		agent: options.prewalk === undefined ? agent : { ...agent, prewalk: options.prewalk },
 		task: "do work",
 		index: 0,
 		enableLsp: false,
@@ -260,7 +318,7 @@ async function spawn(options: SpawnOptions) {
 		effort: options.effort,
 	});
 
-	return { result, forwarded: spy.mock.calls[0]?.[0], spy, hasConfiguredAuth, parentSettings: settings };
+	return { result, forwarded: spy.mock.calls[0]?.[0], spy, hasConfiguredAuth, parentSettings: settings, inits };
 }
 
 describe("ultracode subagent effort pin", () => {
@@ -707,6 +765,224 @@ describe("ultracode pin through the real spawn frontends", () => {
 	});
 });
 
+// Queued fan-out decides the floor at REQUEST time. An armed turn pushes more
+// work than `task.maxConcurrency` admits, its turn ends (pool results
+// auto-deliver), and the user's next keyword-free prompt disarms the root while
+// items still wait for a slot: those items were requested armed and must spawn
+// (or continue) pinned — and the reverse for an unarmed request the root armed
+// after. Each drives the real frontend → runStructuredSubagent → runSubprocess
+// (and runSubagentFollowUpTurn for a reused worker) path; only the SDK is faked.
+interface CreatedChild {
+	options: CreateAgentSessionOptions;
+	/** The child's own turn flag when the SDK built it. */
+	flagAtCreate: boolean;
+	log: string[];
+}
+
+/** Drains pending microtasks until an in-memory condition holds (no I/O in between). */
+async function untilSettled(predicate: () => boolean, what: string): Promise<void> {
+	for (let attempt = 0; attempt < 1_000; attempt++) {
+		if (predicate()) return;
+		await Promise.resolve();
+	}
+	throw new Error(`Never observed ${what}`);
+}
+
+describe("queued fan-out follows the arm state at request time", () => {
+	const workerIds: string[] = [];
+
+	afterEach(async () => {
+		const lifecycle = AgentLifecycleManager.global();
+		for (const id of workerIds.splice(0)) await lifecycle.release(id);
+		for (const manager of jobManagers) await manager.dispose();
+		jobManagers.clear();
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+		WorkPoolRegistry.resetForTests();
+		vi.restoreAllMocks();
+	});
+
+	/**
+	 * A root admitting one spawn at a time, registered as the live `Main` the resume sync
+	 * mirrors, whose SDK builds kept-alive children registered under their parent like the
+	 * real one does. The first child's prompts wait on `release` (a worker busy on its first
+	 * batch), so later requests queue behind it. `created(n)` settles once n children exist.
+	 */
+	function queuedRoot(options: { armed: boolean; freshAgents?: boolean }) {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [baseAgent], projectAgentsDir: null });
+		const session = frontendToolSession({ model: FULL_LADDER, ultracode: options.armed });
+		cfgTaskMaxConcurrency.override(session.settings, 1);
+		cfgEvalWorkpoolFreshAgents.override(session.settings, options.freshAgents ?? false);
+		AgentRegistry.global().register({
+			id: "Main",
+			displayName: "Main",
+			kind: "main",
+			status: "running",
+			session: { settings: session.settings, emitIrcRelayObservation: () => {} } as unknown as AgentSession,
+		});
+		const busy = Promise.withResolvers<void>();
+		const children: CreatedChild[] = [];
+		const waiters: Array<{ count: number; resolve: () => void }> = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options?.settings || !options.agentId) throw new Error("Expected settings and an agent id to ride in");
+			const log: string[] = [];
+			const child = keptAliveSession(options, log, children.length === 0 ? busy.promise : undefined);
+			children.push({ options, flagAtCreate: cfgUltracode.get(options.settings), log });
+			workerIds.push(options.agentId);
+			AgentRegistry.global().register({
+				id: options.agentId,
+				displayName: options.agentId,
+				kind: "sub",
+				parentId: options.parentAgentId,
+				session: child,
+				sessionFile: options.sessionManager?.getSessionFile() ?? null,
+				status: "running",
+			});
+			for (const waiter of waiters) if (children.length >= waiter.count) waiter.resolve();
+			return createSessionResult(child);
+		});
+		const created = (count: number): Promise<void> => {
+			if (children.length >= count) return Promise.resolve();
+			const { promise, resolve } = Promise.withResolvers<void>();
+			waiters.push({ count, resolve });
+			return promise;
+		};
+		return { session, children, created, release: () => busy.resolve() };
+	}
+
+	it("spawns a fresh-agent item pushed while armed pinned, though the root disarmed before it started", async () => {
+		const { session, children, created, release } = queuedRoot({ armed: true, freshAgents: true });
+		await runEvalWorkpool({ op: "create", agent: "task", name: "queued" }, { session });
+		await runEvalWorkpool({ op: "push", name: "queued", items: ["one", "two"] }, { session });
+		await created(1);
+
+		// The armed turn ended; the user's next keyword-free prompt disarms the root.
+		cfgUltracode.override(session.settings, false);
+		release();
+		await settleEvalJob(session, "queued");
+
+		expect(children.map(child => [child.options.thinkingLevel, child.flagAtCreate])).toEqual([
+			[Effort.XHigh, true],
+			[Effort.XHigh, true],
+		]);
+		expect(await runEvalWorkpool({ op: "status", name: "queued" }, { session })).toMatchObject({
+			items: { completed: 2, failed: 0 },
+		});
+	});
+
+	it("spawns a fresh-agent item pushed while unarmed unpinned, though the root armed before it started", async () => {
+		const { session, children, created, release } = queuedRoot({ armed: false, freshAgents: true });
+		await runEvalWorkpool({ op: "create", agent: "task", name: "queued" }, { session });
+		await runEvalWorkpool({ op: "push", name: "queued", items: ["one", "two"] }, { session });
+		await created(1);
+
+		cfgUltracode.override(session.settings, true);
+		release();
+		await settleEvalJob(session, "queued");
+
+		expect(children.map(child => [child.options.thinkingLevel, child.flagAtCreate])).toEqual([
+			[undefined, false],
+			[undefined, false],
+		]);
+	});
+
+	it("keeps a reused worker pinned for a batch pushed while armed, though the root disarmed before it ran", async () => {
+		const { session, children, created, release } = queuedRoot({ armed: true });
+		await runEvalWorkpool({ op: "create", agent: "task", name: "reused" }, { session });
+		await runEvalWorkpool({ op: "push", name: "reused", items: ["one", "two"] }, { session });
+		await created(1);
+
+		cfgUltracode.override(session.settings, false);
+		release();
+		await settleEvalJob(session, "reused");
+
+		// One worker, two turns: the follow-up batch mirrors its push, not the root's
+		// state when the worker freed up (that would be "disarm", "prompt:false").
+		expect(children).toHaveLength(1);
+		expect(children[0]?.log).toEqual(["prompt:true", "repin", "prompt:true"]);
+		expect(await runEvalWorkpool({ op: "status", name: "reused" }, { session })).toMatchObject({
+			items: { completed: 2, failed: 0 },
+			batches: 2,
+		});
+	});
+
+	it("never batches items pushed under different arm states into one worker turn", async () => {
+		const { session, children, created, release } = queuedRoot({ armed: true });
+		await runEvalWorkpool({ op: "create", agent: "task", name: "mixed" }, { session });
+		await runEvalWorkpool({ op: "push", name: "mixed", items: ["one"] }, { session });
+		await created(1);
+		await runEvalWorkpool({ op: "push", name: "mixed", items: ["two"] }, { session });
+		cfgUltracode.override(session.settings, false);
+		await runEvalWorkpool({ op: "push", name: "mixed", items: ["three"] }, { session });
+		// Both later items queue on the one busy worker before it is released.
+		const pool = WorkPoolRegistry.global().get("Main", "mixed");
+		await untilSettled(() => pool?.agents[0]?.queue.length === 2, "both items queued on the busy worker");
+
+		release();
+		await settleEvalJob(session, "mixed");
+
+		expect(children).toHaveLength(1);
+		expect(children[0]?.log).toEqual(["prompt:true", "repin", "prompt:true", "disarm", "prompt:false"]);
+		expect(await runEvalWorkpool({ op: "status", name: "mixed" }, { session })).toMatchObject({
+			items: { completed: 3, failed: 0 },
+			batches: 3,
+		});
+	});
+
+	it("pins an eval agent() requested while armed, though the root disarmed before its job reached the spawn", async () => {
+		const { session, children, release } = queuedRoot({ armed: true });
+		release();
+		// agent() preflights once before it returns the handle; the background job's spawn
+		// preflights again. Holding that second discovery holds the job before runSubprocess.
+		const jobPreflightReached = Promise.withResolvers<void>();
+		const jobPreflight = Promise.withResolvers<void>();
+		let discoveries = 0;
+		vi.spyOn(discoveryModule, "discoverAgents").mockImplementation(async () => {
+			discoveries++;
+			if (discoveries > 1) {
+				jobPreflightReached.resolve();
+				await jobPreflight.promise;
+			}
+			return { agents: [baseAgent], projectAgentsDir: null };
+		});
+
+		const handle = await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+		await jobPreflightReached.promise;
+		cfgUltracode.override(session.settings, false);
+		jobPreflight.resolve();
+		await settleEvalJob(session, handle.id);
+
+		expect(children.map(child => [child.options.agentId, child.options.thinkingLevel, child.flagAtCreate])).toEqual([
+			[handle.id, Effort.XHigh, true],
+		]);
+	});
+
+	it("pins a queued background task spawn requested while armed, though the root disarmed before it got a slot", async () => {
+		const { session, children, created, release } = queuedRoot({ armed: true });
+		cfgAsyncEnabled.override(session.settings, true);
+		cfgTaskBatch.override(session.settings, true);
+		const tool = await TaskTool.create(session);
+
+		await tool.execute("tc-queued", {
+			context: "shared",
+			tasks: [
+				{ name: "One", agent: "task", task: "first" },
+				{ name: "Two", agent: "task", task: "second" },
+			],
+		} as TaskParams);
+		// `task.maxConcurrency` 1: the second spawn waits on the session semaphore.
+		await created(1);
+		cfgUltracode.override(session.settings, false);
+		release();
+		await created(2);
+
+		expect(children.map(child => [child.options.thinkingLevel, child.flagAtCreate])).toEqual([
+			[Effort.XHigh, true],
+			[Effort.XHigh, true],
+		]);
+	});
+});
+
 // The grandchild middle link. The pin tests above prove the parent's flag pins
 // the CHILD's level, and agent-session-magic-keywords proves an armed child
 // keeps an inherited flag through its agent-authored turn — but only the
@@ -803,18 +1079,119 @@ describe("ultracode restore level rides into the child", () => {
 		expect(forwarded?.ultracodeRestoreLevel).toBe(AUTO_THINKING);
 	});
 
-	it("forwards no restore level while ultracode is off", async () => {
-		// Control: outside an armed turn nothing is borrowed, so seeding a
-		// handback would make the child's first disarm rewrite a level it owns.
-		const { result, forwarded } = await spawn({
-			id: "ultracode-off-no-restore",
+	// A child born armed must never ride with an undefined hand-back: ModelControls
+	// seeds `#levelBeforeUltracode` only from `ultracodeRestoreLevel`, so `undefined`
+	// turns the resume-boundary disarm into a no-op and the borrowed xhigh becomes
+	// the child's own level. Agents with no level of their own (a user agent without
+	// `thinkingLevel`, the bundled `reviewer`/`security-reviewer`) hit exactly that.
+	it("hands a level-less agent back to the child's default level and persists the hand-back", async () => {
+		const { result, forwarded, inits } = await spawn({
+			id: "ultracode-restore-levelless",
 			model: FULL_LADDER,
-			thinkingLevel: ThinkingLevel.Medium,
+			ultracode: true,
+			defaultThinkingLevel: ThinkingLevel.Medium,
 		});
 
 		expect(result.exitCode).toBe(0);
-		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		// Unpinned, the SDK picks the model's catalog default (FULL_LADDER has none),
+		// then the child's `defaultThinkingLevel`: the level the pin borrowed from.
+		expect(forwarded?.ultracodeRestoreLevel).toBe(ThinkingLevel.Medium);
+		// No caller `effort`: unpinned, the spawn rides with no ceiling at all.
+		expect(forwarded?.ultracodeRestoreCeiling).toBeNull();
+		// The cold-revive contract carries the same hand-back.
+		expect(inits).toHaveLength(1);
+		expect(inits[0]).toMatchObject({
+			ultracode: true,
+			ultracodeRestoreLevel: ThinkingLevel.Medium,
+			ultracodeRestoreCeiling: null,
+		});
+	});
+
+	it("prefers the model's catalog default level over the settings default for a level-less agent", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-restore-model-default",
+			model: DEFAULTS_TO_LOW,
+			ultracode: true,
+			defaultThinkingLevel: ThinkingLevel.Medium,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.ultracodeRestoreLevel).toBe(Effort.Low);
+	});
+
+	it("hands the bundled reviewer, which pins no level of its own, back below xhigh", async () => {
+		const reviewer = getBundledAgent("reviewer");
+		if (!reviewer) throw new Error("Expected the bundled reviewer agent");
+		// The premise: nothing in the definition names a level for the hand-back.
+		expect(reviewer.thinkingLevel).toBeUndefined();
+		const { result, forwarded } = await spawn({
+			id: "ultracode-restore-reviewer",
+			model: FULL_LADDER,
+			ultracode: true,
+			agent: reviewer,
+			role: "slow",
+			defaultThinkingLevel: ThinkingLevel.Medium,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.ultracodeRestoreLevel).toBe(ThinkingLevel.Medium);
+	});
+
+	it("hands a caller effort back to the level it resolves to unpinned, outranking the agent's level", async () => {
+		const { result, forwarded, inits } = await spawn({
+			id: "ultracode-restore-caller-effort",
+			model: FULL_LADDER,
+			ultracode: true,
+			thinkingLevel: ThinkingLevel.Medium,
+			effort: "lo",
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		// Unpinned, `lo` on a low→max ladder runs at low (effort outranks the agent level)
+		// under `task.maxEffort` (default max) — the pin's xhigh ceiling is borrowed too.
+		expect(forwarded?.ultracodeRestoreLevel).toBe(Effort.Low);
+		expect(forwarded?.ultracodeRestoreCeiling).toBe(Effort.Max);
+		expect(inits[0]).toMatchObject({ ultracodeRestoreLevel: Effort.Low, ultracodeRestoreCeiling: Effort.Max });
+	});
+
+	it("hands a capped caller effort back under task.maxEffort, the ceiling the pin ignored", async () => {
+		const { result, forwarded } = await spawn({
+			id: "ultracode-restore-capped-effort",
+			model: FULL_LADDER,
+			ultracode: true,
+			effort: "hi",
+			maxEffort: Effort.High,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(Effort.XHigh);
+		expect(forwarded?.thinkingLevelCeiling).toBe(Effort.XHigh);
+		expect(forwarded?.ultracodeRestoreLevel).toBe(Effort.High);
+		expect(forwarded?.ultracodeRestoreCeiling).toBe(Effort.High);
+	});
+
+	it("forwards and persists no hand-back while ultracode is off", async () => {
+		// Control: outside an armed turn nothing is borrowed, so seeding a
+		// handback would make the child's first disarm rewrite a level it owns.
+		const { result, forwarded, inits } = await spawn({
+			id: "ultracode-off-no-restore",
+			model: FULL_LADDER,
+			thinkingLevel: ThinkingLevel.Medium,
+			effort: "lo",
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(forwarded?.ultracodeRestoreLevel).toBeUndefined();
+		expect(forwarded?.ultracodeRestoreCeiling).toBeUndefined();
+		expect(inits).toHaveLength(1);
+		expect(inits[0]?.ultracode).toBeUndefined();
+		expect(inits[0]?.ultracodeRestoreLevel).toBeUndefined();
+		expect(inits[0]?.ultracodeRestoreCeiling).toBeUndefined();
 	});
 });
 
@@ -978,8 +1355,14 @@ const REVIVE_PARENT_ID = "ultracode-revive-parent";
  * on disk), closes it on dispose like the real session, and carries the three
  * ultracode members `syncChildUltracodeAtResume` calls. The disarm has the real
  * one's effect on the flag: `override(settings, false)`, never `clearOverride`.
+ * `log` records each sync call and the child's own flag at every prompt, in order;
+ * a `gate` holds every prompt until it resolves (a worker busy on its first batch).
  */
-function keptAliveSession(options: CreateAgentSessionOptions | undefined): AgentSession {
+function keptAliveSession(
+	options: CreateAgentSessionOptions | undefined,
+	log: string[] = [],
+	gate?: Promise<void>,
+): AgentSession {
 	const settings = options?.settings;
 	const sessionManager = options?.sessionManager;
 	if (!settings || !sessionManager) throw new Error("Expected settings and a session manager to ride in");
@@ -988,6 +1371,8 @@ function keptAliveSession(options: CreateAgentSessionOptions | undefined): Agent
 		...base,
 		sessionManager,
 		prompt: async (text: string, promptOptions?: PromptOptions) => {
+			if (gate) await gate;
+			log.push(`prompt:${cfgUltracode.get(settings)}`);
 			sessionManager.appendMessage({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 			sessionManager.appendMessage({
 				role: "assistant",
@@ -1013,11 +1398,15 @@ function keptAliveSession(options: CreateAgentSessionOptions | undefined): Agent
 			await sessionManager.close();
 		},
 		disarmUltracodeTurn: () => {
+			log.push("disarm");
 			if (cfgUltracode.get(settings)) cfgUltracode.override(settings, false);
 		},
 		// FULL_LADDER has an xhigh rung and no ceiling below it: the pin always lands.
 		ultracodePinRefusal: () => undefined,
-		repinUltracodeIfArmed: () => true,
+		repinUltracodeIfArmed: () => {
+			log.push("repin");
+			return true;
+		},
 	};
 	return session as unknown as AgentSession;
 }
@@ -1035,11 +1424,18 @@ describe("ultracode warm revive of a kept-alive child", () => {
 		await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 	});
 
-	/** Spawns a kept-alive medium-level child of a registered parent through the real runSubprocess. */
-	async function spawnKeptAlive(id: string, armed: boolean) {
+	/**
+	 * Spawns a kept-alive child of a registered parent through the real runSubprocess, at
+	 * `thinkingLevel` (default medium; `null` = an agent with no level of its own).
+	 */
+	async function spawnKeptAlive(
+		id: string,
+		armed: boolean,
+		options: { thinkingLevel?: ConfiguredThinkingLevel | null; effort?: TaskEffort } = {},
+	) {
 		const dir = TempDir.createSync("@pi-ultracode-warm-revive-");
 		tempDirs.push(dir);
-		const parentSettings = Settings.isolated();
+		const parentSettings = Settings.isolated({ defaultThinkingLevel: ThinkingLevel.Low });
 		cfgUltracode.override(parentSettings, armed);
 		parentSettings.setModelRole("task", `${FULL_LADDER.provider}/${FULL_LADDER.id}`);
 		// The resume sync mirrors the nearest live ancestor's flag: exactly its `settings`.
@@ -1050,8 +1446,9 @@ describe("ultracode warm revive of a kept-alive child", () => {
 			session: { settings: parentSettings } as unknown as AgentSession,
 		});
 		let child: AgentSession | undefined;
+		const log: string[] = [];
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
-			child = keptAliveSession(options);
+			child = keptAliveSession(options, log);
 			// The SDK registers a spawned child under its parent, which keeps it live after it yields.
 			AgentRegistry.global().register({
 				id,
@@ -1075,7 +1472,8 @@ describe("ultracode warm revive of a kept-alive child", () => {
 			id,
 			settings: parentSettings,
 			modelRegistry: createModelRegistry(FULL_LADDER),
-			thinkingLevel: ThinkingLevel.Medium,
+			thinkingLevel: options.thinkingLevel === null ? undefined : (options.thinkingLevel ?? ThinkingLevel.Medium),
+			effort: options.effort,
 			artifactsDir: dir.path(),
 			keepAlive: true,
 			parentAgentId: REVIVE_PARENT_ID,
@@ -1083,7 +1481,9 @@ describe("ultracode warm revive of a kept-alive child", () => {
 		expect(result.exitCode).toBe(0);
 		if (!child) throw new Error("Expected the spawn to create a session");
 		expect(AgentLifecycleManager.global().has(id)).toBe(true);
-		return { child, spawned: spy.mock.calls[0]?.[0], parentSettings };
+		// Only what happens after the spawn's own first prompt matters to the callers.
+		log.length = 0;
+		return { child, spawned: spy.mock.calls[0]?.[0], parentSettings, log };
 	}
 
 	/** Parks the child, then warm-revives it through the lifecycle, capturing what the reviver forwards. */
@@ -1151,23 +1551,115 @@ describe("ultracode warm revive of a kept-alive child", () => {
 		expect(revived.options.thinkingLevel).toBe(ThinkingLevel.Medium);
 		expect(revived.options.ultracodeRestoreLevel).toBeUndefined();
 	});
+
+	it("revives a level-less child disarmed at a resume boundary at its unpinned default, not xhigh", async () => {
+		// The child has no level of its own: without a computed hand-back the reviver
+		// cannot tell it was disarmed since the pin and brings it back at the spec's xhigh.
+		const id = "ultracode-warm-revive-levelless";
+		const { child, spawned, parentSettings } = await spawnKeptAlive(id, true, { thinkingLevel: null });
+		expect(spawned?.thinkingLevel).toBe(Effort.XHigh);
+		expect(spawned?.ultracodeRestoreLevel).toBe(ThinkingLevel.Low);
+
+		cfgUltracode.override(parentSettings, false);
+		syncChildUltracodeAtResume(id, child, AgentRegistry.global());
+		expect(childFlag(child.settings)).toBe(false);
+
+		const revived = await parkAndRevive(id);
+		expect(revived.flagAtCreate).toBe(false);
+		expect(revived.options.thinkingLevel).toBe(ThinkingLevel.Low);
+		// No caller effort: the unpinned spawn had no ceiling, so neither does the revive.
+		expect(revived.options.thinkingLevelCeiling).toBeUndefined();
+	});
+
+	it("revives a disarmed child under the ceiling it had unpinned, not the pin's xhigh", async () => {
+		const id = "ultracode-warm-revive-ceiling";
+		const { child, spawned, parentSettings } = await spawnKeptAlive(id, true, { effort: "lo" });
+		expect(spawned?.thinkingLevelCeiling).toBe(Effort.XHigh);
+		expect(spawned?.ultracodeRestoreCeiling).toBe(Effort.Max);
+
+		cfgUltracode.override(parentSettings, false);
+		syncChildUltracodeAtResume(id, child, AgentRegistry.global());
+
+		const revived = await parkAndRevive(id);
+		expect(revived.options.thinkingLevel).toBe(Effort.Low);
+		expect(revived.options.thinkingLevelCeiling).toBe(Effort.Max);
+	});
+
+	// runSubagentFollowUpTurn is the resume boundary of a LIVE kept-alive child
+	// (workpool worker reuse, vibe): ensureLive hands back the live session without
+	// the lifecycle's revive-time sync, so the follow-up's own sync is the only
+	// thing that mirrors the parent before the child's next prompt.
+	it("hands a pinned child back before its follow-up prompt once the parent disarmed", async () => {
+		const id = "ultracode-followup-disarm";
+		const { child, parentSettings, log } = await spawnKeptAlive(id, true);
+		cfgUltracode.override(parentSettings, false);
+		expect(childFlag(child.settings)).toBe(true);
+
+		const turn = await runSubagentFollowUpTurn({ id, agent: baseAgent, message: "follow up" });
+
+		expect(turn.exitCode).toBe(0);
+		expect(log).toEqual(["disarm", "prompt:false"]);
+	});
+
+	it("re-pins an unpinned child before its follow-up prompt once the parent armed", async () => {
+		const id = "ultracode-followup-repin";
+		const { parentSettings, log } = await spawnKeptAlive(id, false);
+		cfgUltracode.override(parentSettings, true);
+
+		const turn = await runSubagentFollowUpTurn({ id, agent: baseAgent, message: "follow up" });
+
+		expect(turn.exitCode).toBe(0);
+		expect(log).toEqual(["repin", "prompt:true"]);
+	});
+
+	// A queued workpool batch carries the arm state of its push. When it reaches a
+	// reused worker the root may have flipped since; the follow-up mirrors the
+	// request, not the root's state at the moment the worker freed up.
+	it("keeps the pin for a follow-up requested while armed, though the parent disarmed since", async () => {
+		const id = "ultracode-followup-request-armed";
+		const { parentSettings, log } = await spawnKeptAlive(id, true);
+		cfgUltracode.override(parentSettings, false);
+
+		const turn = await runSubagentFollowUpTurn({ id, agent: baseAgent, message: "follow up", ultracodeArmed: true });
+
+		expect(turn.exitCode).toBe(0);
+		expect(log).toEqual(["repin", "prompt:true"]);
+	});
+
+	it("stays unpinned for a follow-up requested while unarmed, though the parent armed since", async () => {
+		const id = "ultracode-followup-request-unarmed";
+		const { parentSettings, log } = await spawnKeptAlive(id, false);
+		cfgUltracode.override(parentSettings, true);
+
+		const turn = await runSubagentFollowUpTurn({ id, agent: baseAgent, message: "follow up", ultracodeArmed: false });
+
+		expect(turn.exitCode).toBe(0);
+		expect(log).toEqual(["prompt:false"]);
+	});
 });
 
 // A cold revive (new process, parent's live settings gone) rebuilds an armed
 // child from the LATEST session_init. The session appends a newer one whenever
 // a model call's base prompt or work-pool items change, spreading the
 // extracted init (AgentSession #recordModelCallSystemPrompt) — so extraction
-// must carry the ultracode stamp and its restore level, or the first re-record
-// silently drops the pin from the persisted contract.
+// must carry the ultracode stamp and its hand-back (restore level and ceiling),
+// or the first re-record silently drops the pin from the persisted contract.
 describe("session_init carries the ultracode stamp across re-records", () => {
 	const contract = { systemPrompt: ["base"], task: "do work", tools: ["read", "yield"] };
 
-	it("round-trips the flag and restore level through a newer re-recorded session_init", () => {
+	it("round-trips the flag, restore level and a no-ceiling hand-back through a re-recorded session_init", () => {
 		const manager = SessionManager.inMemory("/tmp");
-		manager.appendSessionInit({ ...contract, ultracode: true, ultracodeRestoreLevel: ThinkingLevel.Medium });
+		manager.appendSessionInit({
+			...contract,
+			ultracode: true,
+			ultracodeRestoreLevel: ThinkingLevel.Medium,
+			// `null` is the "no ceiling" hand-back, distinct from an absent (legacy) one.
+			ultracodeRestoreCeiling: null,
+		});
 		const init = extractSessionInit(manager.getEntries());
 		expect(init?.ultracode).toBe(true);
 		expect(init?.ultracodeRestoreLevel).toBe(ThinkingLevel.Medium);
+		expect(init?.ultracodeRestoreCeiling).toBeNull();
 		if (!init) throw new Error("Expected a session_init");
 
 		// Exactly the re-record's spread on a base-prompt change.
@@ -1176,6 +1668,7 @@ describe("session_init carries the ultracode stamp across re-records", () => {
 		expect(latest?.systemPrompt).toEqual(["rebuilt base"]);
 		expect(latest?.ultracode).toBe(true);
 		expect(latest?.ultracodeRestoreLevel).toBe(ThinkingLevel.Medium);
+		expect(latest?.ultracodeRestoreCeiling).toBeNull();
 	});
 
 	it("extracts an unarmed init without the ultracode fields", () => {
@@ -1185,5 +1678,304 @@ describe("session_init carries the ultracode stamp across re-records", () => {
 		if (!init) throw new Error("Expected a session_init");
 		expect("ultracode" in init).toBe(false);
 		expect("ultracodeRestoreLevel" in init).toBe(false);
+		expect("ultracodeRestoreCeiling" in init).toBe(false);
+	});
+});
+
+// A cold revive (new process, no live ancestor) rebuilds the child from that
+// persisted contract through createPersistedSubagentReviverFactory: the flag
+// stamp seeds its settings, the ceiling is the pin's, and the hand-back pair
+// rides into the SDK so the lifecycle's resume sync can disarm it properly.
+describe("ultracode cold revive from the persisted session_init", () => {
+	const tempDirs: TempDir[] = [];
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		MCPManager.resetForTests();
+		await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
+	});
+
+	/** Persists a parked child transcript with `init` on disk and cold-revives it, returning what reached the SDK. */
+	async function coldRevive(init: Partial<PersistedSessionInit>): Promise<CreateAgentSessionOptions> {
+		const dir = TempDir.createSync("@pi-ultracode-cold-revive-");
+		tempDirs.push(dir);
+		const cwd = dir.path();
+		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		manager.appendSessionInit({ systemPrompt: ["base"], task: "do work", tools: ["read", "yield"], ...init });
+		manager.appendMessage({
+			role: "assistant",
+			provider: FULL_LADDER.provider,
+			model: FULL_LADDER.id,
+			api: FULL_LADDER.api,
+			content: [{ type: "text", text: "done" }],
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		await manager.close();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+
+		let captured: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			captured = options;
+			// Exactly the members the reviver touches after construction (upstream's
+			// persisted-revive.test.ts fake), on top of the shared session defaults.
+			const revived = {
+				...createSessionDefaults(),
+				getMountedXdevToolNames: () => [],
+				setActiveToolsByName: async (_toolNames: string[]) => {},
+				subscribe: () => () => {},
+				setIrcWakeTurnObserver: () => {},
+			};
+			return { session: revived as unknown as AgentSession } as CreateAgentSessionResult;
+		});
+		const parentSession = {
+			sessionManager: { getCwd: () => cwd, getArtifactManager: () => undefined },
+			sessionFile: path.join(cwd, "parent.jsonl"),
+			effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
+			preparedExtensions: undefined,
+		} as unknown as AgentSession;
+		const factory = createPersistedSubagentReviverFactory({
+			session: parentSession,
+			authStorage: {} as AuthStorage,
+			modelRegistry: { authStorage: {} } as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			enableLsp: true,
+		});
+		const ref: AgentRef = {
+			id: "ColdChild",
+			displayName: "ColdChild",
+			kind: "sub",
+			parentId: "Main",
+			status: "parked",
+			session: null,
+			sessionFile,
+			createdAt: 0,
+			lastActivity: 0,
+		};
+		const reviver = await factory(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+		if (!captured) throw new Error("Expected the reviver to build a session");
+		return captured;
+	}
+
+	it("seeds the flag, the xhigh ceiling and the whole hand-back for a child spawned armed", async () => {
+		const forwarded = await coldRevive({
+			ultracode: true,
+			ultracodeRestoreLevel: ThinkingLevel.Medium,
+			ultracodeRestoreCeiling: Effort.High,
+		});
+
+		expect(childFlag(forwarded.settings)).toBe(true);
+		expect(forwarded.thinkingLevelCeiling).toBe(Effort.XHigh);
+		expect(forwarded.ultracodeRestoreLevel).toBe(ThinkingLevel.Medium);
+		expect(forwarded.ultracodeRestoreCeiling).toBe(Effort.High);
+	});
+
+	it("seeds none of it for a child spawned unarmed", async () => {
+		const forwarded = await coldRevive({});
+
+		expect(childFlag(forwarded.settings)).toBe(false);
+		expect(forwarded.thinkingLevelCeiling).toBeUndefined();
+		expect(forwarded.ultracodeRestoreLevel).toBeUndefined();
+		expect(forwarded.ultracodeRestoreCeiling).toBeUndefined();
+	});
+});
+
+// The resume sync's ancestor walk: the nearest LIVE ancestor decides, and a
+// parked (session-less) parent between a grandchild and the root must not stop
+// the walk — otherwise the grandchild falls back to its own stale stamp.
+describe("the ultracode resume sync walks past parked ancestors", () => {
+	afterEach(() => {
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	function grandchildUnderParkedParent(rootArmed: boolean, childArmed: boolean) {
+		const registry = AgentRegistry.global();
+		const rootSettings = Settings.isolated();
+		cfgUltracode.override(rootSettings, rootArmed);
+		registry.register({
+			id: "Main",
+			displayName: "Main",
+			kind: "main",
+			status: "running",
+			session: { settings: rootSettings } as unknown as AgentSession,
+		});
+		registry.register({
+			id: "ParkedParent",
+			displayName: "ParkedParent",
+			kind: "sub",
+			parentId: "Main",
+			status: "parked",
+			session: null,
+		});
+		const settings = createSubagentSettings(rootSettings, { ultracode: childArmed });
+		const log: string[] = [];
+		const child = {
+			settings,
+			model: FULL_LADDER,
+			disarmUltracodeTurn: () => {
+				log.push("disarm");
+				cfgUltracode.override(settings, false);
+			},
+			ultracodePinRefusal: () => undefined,
+			repinUltracodeIfArmed: () => {
+				log.push("repin");
+				return true;
+			},
+		} as unknown as AgentSession;
+		registry.register({
+			id: "Grandchild",
+			displayName: "Grandchild",
+			kind: "sub",
+			parentId: "ParkedParent",
+			status: "idle",
+			session: child,
+		});
+		return { registry, child, log };
+	}
+
+	it("re-pins an unarmed grandchild when the live root above its parked parent is armed", () => {
+		const { registry, child, log } = grandchildUnderParkedParent(true, false);
+		syncChildUltracodeAtResume("Grandchild", child, registry);
+		expect(childFlag(child.settings)).toBe(true);
+		expect(log).toEqual(["repin"]);
+	});
+
+	it("disarms a flagged grandchild once the live root above its parked parent disarmed", () => {
+		const { registry, child, log } = grandchildUnderParkedParent(false, true);
+		syncChildUltracodeAtResume("Grandchild", child, registry);
+		expect(childFlag(child.settings)).toBe(false);
+		expect(log).toEqual(["disarm"]);
+	});
+});
+
+// The SDK leg of the hand-back and the construction-time refusal, through the
+// REAL createAgentSession: every test above fakes the SDK, so a port that drops
+// a pass-through line in sdk.ts (the file upstream churns most) would pass them.
+describe("ultracode through the real createAgentSession", () => {
+	const tempDirs: TempDir[] = [];
+	const sessions: AgentSession[] = [];
+	const authStorages: AuthStorage[] = [];
+
+	afterEach(async () => {
+		for (const session of sessions.splice(0)) await session.dispose();
+		for (const authStorage of authStorages.splice(0)) authStorage.close();
+		AgentRegistry.resetGlobalForTests();
+		await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
+	});
+
+	/** A child (or, without `parentTaskPrefix`, a root) built by the real SDK on anthropic models. */
+	async function createReal(
+		options: { flagged: boolean; child?: boolean } & Pick<
+			CreateAgentSessionOptions,
+			| "model"
+			| "modelPattern"
+			| "thinkingLevel"
+			| "thinkingLevelCeiling"
+			| "ultracodeRestoreLevel"
+			| "ultracodeRestoreCeiling"
+		>,
+	): Promise<AgentSession> {
+		const dir = TempDir.createSync("@pi-ultracode-real-sdk-");
+		tempDirs.push(dir);
+		const authStorage = await AuthStorage.create(dir.join("auth.db"));
+		authStorages.push(authStorage);
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		cfgUltracode.override(settings, options.flagged);
+		const { flagged: _flagged, child, ...spawn } = options;
+		const { session } = await sdkModule.createAgentSession({
+			...spawn,
+			cwd: dir.path(),
+			agentDir: dir.path(),
+			sessionManager: SessionManager.inMemory(dir.path()),
+			authStorage,
+			modelRegistry: new ModelRegistry(authStorage, dir.join("models.yml")),
+			settings,
+			...(child === false
+				? { agentId: "RealRoot", bindProcessState: false }
+				: { agentId: "RealChild", parentTaskPrefix: "RealChild" }),
+			disableExtensionDiscovery: true,
+			skills: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			hasUI: false,
+		});
+		sessions.push(session);
+		return session;
+	}
+
+	const XHIGH_TO_MAX = modelOrThrow("anthropic", "claude-opus-5-5");
+
+	it("hands a child born at the pin back to the forwarded restore level on disarm", async () => {
+		const session = await createReal({
+			flagged: true,
+			model: XHIGH_TO_MAX,
+			thinkingLevel: Effort.XHigh,
+			thinkingLevelCeiling: Effort.XHigh,
+			ultracodeRestoreLevel: Effort.Low,
+			ultracodeRestoreCeiling: null,
+		});
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		session.disarmUltracodeTurn();
+		expect(cfgUltracode.get(session.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("lifts the pin's xhigh ceiling to the forwarded unpinned one on disarm, so a max hand-back is not clamped", async () => {
+		const session = await createReal({
+			flagged: true,
+			model: XHIGH_TO_MAX,
+			thinkingLevel: Effort.XHigh,
+			thinkingLevelCeiling: Effort.XHigh,
+			ultracodeRestoreLevel: Effort.Max,
+			ultracodeRestoreCeiling: null,
+		});
+
+		session.disarmUltracodeTurn();
+		expect(session.thinkingLevel).toBe(Effort.Max);
+	});
+
+	it("refuses a flagged child whose model only the SDK resolves and which has no xhigh rung", async () => {
+		const refused = createReal({
+			flagged: true,
+			modelPattern: `${CAPS_AT_HIGH.provider}/${CAPS_AT_HIGH.id}`,
+			thinkingLevel: Effort.XHigh,
+			thinkingLevelCeiling: Effort.XHigh,
+			ultracodeRestoreLevel: Effort.Low,
+			ultracodeRestoreCeiling: null,
+		});
+
+		// Not clamped to high under the ultracode name: loud, before any session exists.
+		await expect(refused).rejects.toBeInstanceOf(UltracodeEffortError);
+		await expect(refused).rejects.toThrow(`ultracode requires xhigh; ${CAPS_AT_HIGH.provider}/${CAPS_AT_HIGH.id}`);
+		expect(AgentRegistry.global().get("RealChild")).toBeUndefined();
+	});
+
+	it("builds that same SDK-resolved model normally for an unflagged child", async () => {
+		const session = await createReal({
+			flagged: false,
+			modelPattern: `${CAPS_AT_HIGH.provider}/${CAPS_AT_HIGH.id}`,
+		});
+		expect(session.model?.id).toBe(CAPS_AT_HIGH.id);
+	});
+
+	it("never refuses a root on construction: a root arms per turn and refuses there", async () => {
+		const session = await createReal({ flagged: true, child: false, model: CAPS_AT_HIGH });
+		expect(session.model?.id).toBe(CAPS_AT_HIGH.id);
 	});
 });

@@ -251,7 +251,10 @@ import {
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
 	toReasoningEffort,
+	UltracodeEffortError,
+	ultracodeEffortFor,
 } from "@oh-my-pi/pi-tui/thinking";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import {
 	BashTool,
 	BUILTIN_TOOLS,
@@ -375,6 +378,7 @@ import {
 	cfgTuiAutoGraph,
 	cfgTuiRenderMermaid,
 	cfgTuiRenderSvg,
+	cfgUltracode,
 } from "./modes/settings";
 import { cfgLspEnabled, cfgLspLazy, cfgLspShared } from "./lsp/settings";
 import {
@@ -608,6 +612,13 @@ export interface CreateAgentSessionOptions {
 	 * Absent = `thinkingLevel` is the user's own selection.
 	 */
 	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
+	/**
+	 * The thinking-effort ceiling the session would have had without the borrowed
+	 * ultracode pin (whose ceiling is xhigh); disarm restores it alongside
+	 * {@link ultracodeRestoreLevel}. `null` = no ceiling; absent = unknown (legacy
+	 * transcript), keep the current ceiling. Only meaningful for a session born armed.
+	 */
+	ultracodeRestoreCeiling?: Effort | null;
 	/** OpenAI service-tier override for this session. `null` omits `service_tier`. */
 	openAIServiceTier?: ServiceTier | null;
 	/**
@@ -3259,6 +3270,24 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 
+		// A child born flagged (spawned inside an ultracode turn) carries an xhigh pin its
+		// spawner could validate only against a model it resolved itself; a pattern only this
+		// SDK resolves lands here unchecked, and the level above was already clamped onto the
+		// final model's ladder. A ladder without the rung would leave the child flagged but
+		// unpinned, flooring its own spawns at a level it does not run at: refuse loudly before
+		// anything is persisted or constructed. Roots arm per turn and refuse there instead.
+		// The startup-error cleanup below releases the job manager, kernels and auth this call
+		// owns; an MCP manager the child discovered for itself is released here, since no
+		// session will ever own its teardown.
+		if (model && options.parentTaskPrefix && cfgUltracode.get(settings) && ultracodeEffortFor(model) === undefined) {
+			if (mcpManager && !options.mcpManager) {
+				await mcpManager.disconnectAll().catch(error => {
+					logger.warn("Failed to release a refused ultracode child's MCP manager", { error: String(error) });
+				});
+			}
+			throw new UltracodeEffortError(formatModelStringWithRouting(model), getSupportedEfforts(model));
+		}
+
 		// A first-turn user tail has no assistant metadata to copy. Once startup
 		// has selected its final model, use that model to terminate the
 		// interrupted turn before the live agent consumes the restored context.
@@ -4558,6 +4587,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			thinkingLevel: autoThinking ? AUTO_THINKING : effectiveThinkingLevel,
 			thinkingLevelCeiling: options.thinkingLevelCeiling,
 			ultracodeRestoreLevel: options.ultracodeRestoreLevel,
+			ultracodeRestoreCeiling: options.ultracodeRestoreCeiling,
 			initialRetryFallback,
 			deferRetryFallbackValidation: options.deferRetryFallbackValidation,
 			prewalk,

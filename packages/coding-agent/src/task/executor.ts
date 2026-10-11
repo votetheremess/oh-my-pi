@@ -7,8 +7,14 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
-import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import {
+	AgentBusyError,
+	EventLoopKeepalive,
+	recordHandoff,
+	resolveTelemetry,
+	ThinkingLevel,
+} from "@oh-my-pi/pi-agent-core";
+import type { Api, Effort, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
@@ -82,6 +88,7 @@ import { hasConversationalHistory, SessionManager } from "../session/session-man
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import {
 	type ConfiguredThinkingLevel,
+	parseConfiguredThinkingLevel,
 	prewalkWouldBeNoop,
 	resolveTaskEffortLevel,
 	type TaskEffort,
@@ -437,6 +444,13 @@ export interface ExecutorOptions {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Caller-requested coarse effort (`lo`/`med`/`hi`); maps onto the resolved model's supported thinking range and wins over {@link thinkingLevel}. */
 	effort?: TaskEffort;
+	/**
+	 * The spawning turn's ultracode arm state, captured when the spawn was REQUESTED
+	 * (task tool call, eval `agent()`, workpool push). A queued spawn may start after
+	 * the root's turn flipped; the floor follows the request, not the start. Absent =
+	 * read the spawner's live flag once at entry (vibe, cleanse, direct callers).
+	 */
+	ultracodeArmed?: boolean;
 	/** Caller's description of how open-ended the work is; rides the initial prompt into the child's `auto` thinking classifier. */
 	solutionSpace?: string;
 	/** Schema used to validate the final structured completion. */
@@ -3503,6 +3517,13 @@ export interface FollowUpTurnOptions {
 	completionProbe?: boolean;
 	/** Workpool items accepted by the child yield tool during this turn. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/**
+	 * The arm state the follow-up was REQUESTED under (workpool push). Given, the
+	 * resume sync mirrors it instead of the nearest live ancestor's current flag,
+	 * so a batch queued by an armed turn keeps the pin even if the root disarmed
+	 * before the worker freed up (and the reverse). Absent = live ancestor (IRC, vibe).
+	 */
+	ultracodeArmed?: boolean;
 }
 
 /**
@@ -3570,9 +3591,10 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	const ref = AgentRegistry.global().get(id);
 	const sessionFile = ref?.sessionFile ?? undefined;
 	// A live (not revived) child still carries its spawn-time ultracode
-	// snapshot; the follow-up runs inside the PARENT's current turn, so mirror
-	// the parent's live flag and re-pin (or fail loudly) before prompting.
-	syncChildUltracodeAtResume(id, session, AgentRegistry.global());
+	// snapshot; the follow-up runs inside the PARENT's turn, so mirror the arm
+	// state the follow-up was requested under (else the parent's live flag) and
+	// re-pin (or fail loudly) before prompting.
+	syncChildUltracodeAtResume(id, session, AgentRegistry.global(), options.ultracodeArmed);
 
 	const monitor = createSubagentRunMonitor({
 		index,
@@ -3866,14 +3888,20 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 		// disarmed the child before it parked (its own `override(false)` survives in the captured
 		// overlay), reviving at the spec level would leave it at xhigh, unflagged, with no hand-back
 		// seeded (ModelControls seeds one only for an armed session) — so it revives at the level
-		// the pin borrowed from. A still-flagged child keeps the pin; the lifecycle's resume sync
-		// then disarms or re-pins it.
+		// (and under the ceiling) the pin borrowed from. A still-flagged child keeps the pin; the
+		// lifecycle's resume sync then disarms or re-pins it.
 		const restoreLevel = capture.spec.options.ultracodeRestoreLevel;
+		const restoreCeiling = capture.spec.options.ultracodeRestoreCeiling;
 		const disarmedSincePin = restoreLevel !== undefined && !cfgUltracode.get(settings);
 		try {
 			({ session: revived } = await createAgentSession({
 				...buildSubagentSessionOptions(capture.spec, settings, reopened, expectedAgentRef),
-				...(disarmedSincePin ? { thinkingLevel: restoreLevel } : {}),
+				...(disarmedSincePin
+					? {
+							thinkingLevel: restoreLevel,
+							...(restoreCeiling !== undefined ? { thinkingLevelCeiling: restoreCeiling ?? undefined } : {}),
+						}
+					: {}),
 				oauthAccountPools: Object.hasOwn(agentAccountPools, capture.agentName)
 					? agentAccountPools[capture.agentName]
 					: undefined,
@@ -3896,6 +3924,43 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 		attachIrcWakeTurnMonitor(revived, capture.wake);
 		return revived;
 	};
+}
+
+/**
+ * The level an armed spawn would have run at WITHOUT the ultracode pin — its
+ * hand-back. Mirrors the unpinned precedence: the caller's `effort` resolved
+ * under the unpinned ceiling, then the agent/pattern level, then what the SDK
+ * picks for a level-less spawn (the model's `thinking.defaultLevel`, then the
+ * child's `defaultThinkingLevel`), then off. Never undefined: a child born
+ * armed without a hand-back would keep the borrowed xhigh as its own level
+ * after its resume-boundary disarm (bundled `reviewer`/`security-reviewer`
+ * carry no level of their own).
+ */
+function resolveUnpinnedSpawnLevel(args: {
+	model: Model | undefined;
+	effort: TaskEffort | undefined;
+	ceiling: Effort | undefined;
+	configuredThinkingLevel: ConfiguredThinkingLevel | undefined;
+	childSettings: Settings;
+}): ConfiguredThinkingLevel {
+	let effortLevel: Effort | undefined;
+	if (args.effort !== undefined) {
+		try {
+			effortLevel = resolveTaskEffortLevel(args.model, args.effort, args.ceiling);
+		} catch (error) {
+			// Unpinned, a `task.maxEffort` below the model's floor would have refused
+			// the spawn. The pin ignores that ceiling, so the armed spawn proceeds and
+			// the hand-back falls through to the agent's own level instead.
+			if (!(error instanceof RangeError)) throw error;
+		}
+	}
+	return (
+		effortLevel ??
+		args.configuredThinkingLevel ??
+		args.model?.thinking?.defaultLevel ??
+		parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(args.childSettings)) ??
+		ThinkingLevel.Off
+	);
 }
 
 /**
@@ -3956,11 +4021,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	const settings = options.settings ?? Settings.isolated();
-	// The ultracode turn flag, read ONCE: the child's settings stamp, the effort
+	// The ultracode turn flag, decided ONCE: the child's settings stamp, the effort
 	// pin, prewalk suppression and the persisted session_init all reuse this value,
 	// so a parent disarm landing between the awaits below cannot produce a child
-	// that is flagged but unpinned (or pinned but unflagged).
-	const ultracodeArmed = cfgUltracode.get(settings);
+	// that is flagged but unpinned (or pinned but unflagged). A queued fan-out
+	// spawn carries the state its request saw (`options.ultracodeArmed`) instead
+	// of whatever the root reads by the time a slot frees up.
+	const ultracodeArmed = options.ultracodeArmed ?? cfgUltracode.get(settings);
 	// Per-agent advisor: the agent definition's `advisor` frontmatter or the
 	// `task.agentAdvisor` settings override (agent name → "on"/"off"/model
 	// pattern) pairs the spawned session with an advisor. Subagents default to
@@ -4271,8 +4338,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (ultracodeArmed && model && ultracodeEffortLevel === undefined) {
 				throw new UltracodeEffortError(formatModelStringWithRouting(model), getSupportedEfforts(model));
 			}
-			const spawnEffortCeiling =
-				ultracodeEffortLevel ?? (options.effort !== undefined ? cfgTaskMaxEffort.get(settings) : undefined);
+			// The ceiling this spawn would ride with unpinned; under ultracode it is
+			// also the hand-back ceiling (`ultracodeRestoreCeiling`) a disarm restores.
+			const unpinnedEffortCeiling = options.effort !== undefined ? cfgTaskMaxEffort.get(settings) : undefined;
+			const spawnEffortCeiling = ultracodeEffortLevel ?? unpinnedEffortCeiling;
 			const effortLevel =
 				ultracodeEffortLevel ??
 				(options.effort !== undefined
@@ -4291,17 +4360,30 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// on the resolved model pattern > agent-definition default (e.g. task's
 			// `auto`) > pattern-derived level.
 			//
-			// `configuredThinkingLevel` is what the child would run at with NO
-			// ultracode (the caller's `effort` is a per-spawn hint the pin also
-			// overrides, so it sits above it). Under ultracode it rides into the
-			// child as `ultracodeRestoreLevel`: the pin is borrowed, and a disarm
-			// (parent's turn ended, follow-up without the keyword) hands the child
-			// back to this level instead of leaving xhigh behind as its own choice.
+			// `configuredThinkingLevel` is the agent/pattern level, what the child
+			// would run at with NO ultracode and no caller `effort`. Under ultracode
+			// the level it would have run at unpinned (caller `effort` included, down
+			// to the SDK's own defaults) rides into the child as
+			// `ultracodeRestoreLevel`, with the unpinned ceiling as
+			// `ultracodeRestoreCeiling`: the pin is borrowed, and a disarm (parent's
+			// turn ended, follow-up without the keyword) hands the child back to
+			// them instead of leaving xhigh behind as its own choice.
 			const configuredThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			const effectiveThinkingLevel = effortLevel ?? configuredThinkingLevel;
-			const ultracodeRestoreLevel = ultracodeEffortLevel !== undefined ? configuredThinkingLevel : undefined;
+			const ultracodeRestoreLevel =
+				ultracodeEffortLevel !== undefined
+					? resolveUnpinnedSpawnLevel({
+							model,
+							effort: options.effort,
+							ceiling: unpinnedEffortCeiling,
+							configuredThinkingLevel,
+							childSettings: subagentSettings,
+						})
+					: undefined;
+			const ultracodeRestoreCeiling =
+				ultracodeEffortLevel !== undefined ? (unpinnedEffortCeiling ?? null) : undefined;
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManagerPromise = sessionFile
@@ -4422,6 +4504,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					// The spec is reused by createWarmSubagentReviver, so a warm revive
 					// rebuilds the same borrowed-pin hand-back the live spawn had.
 					ultracodeRestoreLevel,
+					ultracodeRestoreCeiling,
 					// Subagents are short-lived; never schedule background warm requests.
 					cacheWarming: false,
 					toolNames,
@@ -4625,10 +4708,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				isolated: worktree !== undefined || undefined,
 				// Persisted (only when armed) so a cold revive — new process, parent's
 				// live settings gone — can still tell the child was spawned inside an
-				// ultracode turn and re-pin it. The restore level rides along so that
-				// revive can rebuild the hand-back the live spawn had.
+				// ultracode turn and re-pin it. The restore level and ceiling ride along
+				// so that revive can rebuild the hand-back the live spawn had.
 				ultracode: ultracodeArmed || undefined,
 				ultracodeRestoreLevel,
+				ultracodeRestoreCeiling,
 			});
 
 			abortSignal.addEventListener(

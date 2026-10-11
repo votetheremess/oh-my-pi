@@ -197,8 +197,8 @@ export function createAgentsHubDeps(
 				bindProcessState: false,
 				// A child of the live session (kind "sub" via parentTaskPrefix), not a
 				// second "Main": it inherits the arm state through the overlay's by-value
-				// stamp and, as a child, never arms or disarms from its prompt text — it
-				// only re-pins. Without this it would register over the live Main ref.
+				// stamp and never arms or disarms from its own prompt text. Without
+				// this it would register over the live Main ref.
 				agentId: architectId,
 				agentDisplayName: "architect",
 				parentTaskPrefix: architectId,
@@ -212,10 +212,14 @@ export function createAgentsHubDeps(
 			});
 			try {
 				// The request is the user's own text wrapped in the architect template,
-				// so the turn keeps its user attribution. It cannot flip the ultracode
-				// state: the architect is a child kind, and children only re-pin.
+				// so the turn keeps its user attribution. It is the architect's spawn
+				// assignment, not a resume boundary: `spawnAssignment` keeps the arm
+				// state fixed when generateAgent ran instead of re-mirroring the owner
+				// if it flipped during createAgentSession. (Later prompts typed into a
+				// focused child are resume boundaries; the architect never gets one.)
 				await session.prompt(prompt.render(agentCreationUserPrompt, { request: description }), {
 					expandPromptTemplates: false,
+					spawnAssignment: true,
 				});
 				const raw = extractAssistantText(session.state.messages);
 				if (!raw) throw new Error("No response returned by agent creation architect.");

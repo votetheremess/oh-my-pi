@@ -2102,6 +2102,11 @@ export class SessionAdvisors {
 				// the rebuild path's business, not the flag flip's.
 				if (!descriptor) continue;
 				next = resolveThinkingLevelForModel(advisor.model, descriptor.thinkingLevel) ?? ThinkingLevel.Inherit;
+				// A fallback taken during the armed turn recorded the borrowed xhigh
+				// as the level to restore on the primary; the cooldown restore would
+				// then hand xhigh back on every later unarmed turn. The descriptor is
+				// the primary's unarmed level (what an unarmed capture records).
+				if (advisor.retryFallback) advisor.retryFallback.originalThinkingLevel = descriptor.thinkingLevel;
 			}
 			if (descriptor) advisor.signature = descriptor.signature;
 			if (next !== advisor.thinkingLevel) this.#applyAdvisorThinkingLevel(advisor, next);

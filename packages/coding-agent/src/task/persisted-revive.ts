@@ -138,9 +138,10 @@ export function createPersistedSubagentReviverFactory(
 			// right after revive) overwrites it with the nearest live ancestor's flag,
 			// so a stale persisted `true` never floors anything once the parent's
 			// armed turn is over. The persisted thinking entries restore the xhigh
-			// pin itself; the ceiling/restore-level pair below rebuilds the rest of
-			// what the live spawn had, so the sync can re-pin (ceiling at xhigh, not
-			// the parent's `task.maxEffort`) or hand back (to the pre-pin level).
+			// pin itself; the ceiling/restore pair below rebuilds the rest of what
+			// the live spawn had, so the sync can re-pin (ceiling at xhigh, not the
+			// parent's `task.maxEffort`) or hand back (to the pre-pin level, under
+			// the pre-pin ceiling; an older transcript without one keeps xhigh's).
 			const subagentSettings = createSubagentSettings(ctx.settings, {
 				...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 				...(init.ultracode ? { ultracode: true } : undefined),
@@ -202,7 +203,11 @@ export function createPersistedSubagentReviverFactory(
 					...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
 					modelPatternAuthFallback: init.resolvedModel,
 					...(init.ultracode
-						? { thinkingLevelCeiling: Effort.XHigh, ultracodeRestoreLevel: init.ultracodeRestoreLevel }
+						? {
+								thinkingLevelCeiling: Effort.XHigh,
+								ultracodeRestoreLevel: init.ultracodeRestoreLevel,
+								ultracodeRestoreCeiling: init.ultracodeRestoreCeiling,
+							}
 						: {}),
 					settings: subagentSettings,
 					sessionManager: reopened,

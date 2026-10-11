@@ -406,6 +406,7 @@ import {
 	isHiddenUserCompanion,
 	isUserAuthoredQueuedMessage,
 	isUserQueuedMessage,
+	peekQueuedMessageDeliveryEffect,
 	queueChipText,
 	takeQueuedMessageDeliveryEffect,
 	toRestoredQueuedMessage,
@@ -655,6 +656,12 @@ type ScheduledAgentContinueOptions = {
 	source: string;
 	delayMs?: number;
 	generation?: number;
+	/**
+	 * Runs synchronously right before `agent.continue()` claims an idle agent
+	 * (never when it would throw busy and the queued input would join another
+	 * run instead). For turn-start state the run's first queued input decides.
+	 */
+	beforeContinue?: () => void;
 	shouldContinue?: () => boolean;
 	onSkip?: (reason: AgentContinueSkipReason) => void;
 	onError?: (error: unknown) => void;
@@ -1419,8 +1426,16 @@ export class AgentSession implements SettingsScope {
 				// the armed state exactly as the previous turn left it. The keyword
 				// notices and attachment companions queued ahead of the record are
 				// custom-role; the rider sits on the user record itself.
-				if (
-					this.#agentKind !== "sub" &&
+				//
+				// On a child the wake is a RESUME BOUNDARY whatever woke it: the bus
+				// syncs only a recipient idle at delivery, so a record that stranded
+				// past the last aside poll, a wake that lost the prompt race, or a
+				// deferred pooled wake would otherwise start this turn on the
+				// previous turn's pin. A refused pin leaves the child disarmed: the
+				// turn runs unarmed with an error notice and the records still land.
+				if (this.#agentKind === "sub") {
+					this.#syncUltracodeAtChildResumeOrNotify();
+				} else if (
 					records.some(record => record.role === "user" && record.attribution === "user") &&
 					!records.some(hasQueuedMessageDeliveryEffect)
 				) {
@@ -1830,6 +1845,7 @@ export class AgentSession implements SettingsScope {
 			thinkingLevel: config.thinkingLevel,
 			thinkingLevelCeiling: config.thinkingLevelCeiling,
 			ultracodeRestoreLevel: config.ultracodeRestoreLevel,
+			ultracodeRestoreCeiling: config.ultracodeRestoreCeiling,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
 
@@ -1867,6 +1883,7 @@ export class AgentSession implements SettingsScope {
 			// cannot drop the pending handback or the subagent floor.
 			setThinkingLevel: level => this.#models.setThinkingLevel(level),
 			repinUltracodeIfArmed: () => this.#models.repinUltracodeIfArmed(),
+			rebaseUltracodeRestore: () => this.#models.rebaseUltracodeRestore(),
 			userConfiguredThinkingLevel: () => this.#models.userConfiguredThinkingLevel(),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			thinkingLevelCeiling: () => this.#models.thinkingLevelCeiling,
@@ -4704,6 +4721,9 @@ export class AgentSession implements SettingsScope {
 			}
 			for (;;) {
 				try {
+					// Synchronously before the claim: `continue()` throws busy (and the
+					// queued input joins the live run) exactly when a run is streaming.
+					if (!this.agent.state.isStreaming) request.options.beforeContinue?.();
 					await this.agent.continue(signal);
 					return { status: "completed" };
 				} catch (error) {
@@ -7317,7 +7337,8 @@ export class AgentSession implements SettingsScope {
 	 * side effects. Split from {@link armUltracodeTurn} because the queued
 	 * approval branch needs the notice text at ENQUEUE (it rides the synthetic
 	 * follow-up) while the arm itself runs at delivery via
-	 * {@link armUltracodeTurnDeferred}.
+	 * {@link armUltracodeTurnDeferred}, which re-renders it there from the arm
+	 * actually taken.
 	 */
 	ultracodeArmNotice(): string {
 		return renderUltracodeNoticeFor(this.#magicKeywordContext(), true);
@@ -7368,12 +7389,25 @@ export class AgentSession implements SettingsScope {
 	 * turn (as its {@link FollowUpOptions.onDeliver} hook).
 	 * Arming at enqueue would raise the in-flight turn's pin and floor before
 	 * the approved plan even starts, and leave them raised if it is dequeued.
+	 *
+	 * `renderPrompt` rebuilds the queued directive around a given notice (the
+	 * caller built the enqueued text as `renderPrompt(ultracodeArmNotice())`).
+	 * The notice inside was rendered at ENQUEUE while the arm is decided here,
+	 * so a model switch in between would leave it promising a pin the arm
+	 * refused (or denying one it took). Passed with this thunk as the
+	 * synthetic {@link followUp}'s `onDeliver`, the directive is re-rendered
+	 * from the live session in the same commit, right after the arm.
 	 */
-	armUltracodeTurnDeferred(): () => void {
-		return () => {
+	armUltracodeTurnDeferred(renderPrompt?: (notice: string) => string): () => void {
+		const arm = () => {
 			if (this.#agentKind !== "sub") this.#armUltracodeTurnNow();
 		};
+		if (renderPrompt) this.#deferredArmPromptRenderers.set(arm, renderPrompt);
+		return arm;
 	}
+
+	/** Directive renderers registered by {@link armUltracodeTurnDeferred}, keyed by its thunk. */
+	#deferredArmPromptRenderers = new WeakMap<() => void, (notice: string) => string>();
 
 	/**
 	 * Disarm as a delivery thunk, for a keyword-free turn that ENDS an
@@ -7422,11 +7456,14 @@ export class AgentSession implements SettingsScope {
 	 * pinned, and ultracode never clamps (user decision: fail loudly). Raising the
 	 * flag anyway would floor every spawn at a level this session itself is not
 	 * running at, and the executor would throw on each one. So on a failed pin the
-	 * turn stays unarmed, the user is told, and nothing is changed.
+	 * turn is not armed and the user is told. A flag still up from an EARLIER
+	 * armed turn (an extension swapped to a model without the rung since) is
+	 * ended too, so the flag always matches the "not armed" warning and notice
+	 * instead of flooring this turn's spawns behind their back.
 	 *
 	 * @returns an undo closure reverting exactly what this call changed — the
 	 * override write and the pin/handback — for a dispatch that drops the turn
-	 * before it starts; `undefined` when nothing changed (refused pin, or a
+	 * before it starts; `undefined` when nothing to revert (refused pin, or a
 	 * re-arm behind an already-armed turn with its handback in place). The undo
 	 * is guarded by {@link #ultracodeArmSeq}: it acts only while it is still the
 	 * latest flip, so a later arm or disarm is never reverted by an older one.
@@ -7437,12 +7474,8 @@ export class AgentSession implements SettingsScope {
 		if (!this.#models.beginUltracodeTurn()) {
 			// Silent clamping is exactly what the fail-loud policy forbids, so the
 			// refusal has to be visible to the user, not buried in the hidden notice.
-			const model = this.model;
-			const error = new UltracodeEffortError(
-				model ? formatModelStringWithRouting(model) : "no model",
-				model ? getSupportedEfforts(model) : [],
-			);
-			this.emitNotice("warning", `${error.message}; this turn is not armed`, "ultracode");
+			if (wasArmed) this.disarmUltracodeTurn();
+			this.emitNotice("warning", `${this.#ultracodeArmRefusal()}; this turn is not armed`, "ultracode");
 			return undefined;
 		}
 		// Runtime override layer only, never written to settings.json. It is how
@@ -7463,6 +7496,22 @@ export class AgentSession implements SettingsScope {
 			this.#ultracodeArmSeq++;
 			this.#advisors.resyncUltracodeEffort();
 		};
+	}
+
+	/**
+	 * Why {@link #armUltracodeTurnNow} refused, worded by cause so the warning
+	 * names the fix: a model without the xhigh rung lists the tiers it does
+	 * expose (swap model); a hard effort ceiling below xhigh on a model that
+	 * has the rung names that ceiling (raise the cap) instead of listing xhigh
+	 * among the tiers it supposedly lacks.
+	 */
+	#ultracodeArmRefusal(): string {
+		const model = this.model;
+		const modelName = model ? formatModelStringWithRouting(model) : "no model";
+		if (this.#models.ultracodePinRefusal() === "ceiling") {
+			return `ultracode requires xhigh; ${modelName} exposes it, but this session's effort ceiling (${this.#models.thinkingLevelCeiling}) caps it below xhigh`;
+		}
+		return new UltracodeEffortError(modelName, model ? getSupportedEfforts(model) : []).message;
 	}
 
 	/**
@@ -7530,8 +7579,9 @@ export class AgentSession implements SettingsScope {
 	 * armed means the model cannot take the pin (see {@link ultracodePinRefusal});
 	 * the level is left alone and the caller decides how to fail (the task
 	 * lifecycle sync throws, /tan refuses the fork up front). For a
-	 * child this is the ONLY way effort follows the inherited flag: children
-	 * never run {@link #applyUltracodeTurnState}.
+	 * child this is the ONLY way effort follows the inherited flag: a child
+	 * never arms from its own text, it only mirrors its parent at resume
+	 * boundaries (`syncChildUltracodeAtResume`), which re-pins through here.
 	 */
 	repinUltracodeIfArmed(): boolean {
 		return this.#models.repinUltracodeIfArmed();
@@ -7576,14 +7626,19 @@ export class AgentSession implements SettingsScope {
 	 * the parent has disarmed, re-pin while it is still armed — and throws
 	 * (fail loud) when the parent is armed and this model cannot hold xhigh.
 	 *
+	 * A child's spawn-time assignment ({@link PromptOptions.spawnAssignment}: the
+	 * `/tan` work prompt, the architect request) is not a boundary: its creator
+	 * fixed the state at dispatch, and re-mirroring the parent here would let a
+	 * parent flip in between re-arm or disarm the child before its first turn.
+	 *
 	 * @returns the undo closure for what the arm changed, or `undefined` when a
 	 * keyword-free turn disarmed (a dropped keyword-free turn leaving things
 	 * disarmed is the correct end state, so there is nothing to revert) or a
 	 * child mirrored its parent (the mirrored state is correct either way).
 	 */
-	#applyUltracodeTurnState(text: string): (() => void) | undefined {
+	#applyUltracodeTurnState(text: string, options?: { spawnAssignment?: boolean }): (() => void) | undefined {
 		if (this.#agentKind === "sub") {
-			this.#syncUltracodeAtChildResume();
+			if (!options?.spawnAssignment) this.#syncUltracodeAtChildResume();
 			return undefined;
 		}
 		if (this.#magicKeywordEnabled("ultracode") && containsMagicKeyword(text, "ultracode")) {
@@ -7603,6 +7658,22 @@ export class AgentSession implements SettingsScope {
 	 */
 	#syncUltracodeAtChildResume(): void {
 		if (this.#agentId) syncChildUltracodeAtResume(this.#agentId, this, AgentRegistry.global());
+	}
+
+	/**
+	 * {@link #syncUltracodeAtChildResume} for a child turn that starts where
+	 * the prompt cannot fail any more (a queued message's delivery, the idle
+	 * queue drain, an IRC wake): a refused pin is reported as an error notice
+	 * and the turn runs unarmed — the sync already disarmed the child before
+	 * throwing — like a root's refused arm.
+	 */
+	#syncUltracodeAtChildResumeOrNotify(): void {
+		try {
+			this.#syncUltracodeAtChildResume();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.emitNotice("error", `${message}; this turn is not armed`, "ultracode");
+		}
 	}
 
 	/**
@@ -7637,31 +7708,64 @@ export class AgentSession implements SettingsScope {
 	 * registered in {@link #followUpRiderAsSteer} with no steer counterpart, so
 	 * a follow-up later promoted into the steering queue
 	 * ({@link promoteQueuedMessage}) joins the running turn without ending it,
-	 * exactly like a typed steer.
+	 * exactly like a typed steer. On an IDLE session a steer joins nothing: it
+	 * STARTS a turn through the queued-message drain, which applies the
+	 * turn-start state itself ({@link #applyQueuedTurnStartUltracodeState}).
+	 *
+	 * `notices` are the hidden keyword notices queued with the message. Their
+	 * ultracode notice was rendered at ENQUEUE, but the arm is decided here at
+	 * DELIVERY, after a model switch may have changed whether xhigh can be
+	 * pinned; the arm rider re-renders it from the live session in the same
+	 * commit, before the model sees it or it is recorded (see
+	 * {@link #refreshUltracodeNotice}).
 	 */
-	#ultracodeDeliveryHook(text: string, mode: "steer" | "followUp" | "aside"): (() => void) | undefined {
+	#ultracodeDeliveryHook(
+		text: string,
+		mode: "steer" | "followUp" | "aside",
+		notices?: readonly CustomMessage[],
+	): (() => void) | undefined {
 		if (this.#agentKind === "sub") {
 			if (mode !== "followUp") return undefined;
-			const resumeSync = () => {
-				try {
-					this.#syncUltracodeAtChildResume();
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					this.emitNotice("error", `${message}; this turn is not armed`, "ultracode");
-				}
-			};
+			const resumeSync = () => this.#syncUltracodeAtChildResumeOrNotify();
 			this.#followUpRiderAsSteer.set(resumeSync, undefined);
 			return resumeSync;
 		}
 		if (this.#magicKeywordEnabled("ultracode") && containsMagicKeyword(text, "ultracode")) {
-			return () => {
+			const arm = () => {
 				this.#armUltracodeTurnNow();
+				this.#refreshUltracodeNotice(notices);
 			};
+			this.#ultracodeArmRiders.add(arm);
+			return arm;
 		}
 		if (mode !== "followUp") return undefined;
 		const disarm = this.disarmUltracodeTurnDeferred();
 		this.#followUpRiderAsSteer.set(disarm, undefined);
 		return disarm;
+	}
+
+	/**
+	 * Delivery riders that ARM ultracode (the keyword arm, and a follow-up's
+	 * rider composed around it). The idle queue drain reads this to tell a
+	 * steering batch that will arm at commit from a keyword-free one that
+	 * starts a turn and must end the previous arm.
+	 */
+	#ultracodeArmRiders = new WeakSet<() => void>();
+
+	/**
+	 * Re-render the hidden ultracode notice among `notices` from the live
+	 * session, right after the arm for its turn was decided. The notice's
+	 * `effortPinned` branch must match that decision, not the one implied when
+	 * the notice was built: a queued message's notice is built at enqueue, a
+	 * direct prompt's before its image awaits, and a model switch in between
+	 * flips whether xhigh can be pinned. Mutating the message in place reaches
+	 * both the model view and the transcript: queue rewrites keep message
+	 * identity, and the loop commits a batch (riders included) before it
+	 * records any of it or calls the provider.
+	 */
+	#refreshUltracodeNotice(notices: readonly CustomMessage[] | undefined): void {
+		const notice = notices?.find(message => message.customType === "ultracode-notice");
+		if (notice) notice.content = renderUltracodeNoticeFor(this.#magicKeywordContext());
 	}
 
 	/**
@@ -7857,7 +7961,9 @@ export class AgentSession implements SettingsScope {
 				rawText: typedText,
 				onPromptAdmitted: options?.onPromptAdmitted,
 				promptGeneration: queueGeneration,
-				onDeliver: userAuthoredTurn ? this.#ultracodeDeliveryHook(expandedText, streamingBehavior) : undefined,
+				onDeliver: userAuthoredTurn
+					? this.#ultracodeDeliveryHook(expandedText, streamingBehavior, keywordNotices)
+					: undefined,
 			});
 			outcome.sessionClaimed = queued;
 			if (!queued) {
@@ -7944,7 +8050,9 @@ export class AgentSession implements SettingsScope {
 					descriptionNotice: imageDescriptionNotice,
 				},
 				onPromptAdmitted: options?.onPromptAdmitted,
-				onDeliver: userAuthoredTurn ? this.#ultracodeDeliveryHook(expandedText, streamingBehavior) : undefined,
+				onDeliver: userAuthoredTurn
+					? this.#ultracodeDeliveryHook(expandedText, streamingBehavior, keywordNotices)
+					: undefined,
 			});
 			outcome.sessionClaimed = true;
 			if (!queued) options?.onDropped?.();
@@ -7960,13 +8068,24 @@ export class AgentSession implements SettingsScope {
 		// would yank the winner's in-flight pin and floor. On a kept-alive child
 		// this is the resume-boundary sync instead, which throws (the prompt
 		// fails loudly, nothing dispatched) when the parent is armed and this
-		// model cannot hold xhigh.
-		const undoUltracodeTurnState = userAuthoredTurn ? this.#applyUltracodeTurnState(expandedText) : undefined;
+		// model cannot hold xhigh — except for its spawn-time assignment, whose
+		// state the creator fixed at dispatch.
+		const undoUltracodeTurnState = userAuthoredTurn
+			? this.#applyUltracodeTurnState(expandedText, { spawnAssignment: options?.spawnAssignment })
+			: undefined;
+		// The notice was built before the image awaits above; match it to the
+		// arm just decided.
+		this.#refreshUltracodeNotice(keywordNotices);
 		// The focused view's `.`/`c` continue shortcut is synthetic but typed by
 		// the user: on a kept-alive child it starts a turn at the same resume
 		// boundary as a typed prompt. Executor prompts are agent-attributed and
 		// never `userInitiated`; the executor syncs those itself.
-		if (!userAuthoredTurn && options?.userInitiated === true && this.#agentKind === "sub") {
+		if (
+			!userAuthoredTurn &&
+			options?.userInitiated === true &&
+			!options.spawnAssignment &&
+			this.#agentKind === "sub"
+		) {
 			this.#syncUltracodeAtChildResume();
 		}
 
@@ -8154,7 +8273,9 @@ export class AgentSession implements SettingsScope {
 				prependMessages: keywordNotices,
 				onPromptAdmitted: options?.onPromptAdmitted,
 				onDeliver:
-					keywordText === undefined ? undefined : this.#ultracodeDeliveryHook(keywordText, streamingBehavior),
+					keywordText === undefined
+						? undefined
+						: this.#ultracodeDeliveryHook(keywordText, streamingBehavior, keywordNotices),
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -8202,7 +8323,9 @@ export class AgentSession implements SettingsScope {
 				prependMessages: keywordNotices,
 				onPromptAdmitted: options?.onPromptAdmitted,
 				onDeliver:
-					keywordText === undefined ? undefined : this.#ultracodeDeliveryHook(keywordText, streamingBehavior),
+					keywordText === undefined
+						? undefined
+						: this.#ultracodeDeliveryHook(keywordText, streamingBehavior, keywordNotices),
 			});
 			outcome.sessionClaimed = true;
 			return true;
@@ -8213,6 +8336,7 @@ export class AgentSession implements SettingsScope {
 		// floor armed on a dropped skill turn, or flip a racing winner's in-flight
 		// turn while the loser queues (whose state rides its delivery hook).
 		const undoKeywordTurnState = keywordText === undefined ? undefined : this.#applyUltracodeTurnState(keywordText);
+		this.#refreshUltracodeNotice(keywordNotices);
 		let dispatched = false;
 		try {
 			dispatched = await this.#promptWithMessage(preparedMessage, textContent, {
@@ -8795,7 +8919,8 @@ export class AgentSession implements SettingsScope {
 	 *
 	 * User text from RPC/SDK/collab hosts, so the ultracode keyword counts: a
 	 * steer joins the running turn, so the hook is arm-only (a keyword-free
-	 * steer never disarms the turn it joins).
+	 * steer never disarms the turn it joins). Sent to an idle session it starts
+	 * a turn instead, and the queued-message drain ends a previous arm then.
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
 		if (text.startsWith("/")) {
@@ -8848,8 +8973,10 @@ export class AgentSession implements SettingsScope {
 					onDeliver();
 				};
 				// Promoted to a steer, a keyword-free follow-up keeps only the
-				// caller's own effect (see #followUpRiderAsSteer).
+				// caller's own effect (see #followUpRiderAsSteer); a keyword one
+				// still arms (see #ultracodeArmRiders).
 				if (this.#followUpRiderAsSteer.has(ultracodeHook)) this.#followUpRiderAsSteer.set(rider, onDeliver);
+				if (this.#ultracodeArmRiders.has(ultracodeHook)) this.#ultracodeArmRiders.add(rider);
 			}
 			await this.#queueUserMessage(expandedText, images, "followUp", {
 				timestamp: submittedAt,
@@ -8884,8 +9011,31 @@ export class AgentSession implements SettingsScope {
 			synthetic: true,
 		};
 		// Turn-start side effects (the plan-approval ultracode arm) ride the
-		// message and fire when the loop commits it, never at enqueue.
-		if (options.onDeliver) attachQueuedMessageDeliveryEffect(message, options.onDeliver);
+		// message and fire when the loop commits it, never at enqueue. A deferred
+		// arm that registered its directive renderer also re-renders the
+		// directive's ultracode notice from the live session right after it arms,
+		// in place: the loop commits the message by reference and records and
+		// sends it only after the batch commit (see #refreshUltracodeNotice).
+		const onDeliver = options.onDeliver;
+		const renderPrompt = onDeliver && this.#deferredArmPromptRenderers.get(onDeliver);
+		if (onDeliver) {
+			attachQueuedMessageDeliveryEffect(
+				message,
+				renderPrompt
+					? () => {
+							onDeliver();
+							const rendered = renderPrompt(this.ultracodeArmNotice());
+							content[0] = {
+								type: "text",
+								text:
+									options.expandPromptTemplates === false
+										? rendered
+										: expandPromptTemplate(rendered, [...this.#promptTemplates]),
+							};
+						}
+					: onDeliver,
+			);
+		}
 		this.agent.followUp(message);
 		this.#scheduleIdleQueueDrain();
 	}
@@ -9077,6 +9227,7 @@ export class AgentSession implements SettingsScope {
 					this.agent.hasQueuedMessages()
 				);
 			},
+			beforeContinue: () => this.#applyQueuedTurnStartUltracodeState(),
 			onSkip: () => {
 				this.#queuedMessageDrainScheduled = false;
 			},
@@ -9085,6 +9236,41 @@ export class AgentSession implements SettingsScope {
 				this.#queuedMessageDrainBlocked = this.agent.hasQueuedMessages();
 			},
 		});
+	}
+
+	/**
+	 * Turn-start ultracode state for a run the idle queued-message drain STARTS
+	 * from the steering queue. A steer is arm-only because it normally joins a
+	 * running turn, so a keyword-free one carries no rider. Queued to an IDLE
+	 * session it joins nothing and starts a fresh turn instead: an RPC/SDK
+	 * `steer`, `sendUserMessage({ deliverAs: "steer" })`, a queue-only skill
+	 * steer, a steer that missed the run's last poll, or a follow-up promoted to
+	 * a steer (the promotion dropped its disarm). That turn takes the same
+	 * off-ramp a typed message would. Only the user's own text counts, as for
+	 * the stranded-aside wake: an agent-attributed steer is not the user's turn.
+	 * Follow-ups carry their own full riders and are left to them.
+	 *
+	 * Root: end the previous turn's arm, unless a queued steer arms at commit
+	 * (its rider re-arms). Child: a turn start is a resume boundary, so mirror
+	 * the live parent; a refused pin is an error notice and an unarmed turn.
+	 */
+	#applyQueuedTurnStartUltracodeState(): void {
+		const steering = this.agent.peekSteeringQueue();
+		const userSteer = steering.some(
+			record =>
+				(record.role === "user" && record.attribution === "user") ||
+				(record.role === "custom" && isUserInvokedSkillPrompt(record)),
+		);
+		if (!userSteer) return;
+		if (this.#agentKind === "sub") {
+			this.#syncUltracodeAtChildResumeOrNotify();
+			return;
+		}
+		const armsAtCommit = steering.some(record => {
+			const effect = peekQueuedMessageDeliveryEffect(record);
+			return effect !== undefined && this.#ultracodeArmRiders.has(effect);
+		});
+		if (!armsAtCommit) this.disarmUltracodeTurn();
 	}
 
 	/**
@@ -9757,6 +9943,8 @@ export class AgentSession implements SettingsScope {
 		// starting one, so its ultracode rider takes the steer shape (arm-only): a
 		// keyword-free follow-up's deferred disarm is dropped, while a keyword arm
 		// (or a host's own effect) rides on unchanged. Companions carry no rider.
+		// On an idle session the promoted steer STARTS a turn through the drain
+		// scheduled below, which ends a previous arm itself.
 		const rider = takeQueuedMessageDeliveryEffect(message);
 		const steerRider = rider && this.#followUpRiderAsSteer.has(rider) ? this.#followUpRiderAsSteer.get(rider) : rider;
 		if (steerRider) attachQueuedMessageDeliveryEffect(message, steerRider);

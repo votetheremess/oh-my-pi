@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import * as vm from "node:vm";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgEvalWorkpoolFreshAgents } from "@oh-my-pi/pi-coding-agent/eval/settings";
 import {
@@ -156,28 +157,110 @@ describe("ultracode orchestration contract", () => {
 		expect(withTooling).toContain("```js");
 	});
 
-	it("names only helpers the eval kernels actually export", () => {
+	it("names only helpers the eval kernels actually export, in the kernel that spells them", () => {
 		// v18.1.16 (05bb0c1989) replaced parallel()/pipeline() with handles and
 		// workpool(). A notice teaching a helper the prelude no longer installs
 		// sends the model into a ReferenceError; tie every backticked call the
-		// notice makes to a `globalThis.<name> =` export in the real JS prelude or
-		// a top-level `def <name>(` in the real Python prelude (the notice spells
-		// out both kernels' forms), so the next rename goes red here instead of in
-		// a live turn.
+		// notice makes to the kernel that must provide it, so the next rename
+		// goes red here instead of in a live turn. An either-kernel check is not
+		// enough: every plain name exists in both, so a JS-only rename passed.
+		// - camelCase (`judgeBatch`) is the JS spelling: a `globalThis.<name> =`
+		//   export of the real JS prelude.
+		// - snake_case (`judge_batch`) is the Python spelling: a top-level def or
+		//   binding of the real Python prelude.
+		// - a plain lowercase name is spelled the same in both, and the notice
+		//   offers "Plain JavaScript or Python", so it must exist in BOTH.
 		const exported = new Set([...javascriptPrelude.matchAll(/globalThis\.(\w+) = /g)].map(m => m[1]));
-		const defined = new Set([...pythonPrelude.matchAll(/^ {4}(?:async )?def (\w+)\(/gm)].map(m => m[1]));
-		const named = new Set([...withTooling.matchAll(/`(\w+)\(/g)].map(m => m[1]));
-		for (const name of ["workpool", "agent", "wait", "completion", "judge", "judgeBatch", "phase", "log"]) {
+		// Top-level defs plus bindings (`tool = _ToolProxy()`, `budget = _Budget()`).
+		const defined = new Set(
+			[...pythonPrelude.matchAll(/^ {4}(?:(?:async )?def (\w+)\(|(\w+) = )/gm)].map(m => m[1] ?? m[2]),
+		);
+		const notice = renderUltracodeNotice({ workflowAvailable: true, evalTools: true });
+		const named = new Set([...notice.matchAll(/`(\w+)\(/g)].map(m => m[1] ?? ""));
+		for (const name of ["workpool", "agent", "wait", "completion", "judge", "judgeBatch", "judge_batch", "tool"]) {
 			expect(named.has(name)).toBe(true);
 		}
+		const missing: { js: string[]; python: string[] } = { js: [], python: [] };
 		for (const name of named) {
-			expect(exported.has(name) || defined.has(name)).toBe(true);
+			const pythonSpelling = name.includes("_");
+			const jsSpelling = /[A-Z]/.test(name);
+			if (!pythonSpelling && !exported.has(name)) missing.js.push(name);
+			if (!jsSpelling && !defined.has(name)) missing.python.push(name);
 		}
-		// The Python spelling is taught next to the JS one, and must exist there.
-		expect(named.has("judge_batch")).toBe(true);
-		expect(defined.has("judge_batch")).toBe(true);
-		expect(withTooling).not.toContain("parallel(");
-		expect(withTooling).not.toContain("pipeline(");
+		expect(missing).toEqual({ js: [], python: [] });
+		expect(notice).not.toContain("parallel(");
+		expect(notice).not.toContain("pipeline(");
+	});
+
+	it("teaches Python's handle.wait() and wait() as synchronous, because they are", () => {
+		// prelude.py: `_Handle.wait` and the module-level `wait` are plain defs
+		// that block and return the value; only `await h` (`__await__`) is
+		// awaitable. `await h.wait()` blocks, then raises TypeError on the
+		// returned str/list, losing the result. If the prelude turns either
+		// into a coroutine, this goes red and the notice must change with it.
+		expect(pythonPrelude).toMatch(/^ {8}def wait\(self, timeout=None\):/m);
+		expect(pythonPrelude).toMatch(/^ {4}def wait\(handles, timeout=None, \*, raise_errors=True\):/m);
+		expect(pythonPrelude).toMatch(/^ {8}def __await__\(self\):/m);
+		expect(withTooling).toContain("and so is `h.wait()`: call it without `await`");
+		expect(withTooling).toContain("or `await h` itself for the same result");
+		expect(withTooling).toContain("`wait(handles, timeout=None, *, raise_errors=True)`, synchronous like `h.wait()`");
+	});
+
+	it("tells the truth about spawn-time throws, which raiseErrors:false does not catch", async () => {
+		// Run the REAL JS prelude in its own realm with a stubbed host bridge
+		// whose third spawn is refused the way agent-bridge refuses a spent hard
+		// `+Nk!` ceiling. wait() awaits every pending handle before it applies
+		// raiseErrors, so one spawn-time throw rejects the whole round; the guard
+		// the notice teaches keeps one slot per input instead.
+		let spawned = 0;
+		const results = new Map<string, { status: string; text: string }>();
+		const sandbox: Record<string, unknown> = {
+			__omp_helpers__: { hasRoot: () => false },
+			__omp_emit_status__: () => {},
+			__omp_log__: () => {},
+			__omp_display__: () => {},
+			__omp_call_tool__: async (name: string, args: { items?: { id: string }[] }) => {
+				if (name === "__agent__") {
+					spawned++;
+					if (spawned === 3) throw new Error("agent() blocked: turn token budget exhausted");
+					const id = `a${spawned}`;
+					results.set(id, { status: "completed", text: `done ${spawned}` });
+					return { id, agent: "task" };
+				}
+				if (name === "__wait__") return { items: (args.items ?? []).map(item => results.get(item.id)) };
+				return {};
+			},
+		};
+		vm.runInContext(javascriptPrelude, vm.createContext(sandbox));
+		type Pending = PromiseLike<unknown> & { wait(): Promise<unknown> };
+		const agent = sandbox.agent as (prompt: string) => Pending;
+		const wait = sandbox.wait as (handles: Pending[], opts: { raiseErrors: boolean }) => Promise<unknown[]>;
+
+		await expect(
+			wait(
+				[1, 2, 3, 4].map(i => agent(`vote ${i}`)),
+				{ raiseErrors: false },
+			),
+		).rejects.toThrow("turn token budget exhausted");
+		spawned = 0;
+		const guarded = await Promise.all(
+			[1, 2, 3, 4].map(i =>
+				agent(`vote ${i}`)
+					.wait()
+					.catch((error: unknown) => error),
+			),
+		);
+		expect(guarded.map(value => (value instanceof Error ? value.message : value))).toEqual([
+			"done 1",
+			"done 2",
+			"agent() blocked: turn token budget exhausted",
+			"done 4",
+		]);
+
+		expect(withTooling).toContain("`raiseErrors: false` only isolates subagents that fail AFTER spawning");
+		expect(withTooling).toContain("`await Promise.all(xs.map(x => agent(...).wait().catch(e => e)))`");
+		expect(withTooling).toContain("a spawn-time throw still rejects the round");
+		expect(withTooling).not.toContain("a failed slot becomes the `Error` that the filter drops");
 	});
 
 	it("teaches judge() as a direct answer and judgeBatch as the bulk path", () => {
@@ -449,6 +532,26 @@ describe("ultracode notice renders live session facts", () => {
 		// there is no effort target to spend through the think tool either.
 		expect(renderUltracodeNotice({ workflowAvailable: true, effortPinned: false, effortApplied: false })).toBe(
 			unarmed,
+		);
+	});
+
+	it("never promises an orchestration contract or a raised effort the render does not have", () => {
+		// Unpinned AND no eval/task: the effort block used to say "the
+		// orchestration contract below still applies" right above the block that
+		// says no fan-out exists, and told the model to spend a "raised effort"
+		// it had just been told was not raised.
+		const neither = renderUltracodeNotice({ workflowAvailable: false, effortPinned: false });
+		expect(neither).toContain("NOT armed");
+		expect(neither).toContain("not both active");
+		expect(neither).not.toContain("orchestration contract below");
+		expect(neither).not.toContain("raised effort");
+		expect(neither).toContain("spend the effort you have on depth instead");
+		// Each half keeps its sentence where it is true.
+		expect(renderUltracodeNotice({ workflowAvailable: true, effortPinned: false })).toContain(
+			"The orchestration contract below still applies",
+		);
+		expect(renderUltracodeNotice({ workflowAvailable: false, effortPinned: true })).toContain(
+			"spend the raised effort on depth instead",
 		);
 	});
 

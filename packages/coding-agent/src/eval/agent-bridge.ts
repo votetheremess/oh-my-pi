@@ -18,6 +18,7 @@ import type { NestedRepoPatch } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./js/shared/types";
+import { cfgUltracode } from "../modes/settings";
 
 /** Synthetic bridge name reserved for the `agent()` helper across both runtimes. */
 export const EVAL_AGENT_BRIDGE_NAME = "__agent__";
@@ -168,6 +169,9 @@ async function buildEvalAgentResult(execution: StructuredSubagentResult): Promis
 /** Register a background subagent and return its handle immediately. */
 export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentHandleResult> {
 	const parsed = parseAgentArgs(args);
+	// Captured at the call: the handle returns while the background job is still
+	// preflighting, and by the time it spawns the turn that asked may have ended.
+	const ultracodeArmed = cfgUltracode.get(options.session.settings);
 	const turnBudget = options.session.getTurnBudget?.();
 	if (turnBudget?.hard && turnBudget.total !== null && turnBudget.spent >= turnBudget.total) {
 		throw new ToolError(
@@ -222,6 +226,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 						...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 						...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
 						identity: { id, label: parsed.label },
+						ultracodeArmed,
 						...(isolation ? { isolation } : {}),
 						...(customTools ? { customTools } : {}),
 						retainArtifacts: true,

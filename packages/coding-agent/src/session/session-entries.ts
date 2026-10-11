@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type {
+	Effort,
 	ImageContent,
 	MessageAttribution,
 	ServiceTierByFamily,
@@ -279,6 +280,13 @@ export interface SessionInitEntry extends SessionEntryBase {
 	 * borrowed xhigh behind as if the user had chosen it.
 	 */
 	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
+	/**
+	 * The effort ceiling the child would have had WITHOUT ultracode (only written
+	 * next to `ultracode`; `null` = none). A cold revive hands it back with the
+	 * restore level so the disarmed child is not left capped at the pin's xhigh.
+	 * Absent in transcripts written before it existed: keep the current ceiling.
+	 */
+	ultracodeRestoreCeiling?: Effort | null;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

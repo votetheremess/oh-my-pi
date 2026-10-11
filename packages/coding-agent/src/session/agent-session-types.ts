@@ -201,6 +201,14 @@ export interface AgentSessionConfig {
 	 * lifecycle sync disarms it. Roots leave it unset: they capture at pin time.
 	 */
 	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
+	/**
+	 * Effort ceiling the ultracode handback restores, next to
+	 * {@link ultracodeRestoreLevel}: the ceiling a child born armed would have
+	 * had unpinned (its pin raised the session ceiling to xhigh). `null` = no
+	 * ceiling; `undefined` = unknown (a legacy transcript), so the current
+	 * ceiling stays. Set only for a session born armed.
+	 */
+	ultracodeRestoreCeiling?: Effort | null;
 	/** Retry chain ownership when startup selected one of its fallback entries. */
 	initialRetryFallback?: InitialRetryFallbackState;
 	/** Skip retry.fallbackChains validation at construction; the host calls `validateRetryFallbackChains()` later. */
@@ -435,6 +443,13 @@ export interface PromptOptions {
 	userInitiated?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/**
+	 * This prompt is a child's spawn-time assignment (the `/tan` work prompt,
+	 * the Agents Hub architect request) whose ultracode state its creator fixed
+	 * at dispatch. It is NOT a resume boundary, so the child keeps that state
+	 * instead of re-mirroring its parent's live flag. Ignored on roots.
+	 */
+	spawnAssignment?: boolean;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
 	/** Delegator's open-endedness description (task tool `solutionSpace`); replaces the prompt as `auto` thinking classification input. */

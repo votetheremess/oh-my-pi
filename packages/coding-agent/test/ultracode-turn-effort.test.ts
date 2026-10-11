@@ -29,24 +29,29 @@ import {
 	type CommittableAsideMessage,
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
-import type { Api, ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { Api, Context, ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { cfgUltracode } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgMagicKeyword, cfgUltracode } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { syncChildUltracodeAtResume } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	convertToLlm,
+	SKILL_PROMPT_MESSAGE_TYPE,
+	type SkillPromptDetails,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelControls, type ModelControlsHost } from "@oh-my-pi/pi-coding-agent/session/model-controls";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
+import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-tui/chat/messages";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -655,6 +660,44 @@ describe("ultracode resume receipt", () => {
 	});
 });
 
+/** Bundled ladder without xhigh (low/medium/high), for the fail-loud cases. */
+const NO_XHIGH_MODEL_ID = "claude-sonnet-4-6";
+
+/** Registry id of a kept-alive child the executor (or /tan) registered under the root. */
+const FOCUSED_CHILD_ID = `${MAIN_AGENT_ID}.Focused`;
+
+/** Registers a live root carrying `parentSettings` and `child` beneath it in the global registry. */
+function registerFocusedChild(parentSettings: Settings, child: AgentSession): void {
+	const registry = AgentRegistry.global();
+	// Only `cfgUltracode.get(settings)` is read off the parent (AGENTS.md, "Faking AgentSession").
+	const parent = { settings: parentSettings } as unknown as AgentSession;
+	registry.register({ id: MAIN_AGENT_ID, displayName: MAIN_AGENT_ID, kind: "main", session: parent });
+	registry.register({
+		id: FOCUSED_CHILD_ID,
+		displayName: "task",
+		kind: "sub",
+		parentId: MAIN_AGENT_ID,
+		session: child,
+	});
+}
+
+/** A user-invoked `/skill:deep-work <args>` prompt, the shape the skill command hands promptCustomMessage. */
+function skillPrompt(args: string, extra: ImageContent[] = []) {
+	const details: SkillPromptDetails = {
+		name: "deep-work",
+		path: "/skills/deep-work/SKILL.md",
+		args,
+		lineCount: 1,
+	};
+	return {
+		customType: SKILL_PROMPT_MESSAGE_TYPE,
+		content: [{ type: "text" as const, text: `Skill body\n\nUser: ${args}` }, ...extra],
+		display: true,
+		details,
+		attribution: "user" as const,
+	};
+}
+
 // The seam between AgentSession and ModelControls: arm in the keyword branch of
 // the turn-state applier, disarm in its keyword-free branch, disarm again on
 // every session transition and user-driven level pick, undo on a dropped
@@ -745,9 +788,6 @@ describe("AgentSession ultracode turn wiring", () => {
 		});
 		return { session: created, settings, notices };
 	}
-
-	/** Bundled ladder without xhigh (low/medium/high), for the fail-loud cases. */
-	const NO_XHIGH_MODEL_ID = "claude-sonnet-4-6";
 
 	/** Forces the streaming queue path in prompt() without a live agent loop. */
 	function forceStreaming(target: AgentSession): void {
@@ -1283,7 +1323,8 @@ describe("AgentSession ultracode turn wiring", () => {
 		await session.prompt("keyword-free child aside", { streamingBehavior: "aside" });
 		await resumeStranded(session, promptSpy);
 
-		// The parent's flag is the parent's to end; the child's turn inherits it.
+		// The child's own text never ends a flag: only the live parent does, at the
+		// wake's resume sync (see the stranded-wake cases), and there is none here.
 		expect(cfgUltracode.get(created.settings)).toBe(true);
 	});
 
@@ -1541,7 +1582,7 @@ describe("AgentSession ultracode turn wiring", () => {
 		expect(session.thinkingLevel).toBe(Effort.Low);
 	});
 
-	it("re-pins over the level an internal temporary swap brings with it", async () => {
+	it("re-pins over the level an internal temporary swap brings with it, and hands back to that level", async () => {
 		const created = await createSession();
 		session = created.session;
 		session.setThinkingLevel(Effort.Low);
@@ -1549,15 +1590,17 @@ describe("AgentSession ultracode turn wiring", () => {
 		await session.prompt("please ultracode this refactor");
 		expect(session.thinkingLevel).toBe(Effort.XHigh);
 
-		// The prewalk / compaction-promotion shape: an internal swap that names
-		// its own level. The keyword outranks it for this turn.
+		// The prewalk / deferred plan-model shape: an internal swap that names
+		// its own level. The keyword outranks it for this turn, but that level is
+		// where the session would be without the keyword, so the turn hands back
+		// to it rather than to the level the swap replaced.
 		await session.setModelTemporary(pickedModel(), Effort.Medium, undefined, "internal");
 
 		expect(cfgUltracode.get(created.settings)).toBe(true);
 		expect(session.thinkingLevel).toBe(Effort.XHigh);
 
 		await session.prompt("keyword-free follow-up");
-		expect(session.thinkingLevel).toBe(Effort.Low);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
 	});
 
 	it("warns when an internal swap lands on a model that cannot carry the pin", async () => {
@@ -2086,23 +2129,6 @@ describe("AgentSession ultracode turn wiring", () => {
 	// borrowed xhigh back once the parent disarmed, re-pin while it is armed,
 	// refuse loudly when this model cannot hold xhigh.
 
-	const FOCUSED_CHILD_ID = `${MAIN_AGENT_ID}.Focused`;
-
-	/** Registers a live root carrying `parentSettings` and `child` beneath it in the global registry. */
-	function registerFocusedChild(parentSettings: Settings, child: AgentSession): void {
-		const registry = AgentRegistry.global();
-		// Only `cfgUltracode.get(settings)` is read off the parent (AGENTS.md, "Faking AgentSession").
-		const parent = { settings: parentSettings } as unknown as AgentSession;
-		registry.register({ id: MAIN_AGENT_ID, displayName: MAIN_AGENT_ID, kind: "main", session: parent });
-		registry.register({
-			id: FOCUSED_CHILD_ID,
-			displayName: "task",
-			kind: "sub",
-			parentId: MAIN_AGENT_ID,
-			session: child,
-		});
-	}
-
 	/** A kept-alive child the executor built under an armed parent: pinned, flagged, restore level low. */
 	function pinnedChild(): Promise<CreatedSession> {
 		return createSession({
@@ -2301,6 +2327,681 @@ describe("AgentSession ultracode turn wiring", () => {
 		expect(promptMessages.map(message => message.customType).filter(Boolean)).toEqual([]);
 		expect(cfgUltracode.get(created.settings)).toBe(false);
 		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	// --- a child's spawn-time assignment is not a resume boundary ------------
+	//
+	// `/tan` and the Agents Hub architect read the parent's flag ONCE at
+	// dispatch and build the child pinned (or not) from it. The child's first
+	// prompt is that assignment, not a resume: re-mirroring the parent there
+	// would let a parent flip between dispatch and the background job's prompt
+	// re-arm or disarm the child behind its creator's back (or throw on a model
+	// without xhigh although it was dispatched unarmed).
+
+	it("keeps a spawn-assigned child at its dispatch-time pin after the parent disarmed; a later typed prompt still syncs", async () => {
+		const created = await pinnedChild();
+		session = created.session;
+		const target = session;
+		// Dispatched armed; the parent's turn has ended since.
+		registerFocusedChild(Settings.isolated(), session);
+		const atDispatch: Array<{ level: unknown; armed: boolean }> = [];
+		vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			atDispatch.push({ level: target.thinkingLevel, armed: cfgUltracode.get(created.settings) });
+		});
+
+		await session.prompt("work the tangent", { attribution: "user", spawnAssignment: true });
+		// Control: the same child's next typed prompt IS a resume boundary.
+		await session.prompt("hi");
+
+		expect(atDispatch).toEqual([
+			{ level: Effort.XHigh, armed: true },
+			{ level: Effort.Low, armed: false },
+		]);
+	});
+
+	it("keeps a spawn-assigned child dispatched unarmed on a model without xhigh unarmed when the parent armed later", async () => {
+		const created = await createSession({
+			agentKind: "sub",
+			agentId: FOCUSED_CHILD_ID,
+			modelId: NO_XHIGH_MODEL_ID,
+			thinkingLevel: Effort.Low,
+		});
+		session = created.session;
+		registerFocusedChild(Settings.isolated({ ultracode: true }), session);
+		const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		// Without the option this prompt throws UltracodeEffortError (see the
+		// focused-child refusal case above); the assignment runs as dispatched.
+		await session.prompt("work the tangent", { attribution: "user", spawnAssignment: true });
+
+		expect(agentPrompt).toHaveBeenCalledTimes(1);
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	// --- a refused arm never leaves an earlier turn's flag up ---------------
+
+	it("drops a flag still up from an earlier turn when the keyword's re-arm is refused, so the flag matches 'not armed'", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		await session.prompt("please ultracode this refactor");
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+
+		// An extension swap keeps the armed turn (by design), onto a model that
+		// cannot carry the pin.
+		const noXhigh = modelRegistry.find("anthropic", NO_XHIGH_MODEL_ID);
+		if (!noXhigh) throw new Error(`Expected bundled anthropic/${NO_XHIGH_MODEL_ID}`);
+		await session.setModel(noXhigh, "default", undefined, "extension");
+		expect(cfgUltracode.get(created.settings)).toBe(true);
+
+		await session.prompt("ultracode the next phase");
+
+		// The warning and the notice both say "not armed": the executor must not
+		// keep flooring (or refusing) every spawn on a flag the user was told
+		// is down, and the borrowed level goes back.
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+		const messages = promptSpy.mock.calls[1]![0] as unknown as Array<{ customType?: string; content?: string }>;
+		expect(messages.find(message => message.customType === "ultracode-notice")?.content).toContain(
+			"This turn is NOT armed",
+		);
+		expect(created.notices.at(-1)).toMatchObject({ level: "warning", source: "ultracode" });
+		expect(created.notices.at(-1)?.message).toContain("this turn is not armed");
+	});
+
+	it("words a refused arm under an effort ceiling by that ceiling, not as a missing xhigh tier", async () => {
+		const created = await createSession({ thinkingLevelCeiling: Effort.High });
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please ultracode this refactor");
+
+		// The model HAS the rung; telling the user it "exposes [..., xhigh]" and
+		// still refused names the wrong fix. The ceiling is what to raise.
+		const warning = created.notices.find(notice => notice.source === "ultracode");
+		expect(warning?.level).toBe("warning");
+		expect(warning?.message).toContain("effort ceiling (high)");
+		expect(warning?.message).toContain("this turn is not armed");
+		expect(warning?.message).not.toContain("exposes [");
+	});
+
+	// --- an IRC wake on a child is a resume boundary, however it was reached --
+	//
+	// The bus syncs a recipient that is idle at delivery. A record that strands
+	// past the child's last aside poll (or a wake that lost the prompt race, or
+	// one deferred while pooled) is woken later by the session itself, and that
+	// turn must mirror the live parent too, not run on the previous turn's pin.
+
+	/** {@link resumeStranded}, also recording the child's state when the wake dispatches. */
+	async function wakeStranded(
+		target: AgentSession,
+		settings: Settings,
+		promptSpy: Mock<AgentSession["agent"]["prompt"]>,
+	): Promise<{ records: AgentMessage[]; level: unknown; armed: boolean }> {
+		const woke = Promise.withResolvers<{ records: AgentMessage[]; level: unknown; armed: boolean }>();
+		promptSpy.mockImplementation(async (records: unknown) => {
+			woke.resolve({
+				records: records as AgentMessage[],
+				level: target.thinkingLevel,
+				armed: cfgUltracode.get(settings),
+			});
+		});
+		Object.defineProperty(target, "isStreaming", { configurable: true, get: () => false });
+		await target.runModeExitTeardown(async () => {});
+		return withTimeout(woke.promise, 2_000, "The stranded wake never dispatched");
+	}
+
+	it("syncs a child with its live parent before a stranded wake starts its turn", async () => {
+		const created = await pinnedChild();
+		session = created.session;
+		registerFocusedChild(Settings.isolated(), session);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+		forceStreaming(session);
+		await session.prompt("a note for the running turn", { streamingBehavior: "aside" });
+
+		const wake = await wakeStranded(session, created.settings, promptSpy);
+
+		// The parent's turn ended while the record was stranded: the wake turn
+		// hands the borrowed xhigh back instead of running on it.
+		expect(wake.records.some(record => record.role === "user")).toBe(true);
+		expect(wake).toMatchObject({ level: Effort.Low, armed: false });
+	});
+
+	it("reports a refused pin at a child's stranded wake and still runs the woken turn, unarmed", async () => {
+		const created = await createSession({
+			agentKind: "sub",
+			agentId: FOCUSED_CHILD_ID,
+			modelId: NO_XHIGH_MODEL_ID,
+			thinkingLevel: Effort.Low,
+		});
+		session = created.session;
+		registerFocusedChild(Settings.isolated({ ultracode: true }), session);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+		forceStreaming(session);
+		await session.prompt("a note for the running turn", { streamingBehavior: "aside" });
+
+		const wake = await wakeStranded(session, created.settings, promptSpy);
+
+		// The wake cannot fail its own records back to a sender, so the refusal
+		// is loud as a notice, the records still land, and nothing is flagged.
+		expect(wake.records.some(record => record.role === "user")).toBe(true);
+		expect(wake).toMatchObject({ level: Effort.Low, armed: false });
+		const error = created.notices.find(notice => notice.source === "ultracode");
+		expect(error?.level).toBe("error");
+		expect(error?.message).toContain("ultracode requires xhigh");
+		expect(error?.message).toContain("this turn is not armed");
+	});
+
+	// --- queued-path branches the direct-path cases cannot see -----------------
+
+	it("never arms from a queued steer or follow-up while the ultracode keyword is switched off", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		cfgMagicKeyword.ultracode.set(created.settings, false);
+		forceStreaming(session);
+
+		await session.prompt("ultracode the rest of this turn", { streamingBehavior: "steer" });
+		await session.prompt("ultracode the next piece", { streamingBehavior: "followUp" });
+
+		// Switched off, the word is plain text: the steer is a keyword-free steer
+		// (nothing rides it) and the follow-up a keyword-free follow-up.
+		expect(queuedHook(session.agent.peekSteeringQueue().find(m => m.role === "user"))).toBeUndefined();
+		deliverQueued(session.agent.peekFollowUpQueue().find(m => m.role === "user"));
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("arms a queued skill prompt that carries ultracode in its args at delivery, not at enqueue", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		forceStreaming(session);
+
+		await session.promptCustomMessage(skillPrompt("ultracode the refactor"), { streamingBehavior: "followUp" });
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+
+		deliverQueued(
+			session.agent.peekFollowUpQueue().find(m => m.role === "custom" && m.customType === SKILL_PROMPT_MESSAGE_TYPE),
+		);
+		expect(cfgUltracode.get(created.settings)).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("arms a skill prompt that lost the dispatch race during its image prep at delivery", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const normalization = holdImageNormalization();
+
+		const dispatch = session.promptCustomMessage(skillPrompt("ultracode the refactor", [IMAGE]), {
+			streamingBehavior: "followUp",
+		});
+		await withTimeout(normalization.started, 2_000, "Skill image normalization never started");
+		// Another submission takes the session while the images are prepared.
+		forceStreaming(session);
+		normalization.release();
+		await dispatch;
+
+		expect(agentPrompt).not.toHaveBeenCalled();
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+		deliverQueued(
+			session.agent.peekFollowUpQueue().find(m => m.role === "custom" && m.customType === SKILL_PROMPT_MESSAGE_TYPE),
+		);
+		expect(cfgUltracode.get(created.settings)).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("prompt(): a keyword prompt that lost the dispatch race during its image prep arms at delivery", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const normalization = holdImageNormalization();
+
+		const dispatch = session.prompt("ultracode the rest of this turn", {
+			images: [IMAGE],
+			streamingBehavior: "steer",
+		});
+		await withTimeout(normalization.started, 2_000, "Normalization never started");
+		forceStreaming(session);
+		normalization.release();
+		await dispatch;
+
+		// The loser queues: nothing flips under the winner's turn at enqueue.
+		expect(agentPrompt).not.toHaveBeenCalled();
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+		deliverQueued(session.agent.peekSteeringQueue().find(m => m.role === "user"));
+		expect(cfgUltracode.get(created.settings)).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("prompt(): a keyword-free follow-up that lost the dispatch race disarms at delivery, not at enqueue", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		session.armUltracodeTurn();
+		const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const normalization = holdImageNormalization();
+
+		const dispatch = session.prompt("now the plain next step", { images: [IMAGE], streamingBehavior: "followUp" });
+		await withTimeout(normalization.started, 2_000, "Normalization never started");
+		forceStreaming(session);
+		normalization.release();
+		await dispatch;
+
+		expect(agentPrompt).not.toHaveBeenCalled();
+		expect(cfgUltracode.get(created.settings)).toBe(true);
+		deliverQueued(session.agent.peekFollowUpQueue().find(m => m.role === "user"));
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+
+	it("sendUserMessage(): a keyword aside joining a running turn arms when the aside poll commits it", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+		forceStreaming(session);
+
+		await session.sendUserMessage("ultracode the rest of this", { deliverAs: "aside" });
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+
+		const records = await resumeStranded(session, promptSpy);
+		deliverQueued(records.find(m => m.role === "user"));
+		expect(cfgUltracode.get(created.settings)).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("followUp(): an agent-attributed follow-up neither arms nor disarms a root, keyword or not", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		forceStreaming(session);
+
+		await session.followUp("ultracode the next piece", undefined, { attribution: "agent" });
+		expect(queuedHook(session.agent.peekFollowUpQueue().find(m => m.role === "user"))).toBeUndefined();
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+
+		session.armUltracodeTurn();
+		await session.followUp("carry on with the brief", undefined, { attribution: "agent" });
+		const followUps = session.agent.peekFollowUpQueue().filter(m => m.role === "user");
+		expect(followUps).toHaveLength(2);
+		expect(queuedHook(followUps[1])).toBeUndefined();
+		expect(cfgUltracode.get(created.settings)).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+	});
+
+	it("sendUserMessage(): an agent-attributed keyword aside or steer never arms a root", async () => {
+		const created = await createSession();
+		session = created.session;
+		session.setThinkingLevel(Effort.Low);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.setIrcWakeTurnObserver(() => undefined);
+		forceStreaming(session);
+
+		await session.sendUserMessage("ultracode this too", { deliverAs: "aside", attribution: "agent" });
+		const records = await resumeStranded(session, promptSpy);
+		expect(queuedHook(records.find(m => m.role === "user"))).toBeUndefined();
+
+		forceStreaming(session);
+		await session.sendUserMessage("ultracode the rest of this", { deliverAs: "steer", attribution: "agent" });
+		expect(queuedHook(session.agent.peekSteeringQueue().find(m => m.role === "user"))).toBeUndefined();
+		expect(cfgUltracode.get(created.settings)).toBe(false);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+	});
+});
+
+// The queue cases above fire riders by hand. These drive the REAL agent loop
+// against a mock provider and read the session state INSIDE each model call,
+// so they see what a turn actually ran at: including the idle queue drain,
+// which starts a turn from queued text with no rider of its own, and what the
+// model and the transcript were told about the arm.
+describe("ultracode turn state through the real agent loop", () => {
+	let modelRegistry: ModelRegistry;
+	let session: AgentSession | undefined;
+
+	beforeAll(() => {
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage);
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await session?.dispose();
+		session = undefined;
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	/** One model call, read inside the provider call. */
+	interface ModelCall {
+		/** Text of the request's last user-role message. */
+		userText: string;
+		level: unknown;
+		armed: boolean;
+		/** Every text part the request carried (notices and directives included). */
+		texts: string[];
+	}
+
+	interface LoopSession {
+		session: AgentSession;
+		settings: Settings;
+		calls: ModelCall[];
+		/** Resolves once the provider has been called `count` times. */
+		callsReached(count: number): Promise<void>;
+		/** Holds the NEXT model call open, so the turn stays streaming, until released. */
+		holdNextCall(): { started: Promise<void>; release: () => void };
+	}
+
+	function textsOf(message: Context["messages"][number]): string[] {
+		if (typeof message.content === "string") return [message.content];
+		return message.content.flatMap(part => (part.type === "text" ? [part.text] : []));
+	}
+
+	function loopSession(options?: {
+		modelId?: string;
+		agentKind?: "main" | "sub";
+		agentId?: string;
+		thinkingLevel?: ConfiguredThinkingLevel;
+		thinkingLevelCeiling?: Effort;
+		ultracodeRestoreLevel?: ConfiguredThinkingLevel;
+		ultracode?: boolean;
+	}): LoopSession {
+		const model = getBundledModel("anthropic", options?.modelId ?? "claude-sonnet-4-5");
+		if (!model) throw new Error(`Expected bundled anthropic/${options?.modelId ?? "claude-sonnet-4-5"}`);
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			...(options?.ultracode ? { ultracode: true } : {}),
+		});
+		const calls: ModelCall[] = [];
+		const callWaiters: Array<{ count: number; reached: () => void }> = [];
+		let hold: { started: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> } | undefined;
+		// oxlint-disable-next-line prefer-const -- read by the model handler before assignment
+		let target: AgentSession | undefined;
+		const mock = createMockModel({
+			handler: async context => {
+				const lastUser = context.messages.findLast(message => message.role === "user");
+				calls.push({
+					userText: lastUser ? textsOf(lastUser).join("") : "",
+					level: target?.thinkingLevel,
+					armed: cfgUltracode.get(settings),
+					texts: context.messages.flatMap(textsOf),
+				});
+				for (const waiter of callWaiters) if (calls.length >= waiter.count) waiter.reached();
+				const held = hold;
+				hold = undefined;
+				if (held) {
+					held.started.resolve();
+					await held.release.promise;
+				}
+				return { content: ["ok"] };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		target = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			agentKind: options?.agentKind,
+			agentId: options?.agentId,
+			thinkingLevel: options?.thinkingLevel,
+			thinkingLevelCeiling: options?.thinkingLevelCeiling,
+			ultracodeRestoreLevel: options?.ultracodeRestoreLevel,
+		});
+		session = target;
+		return {
+			session: target,
+			settings,
+			calls,
+			callsReached: count => {
+				if (calls.length >= count) return Promise.resolve();
+				const reached = Promise.withResolvers<void>();
+				callWaiters.push({ count, reached: () => reached.resolve() });
+				return reached.promise;
+			},
+			holdNextCall: () => {
+				const started = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				hold = { started, release };
+				return { started: started.promise, release: () => release.resolve() };
+			},
+		};
+	}
+
+	/**
+	 * Resolves once `count` model calls ran and the run that made the last one
+	 * has settled. The idle queue drain starts its turn on a later task, so the
+	 * wait is on the provider call itself, not on the queue call returning.
+	 */
+	async function idleAfter(loop: LoopSession, count: number): Promise<void> {
+		await withTimeout(loop.callsReached(count), 5_000, `The provider never saw call ${count}`);
+		await loop.session.waitForIdle();
+		expect(loop.calls).toHaveLength(count);
+	}
+
+	/** A root whose last turn was an ultracode turn: idle, pinned, flagged, handback low. */
+	async function armedIdleRoot(): Promise<LoopSession> {
+		const loop = loopSession();
+		loop.session.setThinkingLevel(Effort.Low);
+		await loop.session.prompt("please ultracode this refactor");
+		await idleAfter(loop, 1);
+		expect(loop.calls[0]).toMatchObject({ level: Effort.XHigh, armed: true });
+		return loop;
+	}
+
+	// --- a keyword-free steer queued to an IDLE root starts a turn: it disarms ---
+
+	it("an idle keyword-free steer() starts a fresh turn that ends the previous arm", async () => {
+		const loop = await armedIdleRoot();
+
+		await loop.session.steer("now the plain next step");
+		await idleAfter(loop, 2);
+
+		expect(loop.calls[1].userText).toContain("now the plain next step");
+		expect(loop.calls[1]).toMatchObject({ level: Effort.Low, armed: false });
+	});
+
+	it("an idle sendUserMessage({ deliverAs: 'steer' }) starts a fresh turn that ends the previous arm", async () => {
+		const loop = await armedIdleRoot();
+
+		await loop.session.sendUserMessage("now the plain next step", { deliverAs: "steer" });
+		await idleAfter(loop, 2);
+
+		expect(loop.calls[1].userText).toContain("now the plain next step");
+		expect(loop.calls[1]).toMatchObject({ level: Effort.Low, armed: false });
+	});
+
+	it("an idle queue-only skill steer without the keyword starts a fresh turn that ends the previous arm", async () => {
+		const loop = await armedIdleRoot();
+
+		await loop.session.promptCustomMessage(skillPrompt("now the plain next step"), {
+			queueOnly: true,
+			streamingBehavior: "steer",
+		});
+		await idleAfter(loop, 2);
+
+		expect(loop.calls[1].texts.some(text => text.includes("User: now the plain next step"))).toBe(true);
+		expect(loop.calls[1]).toMatchObject({ level: Effort.Low, armed: false });
+	});
+
+	it("promoting a held keyword-free follow-up on an idle root starts a turn that ends the previous arm", async () => {
+		const loop = loopSession();
+		loop.session.setThinkingLevel(Effort.Low);
+		const held = loop.holdNextCall();
+		const first = loop.session.prompt("please ultracode this refactor");
+		await withTimeout(held.started, 2_000, "The armed turn never reached the model");
+		await loop.session.followUp("now the plain next step");
+		// RPC `abort` interrupts without clearing the queue: the follow-up is held.
+		const abort = loop.session.abort({ reason: USER_INTERRUPT_LABEL });
+		held.release();
+		await abort;
+		await first.catch(() => {});
+		await loop.session.waitForIdle();
+		expect(loop.session.agent.peekFollowUpQueue().some(message => message.role === "user")).toBe(true);
+		expect(cfgUltracode.get(loop.settings)).toBe(true);
+
+		// Promotion drops the follow-up's disarm (a steer normally JOINS a run),
+		// but on an idle session the steer STARTS one.
+		expect(loop.session.promoteQueuedMessage("now the plain next step")).toBe(true);
+		await idleAfter(loop, 2);
+
+		expect(loop.calls[1].userText).toContain("now the plain next step");
+		expect(loop.calls[1]).toMatchObject({ level: Effort.Low, armed: false });
+	});
+
+	it("an idle steer on a kept-alive child is a resume boundary: it mirrors the live parent first", async () => {
+		const loop = loopSession({
+			agentKind: "sub",
+			agentId: FOCUSED_CHILD_ID,
+			thinkingLevel: Effort.XHigh,
+			thinkingLevelCeiling: Effort.XHigh,
+			ultracodeRestoreLevel: Effort.Low,
+			ultracode: true,
+		});
+		// The child was spawned armed; the parent's turn has ended since.
+		registerFocusedChild(Settings.isolated(), loop.session);
+
+		await loop.session.steer("now the plain next step");
+		await idleAfter(loop, 1);
+
+		expect(loop.calls[0]).toMatchObject({ level: Effort.Low, armed: false });
+	});
+
+	it("control: an idle steer carrying the keyword still arms the turn it starts", async () => {
+		const loop = loopSession();
+		loop.session.setThinkingLevel(Effort.Low);
+
+		await loop.session.steer("ultracode the next step");
+		await idleAfter(loop, 1);
+
+		expect(loop.calls[0]).toMatchObject({ level: Effort.XHigh, armed: true });
+	});
+
+	it("control: a keyword-free steer that JOINS a running armed turn leaves it armed", async () => {
+		const loop = loopSession();
+		loop.session.setThinkingLevel(Effort.Low);
+		const held = loop.holdNextCall();
+		const first = loop.session.prompt("please ultracode this refactor");
+		await withTimeout(held.started, 2_000, "The armed turn never reached the model");
+
+		await loop.session.steer("also mind the tests");
+		held.release();
+		await first;
+		await idleAfter(loop, 2);
+
+		// Same run, next step: "also do X" mid-turn must not yank the pin.
+		expect(loop.calls[1].userText).toContain("also mind the tests");
+		expect(loop.calls[1]).toMatchObject({ level: Effort.XHigh, armed: true });
+	});
+
+	// --- the notice the model reads matches the arm decided at delivery --------
+	//
+	// A queued keyword message carries its hidden notice from ENQUEUE, but the
+	// arm is decided when the loop delivers it. A model switch in between flips
+	// whether xhigh can be pinned; the model must be told what actually happened,
+	// and so must the transcript the session records.
+
+	const PINNED = "has already pinned this turn to exactly xhigh";
+	const NOT_ARMED = "This turn is NOT armed";
+
+	function transcript(loop: LoopSession): string {
+		return JSON.stringify(loop.session.sessionManager.getEntries());
+	}
+
+	function bundled(id: string): Model<Api> {
+		const model = modelRegistry.find("anthropic", id);
+		if (!model) throw new Error(`Expected bundled anthropic/${id}`);
+		return model;
+	}
+
+	it("tells the model a queued keyword follow-up is NOT armed when its model lost xhigh before delivery", async () => {
+		const loop = loopSession();
+		loop.session.setThinkingLevel(Effort.Low);
+		const held = loop.holdNextCall();
+		const first = loop.session.prompt("start the work");
+		await withTimeout(held.started, 2_000, "The first turn never reached the model");
+
+		await loop.session.prompt("ultracode the next piece", { streamingBehavior: "followUp" });
+		// Rendered at enqueue on an xhigh-capable model.
+		const queued = loop.session.agent
+			.peekFollowUpQueue()
+			.find(m => m.role === "custom" && m.customType === "ultracode-notice");
+		expect(JSON.stringify(queued)).toContain(PINNED);
+		await loop.session.setModel(bundled(NO_XHIGH_MODEL_ID));
+		held.release();
+		await first;
+		await idleAfter(loop, 2);
+
+		expect(loop.calls[1]).toMatchObject({ armed: false });
+		expect(loop.calls[1].texts.some(text => text.includes(NOT_ARMED))).toBe(true);
+		expect(loop.calls[1].texts.some(text => text.includes(PINNED))).toBe(false);
+		expect(transcript(loop)).toContain(NOT_ARMED);
+		expect(transcript(loop)).not.toContain(PINNED);
+	});
+
+	it("tells the model a queued keyword follow-up IS pinned when its model gained xhigh before delivery", async () => {
+		const loop = loopSession({ modelId: NO_XHIGH_MODEL_ID });
+		loop.session.setThinkingLevel(Effort.Low);
+		const held = loop.holdNextCall();
+		const first = loop.session.prompt("start the work");
+		await withTimeout(held.started, 2_000, "The first turn never reached the model");
+
+		await loop.session.prompt("ultracode the next piece", { streamingBehavior: "followUp" });
+		const queued = loop.session.agent
+			.peekFollowUpQueue()
+			.find(m => m.role === "custom" && m.customType === "ultracode-notice");
+		expect(JSON.stringify(queued)).toContain(NOT_ARMED);
+		await loop.session.setModel(bundled("claude-sonnet-4-5"));
+		held.release();
+		await first;
+		await idleAfter(loop, 2);
+
+		expect(loop.calls[1]).toMatchObject({ level: Effort.XHigh, armed: true });
+		expect(loop.calls[1].texts.some(text => text.includes(PINNED))).toBe(true);
+		expect(loop.calls[1].texts.some(text => text.includes(NOT_ARMED))).toBe(false);
+		expect(transcript(loop)).toContain(PINNED);
+		expect(transcript(loop)).not.toContain(NOT_ARMED);
+	});
+
+	it("re-renders a queued plan-approval directive's notice from the arm taken at delivery", async () => {
+		const loop = loopSession();
+		loop.session.setThinkingLevel(Effort.Low);
+		const held = loop.holdNextCall();
+		const first = loop.session.prompt("start the work");
+		await withTimeout(held.started, 2_000, "The first turn never reached the model");
+
+		// The shape interactive-mode queues behind a busy turn.
+		const renderDirective = (notice: string) => `${notice}\n\nExecute the approved plan.`;
+		await loop.session.followUp(renderDirective(loop.session.ultracodeArmNotice()), undefined, {
+			synthetic: true,
+			onDeliver: loop.session.armUltracodeTurnDeferred(renderDirective),
+		});
+		expect(JSON.stringify(loop.session.agent.peekFollowUpQueue())).toContain(PINNED);
+		await loop.session.setModel(bundled(NO_XHIGH_MODEL_ID));
+		held.release();
+		await first;
+		await idleAfter(loop, 2);
+
+		expect(loop.calls[1]).toMatchObject({ armed: false });
+		const directive = loop.calls[1].texts.find(text => text.includes("Execute the approved plan."));
+		expect(directive).toContain(NOT_ARMED);
+		expect(directive).not.toContain(PINNED);
+		expect(transcript(loop)).toContain(NOT_ARMED);
+		expect(transcript(loop)).not.toContain(PINNED);
 	});
 });
 

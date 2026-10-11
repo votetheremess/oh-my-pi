@@ -126,6 +126,16 @@ export function hasQueuedMessageDeliveryEffect(message: AgentMessage): boolean {
 }
 
 /**
+ * The delivery effect {@link attachQueuedMessageDeliveryEffect} put on this
+ * message, left attached: lets a caller ask what delivering a queued message
+ * will do (the idle queue drain checks whether a steer will arm ultracode at
+ * commit) without disturbing it.
+ */
+export function peekQueuedMessageDeliveryEffect(message: AgentMessage): (() => void) | undefined {
+	return (message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT];
+}
+
+/**
  * Detach and return the delivery effect {@link attachQueuedMessageDeliveryEffect}
  * put on this message, so a queue move that changes what delivering the message
  * means (a follow-up promoted into the steering queue joins the running turn

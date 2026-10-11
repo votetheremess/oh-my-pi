@@ -316,11 +316,12 @@ Setting-gated, off by default: `github`, `security_scan`, `generate_image`, `tts
 
 ### Prompt controls
 
-Four standalone, lowercase words opt a turn into specialized agent behavior:
+Five standalone, lowercase words opt a turn into specialized agent behavior:
 
 - `ultrathink` — request careful multi-step reasoning and the highest supported automatic thinking effort.
 - `orchestrate` — run substantial independent work through parallel subagents and verify each phase.
 - `workflowz` — build a deterministic multi-subagent workflow with the active `task` tool.
+- `jevify` — classify a long homogeneous list (commit diffs, log lines, findings) in bulk through the `eval` kernel's `judge()`: freeze the rubric first, then read only what the judge flags.
 - `ultracode` — pin the turn and every subagent it spawns to exactly `xhigh` reasoning effort (a model without that tier is left unpinned and says so) and make scripted multi-agent workflows the default for that turn (switch: `magicKeywords.ultracode`).
 
 They trigger only in prose, not inside code spans, fenced code blocks, XML/HTML sections, identifiers, or paths. See [Magic keywords](docs/magic-keywords.md) for exact matching rules and configuration.

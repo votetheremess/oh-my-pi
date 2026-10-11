@@ -4763,7 +4763,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	/**
 	 * Apply any deferred model switch after the current stream ends. A RESTORE
 	 * (or the plan role landing late), not the user picking a model: `internal`
-	 * keeps an armed ultracode turn's pin and floor across the swap.
+	 * keeps an armed ultracode turn's pin and floor across the swap. Plan-mode
+	 * entry has already ended any armed turn, so a late plan role only re-pins
+	 * when a keyword re-armed the turn after entry.
 	 */
 	async flushPendingModelSwitch(): Promise<void> {
 		const pending = this.#pendingModelSwitch;
@@ -5004,6 +5006,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.planModeEnabled = false;
 			throw error;
 		}
+		// Entering plan mode is the user's choice, so it ends an armed ultracode
+		// turn here, unconditionally: the plan-role switch below only disarms
+		// when it changes the model or level right now, which misses no plan
+		// role, a role matching the current model and level, and mid-stream
+		// entry (deferred, then flushed as an internal swap). A no-op unarmed.
+		this.session.disarmUltracodeTurn();
 		this.session.setPlanProposalHandler?.(title => this.session.preparePlanForReview(title));
 		if (this.session.isStreaming) {
 			await this.session.sendPlanModeContext({ deliverAs: "steer" });
@@ -5782,12 +5790,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// pure render: the ARM itself happens below, as late as possible, so the
 		// state never flips for a turn that has not started (see the dispatch
 		// branches). The turn stays synthetic, so nothing disarms it, and the next
-		// keyword-free user turn hands the borrowed effort back.
+		// keyword-free user turn hands the borrowed effort back. The renderer is
+		// kept so a queued directive is re-rendered at delivery from the arm
+		// actually taken there (the model may have changed while it waited).
+		const renderExecutionPrompt = (ultracodeNotice: string) =>
+			prompt.render(planModeApprovedUltracodePrompt, { ultracodeNotice, planModeDirective });
 		const planModePrompt = options.executionUltracode
-			? prompt.render(planModeApprovedUltracodePrompt, {
-					ultracodeNotice: this.session.ultracodeArmNotice(),
-					planModeDirective,
-				})
+			? renderExecutionPrompt(this.session.ultracodeArmNotice())
 			: planModeDirective;
 		// Close the review overlay only now — after the async title write and plan
 		// prompt are prepared, immediately before the execution turn is queued. The
@@ -5824,7 +5833,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// runs the keyword-free disarm on its own, so it is disarmed here
 		// explicitly rather than inheriting the planning arm.
 		const applyExecutionUltracodeState = options.executionUltracode
-			? this.session.armUltracodeTurnDeferred()
+			? this.session.armUltracodeTurnDeferred(renderExecutionPrompt)
 			: this.session.disarmUltracodeTurnDeferred();
 		const followUpOptions = { synthetic: true, onDeliver: applyExecutionUltracodeState };
 		if (this.session.isStreaming) {

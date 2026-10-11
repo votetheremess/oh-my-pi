@@ -65,6 +65,7 @@ import { SpawnRun, type SpawnPermit } from "./spawn-run";
 import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 
 import { cfgAsyncEnabled } from "../tools/settings";
+import { cfgUltracode } from "../modes/settings";
 import {
 	cfgTaskBatch,
 	cfgTaskDisabledAgents,
@@ -728,14 +729,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return manager;
 	}
 
-	/** Start one spawn's subagent run behind the session semaphore. */
+	/**
+	 * Start one spawn's subagent run behind the session semaphore. The
+	 * ultracode arm state is decided here, at the request, unless the caller
+	 * captured it earlier (a speculative launch, a background job's body): a
+	 * spawn queued behind the semaphore follows the turn that asked for it.
+	 */
 	#launch(spawn: {
 		toolCallId: string;
 		params: TaskParams;
 		index: number;
 		agentId?: string;
 		detached: boolean;
+		ultracodeArmed?: boolean;
 	}): SpawnRun {
+		const ultracodeArmed = spawn.ultracodeArmed ?? cfgUltracode.get(this.session.settings);
 		return new SpawnRun(
 			this.#permit,
 			run =>
@@ -749,6 +757,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					spawn.detached,
 					run.timing,
 					spawn.detached ? run.onArtifactsRetained : undefined,
+					ultracodeArmed,
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
@@ -766,6 +775,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal: AbortSignal,
 	): Promise<SpawnRun | undefined> {
 		if (spawn.tools?.length && this.session.getPlanModeState?.()?.enabled === true) return undefined;
+		const ultracodeArmed = cfgUltracode.get(this.session.settings);
 		let blocking: boolean;
 		try {
 			blocking = (await this.#resolveSpawnPreflight(spawn)).effectiveAgent.blocking === true;
@@ -776,7 +786,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			cfgAsyncEnabled.get(this.session.settings) && this.session.asyncJobManager !== undefined && !blocking;
 		const agentId = await this.#outputManager().allocate(spawn.name?.trim() || generateTaskName());
 		if (signal.aborted) return undefined;
-		return this.#launch({ toolCallId, params: spawn, index, agentId, detached });
+		return this.#launch({ toolCallId, params: spawn, index, agentId, detached, ultracodeArmed });
 	}
 
 	#getSpawnSemaphore(): Semaphore {
@@ -1291,6 +1301,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
 			})}`;
 		};
+		// The arm state is the request's, captured at registration, so it never
+		// depends on when the manager gets around to running the job body.
+		const ultracodeArmed = cfgUltracode.get(this.session.settings);
 		return manager.register(
 			"task",
 			agentId,
@@ -1336,7 +1349,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					await reportProgress(updateText, buildDetails() as unknown as Record<string, unknown>);
 				};
 				const spawnRun =
-					run ?? this.#launch({ toolCallId, params: spawnParams, index: progress.index, agentId, detached: true });
+					run ??
+					this.#launch({
+						toolCallId,
+						params: spawnParams,
+						index: progress.index,
+						agentId,
+						detached: true,
+						ultracodeArmed,
+					});
 				spawnRun.attach({
 					signal: runSignal,
 					onUpdate: forwardSyncProgress,
@@ -1606,6 +1627,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
+		ultracodeArmed?: boolean,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
@@ -1622,6 +1644,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
 				solutionSpace: params.solutionSpace,
+				ultracodeArmed,
 				...(params.tools?.length
 					? {
 							customTools: createEvalCustomTools(

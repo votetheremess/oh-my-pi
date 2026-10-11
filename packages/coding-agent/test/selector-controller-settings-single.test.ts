@@ -1,10 +1,23 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Effort } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as agentsHubDeps from "@oh-my-pi/pi-coding-agent/modes/agents-hub-deps";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
+import { cfgUltracode } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { createAgentSession, discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import type { Component, OverlayHandle, OverlayOptions, TUI } from "@oh-my-pi/pi-tui";
 import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import * as activityClient from "@oh-my-pi/pi-coding-agent/stats/activity-client";
 import * as themeModule from "@oh-my-pi/pi-tui/theme";
+import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
 /** The overlay members of `ui` the single-instance guard reads and drives. */
@@ -184,5 +197,103 @@ describe("single-instance menus", () => {
 		shown[0]?.handleInput?.("\x1b");
 		controller.showUsageDashboard(reports);
 		expect(shown).toHaveLength(2);
+	});
+});
+
+// An ultracode turn borrows xhigh: the live level reads xhigh while the level
+// the user owns (and gets back at the end of the turn) is their own. The
+// settings panel and the Agents Hub are user surfaces of the root session, so
+// they must act on what the user owns and who the user is.
+describe("selector surfaces during an ultracode turn", () => {
+	const tempDirs: string[] = [];
+	const sessions: AgentSession[] = [];
+	let modelRegistry!: ModelRegistry;
+	let authDir: string;
+
+	beforeAll(async () => {
+		await themeModule.initTheme(false);
+		authDir = path.join(os.tmpdir(), `pi-selector-ultracode-auth-${Snowflake.next()}`);
+		fs.mkdirSync(authDir, { recursive: true });
+		modelRegistry = new ModelRegistry(await discoverAuthStorage(authDir));
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		for (const session of sessions.splice(0)) await session.dispose();
+		for (const dir of tempDirs.splice(0)) removeSyncWithRetries(dir);
+	});
+
+	afterAll(() => {
+		modelRegistry.authStorage.close();
+		removeSyncWithRetries(authDir);
+	});
+
+	const startRoot = async (settings: Settings): Promise<AgentSession> => {
+		const cwd = path.join(os.tmpdir(), `pi-selector-ultracode-${Snowflake.next()}`);
+		tempDirs.push(cwd);
+		fs.mkdirSync(cwd, { recursive: true });
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			// Exposes an xhigh rung, so the arm below really pins.
+			model: getBundledModel("anthropic", "claude-sonnet-4-5"),
+			thinkingLevel: Effort.Low,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			rules: [],
+		});
+		sessions.push(session);
+		return session;
+	};
+
+	// Regression: upstream's no-op guard compared the pick with the LIVE level,
+	// which is the borrowed xhigh while pinned. Picking xhigh as the default
+	// then skipped setThinkingLevel's user off-ramp, the turn stayed armed, and
+	// the next keyword-free turn's hand-back silently restored the old level
+	// over the user's explicit choice.
+	it("keeps a settings-panel pick of xhigh made while pinned, instead of handing back over it", async () => {
+		const settings = Settings.isolated();
+		const session = await startRoot(settings);
+		session.armUltracodeTurn();
+		expect(cfgUltracode.get(settings)).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		expect(session.userConfiguredThinkingLevel()).toBe(Effort.Low);
+
+		const controller = new SelectorController(createInteractiveModeContext({ session, settings }));
+		cfgDefaultThinkingLevel.set(settings, Effort.XHigh);
+		controller.handleSettingChange(cfgDefaultThinkingLevel.id, Effort.XHigh);
+
+		// The pick is the user's own level now and ended the borrowed turn.
+		expect(cfgUltracode.get(settings)).toBe(false);
+		expect(session.userConfiguredThinkingLevel()).toBe(Effort.XHigh);
+		// What the next keyword-free turn runs: nothing left to hand back.
+		session.disarmUltracodeTurn();
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		expect(session.configuredThinkingLevel()).toBe(Effort.XHigh);
+	});
+
+	// The hub's creation architect registers as a child of the session that
+	// opened the hub (agents-hub-deps `parentAgentId`). Without the owner id it
+	// registers parentless, so nothing ties it to the root's turn state.
+	it("names the opening session as the Agents Hub architect's owner", async () => {
+		const { ui } = overlayUi();
+		const controller = new SelectorController(
+			createInteractiveModeContext({ ui, session: { getAgentId: () => "Main-owner-7" } }),
+		);
+		const deps = spyOn(agentsHubDeps, "createAgentsHubDeps");
+		spyOn(AgentsHubComponent, "create").mockResolvedValue(Object.create(AgentsHubComponent.prototype));
+
+		await controller.showAgentsDashboard();
+
+		expect(deps).toHaveBeenCalledTimes(1);
+		expect(deps.mock.calls[0]?.at(-1)).toBe("Main-owner-7");
 	});
 });

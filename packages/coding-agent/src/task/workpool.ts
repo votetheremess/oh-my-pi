@@ -20,6 +20,7 @@ import { buildWorkPoolOutputSchema, type WorkPoolYieldItem } from "./workpool-yi
 
 import { cfgEvalWorkpoolFreshAgents } from "../eval/settings";
 import { cfgTaskMaxConcurrency, cfgTaskMaxRuntimeMs } from "./settings";
+import { cfgUltracode } from "../modes/settings";
 
 /** One user-supplied unit tracked through a workpool batch. */
 export interface WorkPoolItem {
@@ -29,6 +30,11 @@ export interface WorkPoolItem {
 	agentId?: string;
 	batchId?: string;
 	status: "queued" | "running" | "completed" | "failed" | "cancelled";
+	/**
+	 * The owner's ultracode arm state when the item was PUSHED. The worker turn
+	 * that runs it follows this, not the owner's state when a slot frees up.
+	 */
+	ultracodeArmed: boolean;
 }
 
 /** Keep-alive subagent and its queued work within a pool. */
@@ -154,9 +160,12 @@ export class WorkPool {
 		if (this.closed) throw new ToolError(`workpool ${this.name} is closed`);
 		if (texts.length === 0) return [];
 		const queued: WorkPoolItem[] = [];
+		// Captured at request time: items an armed turn pushes run pinned even if
+		// the user's next keyword-free prompt disarms the owner before they start.
+		const ultracodeArmed = cfgUltracode.get(this.session.settings);
 		for (const text of texts) {
 			const seq = this.#nextSeq++;
-			const item: WorkPoolItem = { id: `${this.name}#${seq}`, seq, text, status: "queued" };
+			const item: WorkPoolItem = { id: `${this.name}#${seq}`, seq, text, status: "queued", ultracodeArmed };
 			this.items.push(item);
 			queued.push(item);
 		}
@@ -320,7 +329,11 @@ export class WorkPool {
 			this.#notifyDrained();
 			return;
 		}
-		const items = agent.queue.splice(0);
+		// One turn runs under one arm state: a batch takes the queued run that
+		// shares the first item's push-time state and leaves the rest for the next.
+		const firstArmed = agent.queue[0]!.ultracodeArmed;
+		const runLength = agent.queue.findIndex(item => item.ultracodeArmed !== firstArmed);
+		const items = agent.queue.splice(0, runLength === -1 ? agent.queue.length : runLength);
 		const id = `${agent.id}-b${agent.turns + 1}`;
 		const batch: WorkPoolBatch = {
 			id,
@@ -359,6 +372,8 @@ export class WorkPool {
 			index: index + 1,
 		}));
 		const outputSchema = buildWorkPoolOutputSchema(workPoolYieldItems);
+		// #drain batches only items pushed under one arm state.
+		const ultracodeArmed = batch.items[0]!.ultracodeArmed;
 		const jobId = manager.register(
 			"task",
 			batch.id,
@@ -389,6 +404,7 @@ export class WorkPool {
 							outputSchema,
 							schemaMode: "strict",
 							workPoolYieldItems,
+							ultracodeArmed,
 							keepAlive: true,
 							retainArtifacts: true,
 							enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
@@ -405,6 +421,7 @@ export class WorkPool {
 							outputSchemaMode: "strict",
 							outputSchemaSource: "caller",
 							workPoolYieldItems,
+							ultracodeArmed,
 							signal,
 							onProgress,
 							eventBus: this.session.eventBus,

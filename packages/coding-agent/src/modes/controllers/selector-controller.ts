@@ -716,7 +716,11 @@ export class SelectorController {
 	handleSettingChange(id: string, value: unknown): void {
 		if (id !== cfgDefaultThinkingLevel.id || typeof value !== "string") return;
 		const level = parseConfiguredThinkingLevel(value);
-		if (level === undefined || level === this.ctx.session.configuredThinkingLevel()) return;
+		// Compare against the level the user owns, never an ultracode turn's
+		// borrowed xhigh: picking xhigh while pinned is still the user's choice,
+		// so it must reach setThinkingLevel's off-ramp, or the end-of-turn
+		// hand-back overwrites it with the pre-keyword level.
+		if (level === undefined || level === this.ctx.session.userConfiguredThinkingLevel()) return;
 		this.ctx.session.setThinkingLevel(level);
 	}
 

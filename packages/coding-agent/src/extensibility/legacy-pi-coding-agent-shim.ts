@@ -20,6 +20,7 @@ import {
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
 	type MessageCountOptions,
+	ThinkingLevel,
 	Tokenizer,
 } from "@oh-my-pi/pi-agent-core";
 import { findCutPoint as computeCutPoint, type CutPointResult } from "@oh-my-pi/pi-agent-core/compaction";
@@ -51,7 +52,9 @@ import {
 import type { PromptTemplate } from "../config/prompt-templates";
 import { findScopedSettings, Settings } from "../config/settings";
 import { EditTool } from "../edit";
+import { AsyncJobManager } from "../async";
 import { cfgUltracode } from "../modes/settings";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult, LoadExtensionsResult } from "../sdk";
 import {
 	discoverContextFiles,
@@ -67,8 +70,14 @@ import {
 	truncateHead,
 	truncateTail,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { UltracodeEffortError, ultracodeEffortFor } from "@oh-my-pi/pi-tui/thinking";
+import {
+	type ConfiguredThinkingLevel,
+	parseConfiguredThinkingLevel,
+	UltracodeEffortError,
+	ultracodeEffortFor,
+} from "@oh-my-pi/pi-tui/thinking";
 import type { SessionEntry } from "../session/session-entries";
+import { cfgDefaultThinkingLevel } from "../session/settings";
 import { createIsolatedSettings } from "../task/executor";
 import type { Tool, ToolSession } from "../tools";
 import { BashTool } from "../tools/bash";
@@ -98,6 +107,7 @@ import { getEnabledPlugins, resolvePluginExtensionPaths, type ScopedInstalledPlu
 import type { Skill } from "./skills";
 import { loadSkillsFromDir } from "./skills";
 
+import { cfgAsyncMaxJobs } from "../tools/settings";
 import { cfgDisabledExtensions, cfgExtensions, cfgSkills } from "./settings";
 
 const TOOL_DEFINITION_MARKER = "__isToolDefinition";
@@ -1379,50 +1389,86 @@ export type LegacyPiCreateAgentSessionOptions = CreateAgentSessionOptions & {
 };
 
 /**
- * Apply the live session's ultracode contract to a legacy spawn request.
+ * Apply the live session's ultracode contract to an armed legacy spawn.
  *
  * A legacy extension that spawns a session off the LIVE session's Settings
  * is spawning one of the ultracode turn's agents when that turn is armed.
- * Three things follow. The live object is never shared: the spawned session's
- * runtime overrides would otherwise land on the interactive session that
- * loaded the extension, so it gets an overlay with `ultracode: true` stamped
- * by value (flooring its own spawns; its own writes stay local) — isolation only, none of the
+ * Real legacy spawners hand that Settings over as the pi-era `settingsManager`
+ * (pi-schedule-prompt passes `SettingsManager.create(ctx.cwd, agentDir)`,
+ * which inside extension execution IS the active session's instance) or via
+ * their `DefaultResourceLoader`; OMP-native callers pass `settings`. The
+ * caller resolves whichever the SDK would use (see
+ * {@link createUnderLiveUltracodeContract}).
+ *
+ * The live object is never shared: the spawned session's runtime overrides
+ * would otherwise land on the interactive session that loaded the extension,
+ * so it gets an overlay with `ultracode: true` stamped by value (flooring its
+ * own spawns; its own writes stay local) — isolation only, none of the
  * headless-subagent stamps (yolo approval, advisors off) a legacy caller
  * never asked for. The effort is exactly xhigh: the caller's `thinkingLevel`
  * cannot lower it, and a model with no xhigh rung is refused up front rather
- * than clamped — the SDK does NOT validate the pin itself; it clamps
- * `thinkingLevel` onto whatever model it resolves, so the model is resolved
- * HERE (against the live settings, like the agents hub) when the caller left
- * it implicit. And the session is a child kind: a root session would disarm
- * itself on its first keyword-free user prompt, dropping the inherited floor
- * before it spawns anything, whereas a child only ever re-pins.
+ * than clamped, so the model is resolved HERE (against the live settings,
+ * like the agents hub) when the caller left it implicit.
+ *
+ * The session is a child of the session that owns the live Settings (looked
+ * up in the registry; Main when none does). A root would disarm on its first
+ * keyword-free user prompt, dropping the inherited floor before it spawns
+ * anything; a child is only re-synced to its parent at a resume boundary,
+ * and the parent link is what lets that sync reach it at all. A child gets
+ * no AsyncJobManager of its own from the SDK, so it borrows the live
+ * session's (or owns a fresh one) — without it agent()/workpool()/async task
+ * would work unarmed and break armed. Its hand-back is the level the SDK
+ * would have picked for this request unpinned (caller level, default-role
+ * suffix, model default, settings default, off), with the caller's ceiling.
  *
  * A model that cannot be resolved up front (no registry on the request) is
  * still checked once the SDK has picked one, see
  * {@link refuseUnpinnableUltracodeSession}.
  */
 function applyLiveUltracodeContract(
-	requested: LegacyPiCreateAgentSessionOptions,
-	armed: boolean,
-): LegacyPiCreateAgentSessionOptions {
-	const liveSettings = requested.settings;
-	if (!armed || !liveSettings) return requested;
-	let model = requested.model;
-	if (model === undefined && requested.modelRegistry) {
+	options: CreateAgentSessionOptions,
+	liveSettings: Settings,
+): { options: CreateAgentSessionOptions; ownJobManager: AsyncJobManager | undefined } {
+	let model = options.model;
+	let roleThinkingLevel: ConfiguredThinkingLevel | undefined;
+	if (model === undefined && options.modelRegistry) {
 		const patterns = resolveConfiguredModelPatterns(liveSettings.getModelRole("default"), liveSettings);
-		model = resolveModelOverride(patterns, requested.modelRegistry, liveSettings).model;
+		const resolved = resolveModelOverride(patterns, options.modelRegistry, liveSettings);
+		model = resolved.model;
+		if (resolved.explicitThinkingLevel) roleThinkingLevel = resolved.thinkingLevel;
 	}
 	if (model !== undefined && ultracodeEffortFor(model) === undefined) {
 		throw new UltracodeEffortError(formatModelStringWithRouting(model), getSupportedEfforts(model));
 	}
+	const settings = createIsolatedSettings(liveSettings);
+	const liveRef = (options.agentRegistry ?? AgentRegistry.global())
+		.list()
+		.find(ref => ref.session?.settings === liveSettings);
+	const borrowedJobManager = options.asyncJobManager ?? liveRef?.session?.asyncJobManager;
+	const ownJobManager = borrowedJobManager
+		? undefined
+		: new AsyncJobManager({ maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(settings)) });
 	const childId = `Legacy-${Snowflake.next()}`;
+	const { settingsManager: _liveSettingsManager, ...rest } = options;
 	return {
-		...requested,
-		settings: createIsolatedSettings(liveSettings),
-		thinkingLevel: Effort.XHigh,
-		thinkingLevelCeiling: Effort.XHigh,
-		agentId: requested.agentId ?? childId,
-		parentTaskPrefix: requested.parentTaskPrefix ?? childId,
+		options: {
+			...rest,
+			settings,
+			thinkingLevel: Effort.XHigh,
+			thinkingLevelCeiling: Effort.XHigh,
+			ultracodeRestoreLevel:
+				options.thinkingLevel ??
+				roleThinkingLevel ??
+				model?.thinking?.defaultLevel ??
+				parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(settings)) ??
+				ThinkingLevel.Off,
+			ultracodeRestoreCeiling: options.thinkingLevelCeiling ?? null,
+			agentId: options.agentId ?? childId,
+			parentTaskPrefix: options.parentTaskPrefix ?? childId,
+			parentAgentId: options.parentAgentId ?? liveRef?.id ?? MAIN_AGENT_ID,
+			asyncJobManager: borrowedJobManager ?? ownJobManager,
+		},
+		ownJobManager,
 	};
 }
 
@@ -1433,12 +1479,9 @@ function applyLiveUltracodeContract(
  * silent failure the contract forbids. Tear it down before any prompt runs
  * and fail loudly instead.
  */
-async function refuseUnpinnableUltracodeSession(
-	result: CreateAgentSessionResult,
-	armed: boolean,
-): Promise<CreateAgentSessionResult> {
+async function refuseUnpinnableUltracodeSession(result: CreateAgentSessionResult): Promise<void> {
 	const model = result.session.model;
-	if (!armed || ultracodeEffortFor(model) !== undefined) return result;
+	if (ultracodeEffortFor(model) !== undefined) return;
 	await result.session.dispose();
 	throw new UltracodeEffortError(
 		model ? formatModelStringWithRouting(model) : "no model",
@@ -1446,15 +1489,35 @@ async function refuseUnpinnableUltracodeSession(
 	);
 }
 
-export async function createAgentSession(
-	requested: LegacyPiCreateAgentSessionOptions = {},
-): Promise<CreateAgentSessionResult> {
-	const armed = requested.settings !== undefined && cfgUltracode.get(requested.settings);
-	const options = applyLiveUltracodeContract(requested, armed);
+/**
+ * The SDK call behind the legacy `createAgentSession`, with the live
+ * ultracode contract applied when the Settings the SDK would use (`settings`,
+ * else `settingsManager`) is armed. Unarmed, `options` reaches the SDK
+ * untouched, exactly as upstream forwards it.
+ */
+async function createUnderLiveUltracodeContract(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
+	const liveSettings = options.settings ?? (await options.settingsManager);
+	if (!liveSettings || !cfgUltracode.get(liveSettings)) return ompCreateAgentSession(options);
+	const contract = applyLiveUltracodeContract(options, liveSettings);
+	let result: CreateAgentSessionResult;
+	try {
+		result = await ompCreateAgentSession(contract.options);
+		await refuseUnpinnableUltracodeSession(result);
+	} catch (error) {
+		void contract.ownJobManager?.dispose();
+		throw error;
+	}
+	const ownJobManager = contract.ownJobManager;
+	if (ownJobManager) result.session.addDisposer(() => void ownJobManager.dispose());
+	return result;
+}
 
+export async function createAgentSession(
+	options: LegacyPiCreateAgentSessionOptions = {},
+): Promise<CreateAgentSessionResult> {
 	const loader = options.resourceLoader;
 	if (!loader) {
-		return refuseUnpinnableUltracodeSession(await ompCreateAgentSession(options), armed);
+		return createUnderLiveUltracodeContract(options);
 	}
 
 	if (loader instanceof DefaultResourceLoader && !loader.loaded) {
@@ -1521,7 +1584,7 @@ export async function createAgentSession(
 		forwarded.appendSystemPrompt = state.appendSystemPrompt.join("\n\n");
 	}
 
-	return refuseUnpinnableUltracodeSession(await ompCreateAgentSession(forwarded), armed);
+	return createUnderLiveUltracodeContract(forwarded);
 }
 
 /**

@@ -185,12 +185,13 @@ describe("ultracode installer test contract", () => {
 		expect(unrelated).toEqual([]);
 	});
 
-	it("pins the upstream files that guard fork-changed production paths", async () => {
-		// Upstream-owned tests whose hand-rolled fakes cover paths the fork
-		// changed (ModelControls' flag reads, the IRC resume sync, the Agents
-		// Hub owner id, /tan's pin). After the v18.9.0 port they broke while
-		// every fork-named test stayed green. They need not mention ultracode
-		// themselves; they only have to stay in the gate.
+	it("pins the upstream files whose fakes drive fork-changed production paths", async () => {
+		// Upstream-owned tests that drive code the fork changed (effort's
+		// ModelControls, agent-message's IRC delivery, the selector's Agents
+		// Hub, /tan) through hand-rolled fakes. They only keep those fakes
+		// complete: after the v18.9.0 port they broke on members fork code reads
+		// while every fork-named test stayed green. They need not mention
+		// ultracode themselves; they only have to stay in the gate.
 		const adjacent = [
 			"test/slash-commands/effort.test.ts",
 			"test/selector-controller-settings-single.test.ts",

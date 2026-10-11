@@ -153,13 +153,15 @@ export class PrewalkCoordinator {
 		return prewalk !== undefined && !this.#isNoop(prewalk);
 	}
 
+	/**
+	 * Model identity is the live model; the level is the USER's. An armed
+	 * ultracode turn reports the borrowed xhigh as the live selector, which
+	 * would drop a same-model `:xhigh` prewalk for good as "already matching"
+	 * (and treat a same-model `:low` one as a real switch) only until the turn
+	 * hands the user's level back.
+	 */
 	#isNoop(prewalk: Prewalk): boolean {
-		return prewalkWouldBeNoop(
-			this.#host.model(),
-			this.#host.configuredThinkingLevel(),
-			prewalk.target,
-			prewalk.thinkingLevel,
-		);
+		return prewalkWouldBeNoop(this.#host.model(), this.#userThinkingLevel(), prewalk.target, prewalk.thinkingLevel);
 	}
 
 	/**
