@@ -2,14 +2,17 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Model, ServiceTier } from "@oh-my-pi/pi-ai";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { AgentsHubDeps } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { isEnoent, prompt } from "@oh-my-pi/pi-utils";
+import { UltracodeEffortError, ultracodeEffortFor } from "@oh-my-pi/pi-tui/thinking";
+import { isEnoent, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { getConfigDirs } from "../config";
 import type { ModelRegistry } from "../config/model-registry";
 import {
+	formatModelStringWithRouting,
 	resolveAgentAdvisorSelection,
 	resolveAgentModelPatterns,
 	resolveAgentPrewalkPattern,
@@ -22,8 +25,10 @@ import agentCreationUserPrompt from "../prompts/system/agent-creation-user.md" w
 import { createAgentSession } from "../sdk";
 import { refreshAgentDiscovery } from "../task";
 import { discoverAgents } from "../task/discovery";
+import { createIsolatedSettings } from "../task/executor";
 import { resolveAgentPrewalkDefault } from "../task/prewalk";
 import { createModelBrowserSource } from "./model-browser-source";
+import { cfgUltracode } from "./settings";
 
 import {
 	cfgTaskAgentAdvisor,
@@ -61,6 +66,8 @@ export function createAgentsHubDeps(
 	activeModelPattern?: string,
 	defaultModelPattern?: string,
 	sessionServiceTier?: (model: Model) => ServiceTier | undefined,
+	/** Registry id of the owning session, recorded as the creation architect's parent. */
+	ownerAgentId?: string,
 ): AgentsHubDeps {
 	return {
 		browserSource: createModelBrowserSource(settings, sessionServiceTier),
@@ -148,12 +155,33 @@ export function createAgentsHubDeps(
 			const { model } = resolveModelOverride(patterns, modelRegistry, settings);
 			const selectedModel = model ?? modelRegistry.getAvailable()[0];
 			if (!selectedModel) throw new Error("No available model to generate agent specification.");
+			// The architect is an auxiliary agent of the live session, so it obeys the
+			// live ultracode contract: an armed turn runs it at exactly xhigh, and a
+			// model without that rung is refused (surfaced as the hub's create error)
+			// rather than clamped. `undefined` when unarmed leaves the SDK's own
+			// default selection untouched. The SDK does not validate this itself.
+			const ultracodeArmed = cfgUltracode.get(settings);
+			const ultracodeEffortLevel = ultracodeArmed ? ultracodeEffortFor(selectedModel) : undefined;
+			if (ultracodeArmed && ultracodeEffortLevel === undefined) {
+				throw new UltracodeEffortError(
+					formatModelStringWithRouting(selectedModel),
+					getSupportedEfforts(selectedModel),
+				);
+			}
+			const architectId = `Architect-${Snowflake.next()}`;
 			const { session } = await createAgentSession({
 				cwd,
 				authStorage: modelRegistry.authStorage,
 				modelRegistry,
-				settings,
+				// A by-value-stamped overlay, never the live Settings object: sharing it
+				// would let the architect's session-scoped overrides (and any per-turn
+				// ultracode flip) land on the interactive session that opened the hub.
+				// Isolation only — the user is still driving, so none of the headless
+				// subagent stamps (yolo approval, advisors off) apply.
+				settings: createIsolatedSettings(settings),
 				model: selectedModel,
+				thinkingLevel: ultracodeEffortLevel,
+				thinkingLevelCeiling: ultracodeEffortLevel,
 				systemPrompt: [prompt.render(agentCreationArchitectPrompt, {})],
 				hasUI: false,
 				enableLsp: false,
@@ -167,6 +195,14 @@ export function createAgentsHubDeps(
 				slashCommands: [],
 				// A helper for the host session: the host keeps the process-wide effects and provider toggles.
 				bindProcessState: false,
+				// A child of the live session (kind "sub" via parentTaskPrefix), not a
+				// second "Main": it inherits the arm state through the overlay's by-value
+				// stamp and, as a child, never arms or disarms from its prompt text — it
+				// only re-pins. Without this it would register over the live Main ref.
+				agentId: architectId,
+				agentDisplayName: "architect",
+				parentTaskPrefix: architectId,
+				parentAgentId: ownerAgentId,
 			});
 			const unsubscribe = session.subscribe(event => {
 				if (event.type === "message_update" && "assistantMessageEvent" in event) {
@@ -175,6 +211,9 @@ export function createAgentsHubDeps(
 				}
 			});
 			try {
+				// The request is the user's own text wrapped in the architect template,
+				// so the turn keeps its user attribution. It cannot flip the ultracode
+				// state: the architect is a child kind, and children only re-pin.
 				await session.prompt(prompt.render(agentCreationUserPrompt, { request: description }), {
 					expandPromptTemplates: false,
 				});

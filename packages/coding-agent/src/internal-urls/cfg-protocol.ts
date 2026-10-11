@@ -45,18 +45,23 @@ let sortedSettings: AnySetting[] | undefined;
 /**
  * Every setting, ordered by id segment by segment so each namespace's members stay
  * contiguous. Computed on first use: the settings module is still initializing
- * when the router loads this handler.
+ * when the router loads this handler. The ultracode turn flag (modes/settings.ts
+ * `cfgUltracode`) is excluded: it is runtime turn state owned by the keyword, and
+ * a cfg:// write or `/save` would arm a turn without its pin or persist it to disk.
+ * Matched by id so this lazy handler keeps no import edge into modes/settings.
  */
 function allSettings(): AnySetting[] {
-	sortedSettings ??= all().toSorted((a, b) => {
-		const left = a.id.split(".");
-		const right = b.id.split(".");
-		for (let i = 0; i < Math.min(left.length, right.length); i++) {
-			const order = left[i]!.localeCompare(right[i]!, "en", { sensitivity: "base" });
-			if (order !== 0) return order;
-		}
-		return left.length - right.length;
-	});
+	sortedSettings ??= all()
+		.filter(setting => setting.id !== "ultracode")
+		.toSorted((a, b) => {
+			const left = a.id.split(".");
+			const right = b.id.split(".");
+			for (let i = 0; i < Math.min(left.length, right.length); i++) {
+				const order = left[i]!.localeCompare(right[i]!, "en", { sensitivity: "base" });
+				if (order !== 0) return order;
+			}
+			return left.length - right.length;
+		});
 	return sortedSettings;
 }
 const REDACTED = "<redacted>";

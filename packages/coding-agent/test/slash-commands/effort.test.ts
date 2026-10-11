@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Model } from "@oh-my-pi/pi-catalog/types";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { ModelControls, type ModelControlsHost } from "@oh-my-pi/pi-coding-agent/session/model-controls";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -43,6 +44,8 @@ function harness(options: { reasoning?: boolean; efforts?: readonly Effort[]; ce
 	const controls = new ModelControls(
 		{
 			agent: { setThinkingLevel: () => {}, setDisableReasoning: () => {} },
+			// ModelControls reads the ultracode turn flag off the real settings.
+			settings: Settings.isolated(),
 			model: () => model,
 			promptGeneration: () => 0,
 			sessionManager: { appendThinkingLevelChange: () => Promise.resolve() },

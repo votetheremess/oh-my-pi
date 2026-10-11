@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { classifyTerminalMultiplexer, type TerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
@@ -43,7 +44,13 @@ function createContext(
 		configFiles?: readonly string[];
 		settings?: Pick<Settings, "getAgentDir" | "getConfigFiles">;
 		cwd?: string;
+		/** The user's own selector (`userConfiguredThinkingLevel`). */
 		thinkingLevel?: ConfiguredThinkingLevel;
+		/**
+		 * What `configuredThinkingLevel` reports; differs from `thinkingLevel` only
+		 * while an ultracode turn has borrowed the level (the pin, xhigh).
+		 */
+		activeThinkingLevel?: ConfiguredThinkingLevel;
 		argv?: string[];
 		promptCacheKey?: string;
 		launchWarning?: string;
@@ -57,7 +64,8 @@ function createContext(
 		sessionId: "parent-session-id",
 		agent: { promptCacheKey: options.promptCacheKey },
 		model: options.activeModel ?? { provider: "provider", id: "model" },
-		configuredThinkingLevel: () => options.thinkingLevel,
+		configuredThinkingLevel: () => options.activeThinkingLevel ?? options.thinkingLevel,
+		userConfiguredThinkingLevel: () => options.thinkingLevel,
 	};
 	const flush = vi.fn(async () => undefined);
 	const sessionManager = {
@@ -358,6 +366,24 @@ describe("/fork terminal placement", () => {
 		expect(appArgs.filter(arg => arg === "--thinking")).toHaveLength(1);
 		expect(appArgs[appArgs.indexOf("--thinking") + 1]).toBe("auto");
 		expect(appArgs).not.toContain("low");
+	});
+
+	it("forwards the user's own thinking selector, never an ultracode turn's borrowed xhigh", async () => {
+		// Mid ultracode turn the session runs at the borrowed xhigh pin, but the
+		// new root process is not part of that turn: handing it `--thinking xhigh`
+		// would make the pin the fork's own permanent level.
+		const { controller, launchTerminal } = createContext({
+			thinkingLevel: Effort.Medium,
+			activeThinkingLevel: Effort.XHigh,
+		});
+
+		await controller.handleForkCommand("pane");
+
+		const command = launchTerminal.mock.calls[0]?.[0].command ?? [];
+		const appArgs = command.slice(command.indexOf("omp-entry") + 1);
+		expect(appArgs.filter(arg => arg === "--thinking")).toHaveLength(1);
+		expect(appArgs[appArgs.indexOf("--thinking") + 1]).toBe("medium");
+		expect(appArgs).not.toContain("xhigh");
 	});
 
 	it("refuses to expose a startup API key in the multiplexer command", async () => {

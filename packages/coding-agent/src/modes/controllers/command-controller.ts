@@ -1483,7 +1483,9 @@ export class CommandController {
 			const activeModel = this.ctx.session.model;
 			if (activeProfile) childArgs.push("--profile", activeProfile);
 			if (activeModel) childArgs.push("--model", `${activeModel.provider}/${activeModel.id}`);
-			const activeThinkingLevel = this.ctx.session.configuredThinkingLevel();
+			// The user's level, never an armed ultracode turn's borrowed xhigh: the
+			// new root session starts unarmed, so it must not inherit the pin.
+			const activeThinkingLevel = this.ctx.session.userConfiguredThinkingLevel();
 			if (activeThinkingLevel !== undefined) childArgs.push("--thinking", activeThinkingLevel);
 			// Forcing --model/--thinking marks the fork's cache shape as changed, which would
 			// drop the inherited key; pin what the parent's requests populated the cache under.

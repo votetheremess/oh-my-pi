@@ -1196,6 +1196,16 @@ export const cfgMagicKeyword = Object.fromEntries(
 	]),
 ) as Record<MagicKeywordId, Setting<boolean>>;
 
+// Turn state, not a preference: no `ui`, so the settings panel never lists it,
+// and cfg:// filters it out (internal-urls/cfg-protocol.ts) so no agent can read,
+// write or `/save` it. The ultracode keyword writes it through the runtime
+// override layer (`cfgUltracode.override`), which never reaches disk, and the
+// next user turn without the keyword writes it back to `false` — always
+// `override(scope, false)`, never `clearOverride`, which would re-expose a
+// parent's live value on an overlay child. It exists so the task executor can
+// see that this turn's spawns run at the ultracode floor.
+export const cfgUltracode = register({ id: "ultracode", type: "boolean", default: false });
+
 // Notifications
 export const cfgCompletionNotify = register({
 	id: "completion.notify",

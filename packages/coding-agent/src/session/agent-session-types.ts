@@ -194,6 +194,13 @@ export interface AgentSessionConfig {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Hard ceiling on the session's thinking effort (e.g. a task spawn's `task.maxEffort`-capped hint); every later change, including retry-fallback recovery, is re-clamped to it. */
 	thinkingLevelCeiling?: Effort;
+	/**
+	 * Level the ultracode handback returns to. A task-spawned child constructed
+	 * directly at xhigh under an armed parent never pins for itself, so this is
+	 * how it learns what to hand back when the parent's turn ends and the
+	 * lifecycle sync disarms it. Roots leave it unset: they capture at pin time.
+	 */
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 	/** Retry chain ownership when startup selected one of its fallback entries. */
 	initialRetryFallback?: InitialRetryFallbackState;
 	/** Skip retry.fallbackChains validation at construction; the host calls `validateRetryFallbackChains()` later. */
@@ -443,6 +450,21 @@ export interface PromptOptions {
 	 * failed before admission still only settles through the returned promise.
 	 */
 	onPromptAdmitted?: () => void;
+	/**
+	 * Fires when the prompt was dropped before it reached the agent (an abort
+	 * or usage preflight denial raced turn setup, or a queued message lost a
+	 * session/prompt-generation race). `prompt()` still resolves `true` then —
+	 * its boolean means "forwarded, not handled locally" — and
+	 * {@link AgentSession.setPromptDropped} only covers user prompts, so this
+	 * is the one signal a synthetic caller (plan approval) has to unwind turn
+	 * state it armed ahead of the dispatch. With `throwOnDrop` it fires BEFORE
+	 * the `PromptDroppedError` is thrown. Not fired when the dispatch throws
+	 * for any other reason: the caller's own catch already runs.
+	 *
+	 * Never route turn-start state through {@link onPromptAdmitted} instead:
+	 * that fires at ENQUEUE for a streaming prompt.
+	 */
+	onDropped?: () => void;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
@@ -463,6 +485,15 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/**
+	 * Turn-start side effect that fires when the queued follow-up is COMMITTED
+	 * into the live context — never at enqueue. The canonical use is the
+	 * plan-approval ultracode arm (`armUltracodeTurnDeferred()`): arming at
+	 * enqueue would raise the in-flight turn's effort pin and subagent floor
+	 * before the approved plan starts, and leave them raised if the follow-up is
+	 * later dequeued or handed back to the editor.
+	 */
+	onDeliver?: () => void;
 }
 
 /** Options for AgentSession.steer(). */
@@ -490,6 +521,15 @@ export interface SessionHandoffOptions {
 	autoTriggered?: boolean;
 	signal?: AbortSignal;
 }
+
+/**
+ * Who is changing the session's model, as seen by an ultracode turn in flight.
+ * `"user"` is an explicit pick and an off-ramp (the turn ends, the borrowed
+ * level is handed back first, the pick wins). `"extension"` and `"internal"`
+ * (prewalk, context promotion, retry fallback) keep the turn: the swap
+ * re-pins xhigh and warns loudly when the new model cannot take the pin.
+ */
+export type ModelChangeSource = "user" | "extension" | "internal";
 
 /** Result from cycleModel(). */
 export interface ModelCycleResult {

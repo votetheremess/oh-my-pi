@@ -24,6 +24,7 @@ import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-credit";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -42,6 +43,7 @@ import {
 	clampThinkingLevelToCeiling,
 	modelSupportsEffortCeiling,
 	resolveThinkingLevelForModel,
+	ultracodeEffortFor,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import type { AgentSessionEvent } from "./agent-session-events";
@@ -88,6 +90,7 @@ import {
 	cfgRetryUsageReservePct,
 	cfgRetryUsageReservePolicy,
 } from "./settings";
+import { cfgUltracode } from "../modes/settings";
 
 const THINKING_LOOP_REDIRECT_TYPE = "thinking-loop-redirect";
 const UNEXPECTED_STOP_MAX_RETRIES = 3;
@@ -228,8 +231,26 @@ export interface TurnRecoveryHost {
 	thinkingLevel(): ThinkingLevel | undefined;
 	configuredThinkingLevel(): ConfiguredThinkingLevel | undefined;
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined): void;
+	/**
+	 * The level the USER owns: the pre-ultracode capture while a turn is armed,
+	 * else the live selector. Fallback capture and revert read this so a swap
+	 * during an armed turn never records the borrowed xhigh as the user's level.
+	 * Optional for the same reason as {@link repinUltracodeIfArmed}; absent =
+	 * `configuredThinkingLevel` (fail-closed: nothing was ever pinned).
+	 */
+	userConfiguredThinkingLevel?(): ConfiguredThinkingLevel | undefined;
+	/**
+	 * Re-apply the ultracode xhigh pin on the current model when the turn is
+	 * armed; false when nothing was pinned. Fallback swaps call this instead of
+	 * `setThinkingLevel` so the pin keeps its pre-ultracode session receipt.
+	 * Optional so upstream's own host fixtures (turn-recovery-replay-unsafe.test.ts
+	 * builds a bare literal) keep compiling without fork edits; absent = never pinned.
+	 */
+	repinUltracodeIfArmed?(): boolean;
 	/** Hard per-session effort ceiling; fallback recovery must never raise thinking above it. */
 	thinkingLevelCeiling(): Effort | undefined;
+	/** User-visible notice; optional so bare host fixtures keep compiling (absent = log only). */
+	emitNotice?(level: "info" | "warning" | "error", message: string, source?: string): void;
 	isDisposed(): boolean;
 	isStreaming(): boolean;
 	isCompacting(): boolean;
@@ -399,6 +420,8 @@ export class TurnRecovery {
 	#pendingDiscoveryDeferredValidation = false;
 	/** Whether startup fallback-chain validation has run; later checks go through the post-discovery reconcile. */
 	#fallbackChainsValidated = false;
+	/** Prompt generation that already received the "ultracode refused every fallback" notice. */
+	#ultracodeRefusalNoticedGeneration: number | undefined;
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -1954,6 +1977,8 @@ export class TurnRecovery {
 
 		let fallback: { role: string; selector: RetryFallbackSelector; apiKey: string } | undefined;
 		const ceiling = this.#host.thinkingLevelCeiling();
+		const ultracodeRefused: Model[] = [];
+		let ultracodeAdmittedAny = false;
 		const chainKeys = this.retryFallbackChainKeys(currentSelector, currentModel);
 		for (const role of chainKeys) {
 			for (const candidate of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
@@ -1962,6 +1987,8 @@ export class TurnRecovery {
 				const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
 				if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
 				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
+				if (!this.#ultracodeAdmitsFallback(candidateModel, ultracodeRefused)) continue;
+				ultracodeAdmittedAny = true;
 				// A usage fallback must also fit: skip a candidate whose window cannot
 				// hold the live context so we never switch onto an oversized request
 				// (issue #8065).
@@ -2011,7 +2038,10 @@ export class TurnRecovery {
 			}
 			if (fallback) break;
 		}
-		if (!fallback) return false;
+		if (!fallback) {
+			this.#noticeUltracodeRefusedAll(ultracodeRefused, ultracodeAdmittedAny);
+			return false;
+		}
 
 		let shouldFallback = health.state === "depleted" || reservePolicy === "auto" || !confirmer;
 		if (!shouldFallback && health.state === "reserve" && confirmer) {
@@ -2075,10 +2105,18 @@ export class TurnRecovery {
 	 * {@link applyRetryFallbackCandidate} and the per-model clamp in
 	 * `setThinkingLevel`. A different route or a different effective level is a
 	 * real change of request and stays eligible.
+	 *
+	 * Under an armed ultracode turn the level that lands is the xhigh re-pin,
+	 * not the selector's `:level` (see {@link #ultracodeRepinFor}), so a
+	 * same-model `M:high` entry while `M` runs pinned at xhigh is a no-op too.
+	 * Treating it as a switch would re-send the failing request while the
+	 * caller resets the retry budget: the loop this detector exists to stop.
 	 */
 	#isNoOpRetryFallback(candidate: Model, selector: RetryFallbackSelector): boolean {
 		const active = this.#host.model();
 		if (!active || formatModelStringWithRouting(candidate) !== formatModelStringWithRouting(active)) return false;
+		const pinned = this.#ultracodeRepinFor(candidate);
+		if (pinned !== undefined) return pinned === this.#host.thinkingLevel();
 		const configured = this.#host.configuredThinkingLevel();
 		const requested = selector.thinkingLevel ?? configured;
 		if (requested === AUTO_THINKING || configured === AUTO_THINKING) return requested === configured;
@@ -2087,6 +2125,23 @@ export class TurnRecovery {
 			clampThinkingLevelToCeiling(candidate, requested, this.#host.thinkingLevelCeiling()),
 		);
 		return effective === configured;
+	}
+
+	/**
+	 * The level the armed-turn re-pin lands on `candidate` once a fallback swaps
+	 * onto it, or `undefined` when no re-pin happens: not armed, a host without
+	 * the re-pin member, or a candidate that cannot take exactly xhigh (no rung,
+	 * or the session ceiling below it). Mirrors the predicate
+	 * `repinUltracodeIfArmed` gates on, so the no-op detector predicts the level
+	 * {@link applyRetryFallbackCandidate} actually applies.
+	 */
+	#ultracodeRepinFor(candidate: Model): Effort | undefined {
+		if (!this.#host.repinUltracodeIfArmed || !cfgUltracode.get(this.#host.settings)) return undefined;
+		const pinned = ultracodeEffortFor(candidate);
+		if (pinned === undefined) return undefined;
+		return clampThinkingLevelToCeiling(candidate, pinned, this.#host.thinkingLevelCeiling()) === pinned
+			? pinned
+			: undefined;
 	}
 
 	async applyRetryFallbackCandidate(
@@ -2108,9 +2163,16 @@ export class TurnRecovery {
 		}
 		if (options?.signal?.aborted) return false;
 
+		// An armed ultracode turn admits only models that can pin exactly xhigh;
+		// the swap below then re-pins, so a candidate without the rung must be
+		// refused here rather than land on a neighboring level.
+		if (!this.#ultracodeAdmitsFallback(candidate)) return false;
 		// Capture the configured selector (auto-aware) so a fallback chain preserves
-		// `auto` instead of collapsing it to the level it resolved to this turn.
-		const currentThinkingLevel = this.#host.configuredThinkingLevel();
+		// `auto` instead of collapsing it to the level it resolved to this turn, and
+		// the USER-owned one: during an armed ultracode turn the live selector is
+		// the borrowed xhigh, and recording that as `originalThinkingLevel` would
+		// hand the pin back as the user's level once the fallback reverts.
+		const currentThinkingLevel = this.#userConfiguredThinkingLevel();
 		const requestedThinkingLevel = selector.thinkingLevel ?? currentThinkingLevel;
 		// A fallback selector's explicit level (or the carried level after the
 		// replacement model's floor clamp) must never exceed the session's
@@ -2151,17 +2213,28 @@ export class TurnRecovery {
 		}
 		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
 		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
-		this.#host.setThinkingLevel(nextThinkingLevel);
+		// Under ultracode the selector's `:level` is not the applied level: the pin
+		// is. Re-pin with the pre-ultracode receipt so a killed-and-resumed session
+		// never wakes stranded at xhigh, and record what actually landed: the
+		// revert compares it against the live level to tell "user changed effort
+		// since" from "still on the fallback's level". Lands before the resync
+		// below so the system prompt sees the pinned level.
+		let appliedThinkingLevel = nextThinkingLevel;
+		if (this.#host.repinUltracodeIfArmed?.()) {
+			appliedThinkingLevel = this.#host.configuredThinkingLevel();
+		} else {
+			this.#host.setThinkingLevel(nextThinkingLevel);
+		}
 		if (!this.#activeRetryFallback) {
 			this.#activeRetryFallback = {
 				role,
 				originalSelector: currentSelector,
 				originalThinkingLevel: currentThinkingLevel,
-				lastAppliedFallbackThinkingLevel: nextThinkingLevel,
+				lastAppliedFallbackThinkingLevel: appliedThinkingLevel,
 				pinned: options?.pinFallback === true,
 			};
 		} else {
-			this.#activeRetryFallback.lastAppliedFallbackThinkingLevel = nextThinkingLevel;
+			this.#activeRetryFallback.lastAppliedFallbackThinkingLevel = appliedThinkingLevel;
 			this.#activeRetryFallback.pinned = this.#activeRetryFallback.pinned || options?.pinFallback === true;
 		}
 		await this.#host.syncAfterModelChange(previousEditMode);
@@ -2173,6 +2246,57 @@ export class TurnRecovery {
 			reason: options?.reason,
 		});
 		return true;
+	}
+
+	/**
+	 * Whether an armed ultracode turn may fall back onto `candidate`. Ultracode
+	 * pins exactly xhigh, so a candidate without that rung is skipped (loudly,
+	 * at warn) rather than admitted and clamped onto a neighboring level. Keyed
+	 * on the settings flag, not on a pending handback: a child session inherits
+	 * the flag without ever arming, and a root whose original model had no rung
+	 * to pin still must not land on one that cannot pin either. Always true
+	 * when ultracode is not armed.
+	 *
+	 * `refused` collects the skipped candidates so a chain walk can tell the
+	 * user, once, why nothing was tried ({@link #noticeUltracodeRefusedAll}).
+	 */
+	#ultracodeAdmitsFallback(candidate: Model, refused?: Model[]): boolean {
+		if (!cfgUltracode.get(this.#host.settings)) return true;
+		if (ultracodeEffortFor(candidate) !== undefined) return true;
+		logger.warn("retry fallback: skipping candidate without an xhigh rung under ultracode", {
+			model: `${candidate.provider}/${candidate.id}`,
+			ladder: getSupportedEfforts(candidate),
+		});
+		refused?.push(candidate);
+		return false;
+	}
+
+	/**
+	 * Tell the user ONCE per turn that ultracode refused every fallback the
+	 * chain offered. Only fires when nothing was admitted past the ultracode
+	 * gate: a candidate refused later (context fit, credentials) is a different
+	 * reason, and the ordinary retry path already reports that. Keyed on the
+	 * prompt generation so a retry saga that walks the chain several times in
+	 * one turn does not repeat itself, while the next turn may warn again.
+	 */
+	#noticeUltracodeRefusedAll(refused: Model[], admittedAny: boolean): void {
+		if (refused.length === 0 || admittedAny) return;
+		const generation = this.#host.promptGeneration();
+		if (this.#ultracodeRefusalNoticedGeneration === generation) return;
+		this.#ultracodeRefusalNoticedGeneration = generation;
+		const names = refused.map(model => `${model.provider}/${model.id}`).join(", ");
+		this.#host.emitNotice?.(
+			"warning",
+			`ultracode: no fallback — every candidate lacks an xhigh rung (${names}); staying on the current model`,
+			"ultracode",
+		);
+	}
+
+	/** Fail-closed read of the user-owned level: hosts without the ultracode member never pinned. */
+	#userConfiguredThinkingLevel(): ConfiguredThinkingLevel | undefined {
+		return this.#host.userConfiguredThinkingLevel
+			? this.#host.userConfiguredThinkingLevel()
+			: this.#host.configuredThinkingLevel();
 	}
 
 	async #tryRetryModelFallback(
@@ -2188,6 +2312,8 @@ export class TurnRecovery {
 		},
 	): Promise<boolean> {
 		const ceiling = this.#host.thinkingLevelCeiling();
+		const ultracodeRefused: Model[] = [];
+		let ultracodeAdmittedAny = false;
 		const latestAssistant = options?.preserveFailedTurn
 			? failedMessage
 			: this.#host.agent.state.messages.findLast(
@@ -2248,6 +2374,8 @@ export class TurnRecovery {
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
 				// clamped UP past the cap by its model floor — skip it entirely.
 				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) continue;
+				if (!this.#ultracodeAdmitsFallback(candidate, ultracodeRefused)) continue;
+				ultracodeAdmittedAny = true;
 				// Skip a candidate whose window cannot hold the retry context. The
 				// failed assistant is excluded only when retry removes it; preserved
 				// unexecuted-tool turns remain part of the request (issue #8065).
@@ -2272,6 +2400,7 @@ export class TurnRecovery {
 			}
 		}
 
+		this.#noticeUltracodeRefusedAll(ultracodeRefused, ultracodeAdmittedAny);
 		return false;
 	}
 
@@ -2357,13 +2486,21 @@ export class TurnRecovery {
 	 * Switch the active model from a Fireworks Fast (`-fast`) variant to its base
 	 * (Standard) id and stick there for the rest of the session — the auto
 	 * fallback that makes Fast a safe default. Returns false when the current
-	 * model is not a fast variant, the base id is missing, or it has no key.
+	 * model is not a fast variant, the base id is missing, it has no key, or an
+	 * armed ultracode turn refuses a base without an xhigh rung.
 	 */
 	async #tryFireworksFastFallback(currentSelector: string): Promise<boolean> {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
 		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
 		if (!baseModel) return false;
+		// Same admit rule as a chain fallback: an armed ultracode turn degrades
+		// only onto a base that can pin exactly xhigh, and says so when it cannot.
+		const ultracodeRefused: Model[] = [];
+		if (!this.#ultracodeAdmitsFallback(baseModel, ultracodeRefused)) {
+			this.#noticeUltracodeRefusedAll(ultracodeRefused, false);
+			return false;
+		}
 		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
 		if (!apiKey) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
@@ -2374,6 +2511,9 @@ export class TurnRecovery {
 		await this.#host.setModelWithProviderSessionReset(baseModel);
 		this.#host.sessionManager.appendModelChange(baseSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
 		this.#host.settings.getStorage()?.recordModelUsage(baseSelector);
+		// Re-pin exactly xhigh on the base while the turn is armed, like every
+		// other fallback swap; must precede the resync so the prompt sees it.
+		this.#host.repinUltracodeIfArmed?.();
 		await this.#host.syncAfterModelChange(previousEditMode);
 		await this.#host.emitSessionEvent({
 			type: "retry_fallback_applied",
@@ -2428,9 +2568,16 @@ export class TurnRecovery {
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
 		if (!apiKey) return false;
 
+		// Compare the LIVE level against what the fallback applied to tell "user
+		// changed effort since" from "still on the fallback's level", but apply the
+		// USER-owned level either way: under an armed turn the live level is the
+		// borrowed xhigh, and handing that to `setThinkingLevel` would persist the
+		// pin as the session's configured level (the re-pin below restores xhigh).
 		const currentThinkingLevel = this.#host.configuredThinkingLevel();
 		const thinkingToApply =
-			currentThinkingLevel === lastAppliedFallbackThinkingLevel ? originalThinkingLevel : currentThinkingLevel;
+			currentThinkingLevel === lastAppliedFallbackThinkingLevel
+				? originalThinkingLevel
+				: this.#userConfiguredThinkingLevel();
 		const primarySelector = formatModelStringWithRouting(primaryModel);
 		const previousEditMode = this.#host.resolveActiveEditMode();
 		// Clear before the swap: `setModelWithProviderSessionReset` and
@@ -2442,6 +2589,11 @@ export class TurnRecovery {
 		this.#host.sessionManager.appendModelChange(primarySelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(primarySelector);
 		this.#host.setThinkingLevel(thinkingToApply);
+		// Re-pin exactly xhigh on the restored primary while the turn is still
+		// armed; a no-op once the turn has ended, and a primary that cannot pin
+		// (armed while already on a fallback) simply keeps `thinkingToApply`.
+		// Must precede the resync so the system prompt sees the pinned level.
+		this.#host.repinUltracodeIfArmed?.();
 		await this.#host.syncAfterModelChange(previousEditMode);
 		return true;
 	}
