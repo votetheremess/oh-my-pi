@@ -133,6 +133,8 @@ export function createSessionStub(
 		waitForIdle: async () => {},
 		hasPendingAsyncWork: () => false,
 		settleAsyncWork: async () => {},
+		// The Agents Hub names its architect's owner from this (selector-controller).
+		getAgentId: (): string | undefined => undefined,
 		subscribe: vi.fn(() => () => {}),
 	} satisfies SessionOverrides;
 	if (overrides) layer(stub, overrides);

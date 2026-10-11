@@ -23,6 +23,7 @@ import type {
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
+import { runExtensionSetModel } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import {
 	type AskDialogPrompt,
@@ -213,14 +214,12 @@ export class ExtensionUiController {
 			getActiveTools: () => this.ctx.session.getEnabledToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolInfos(),
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
-			setModel: async model => {
-				const key = await this.ctx.session.modelRegistry.getApiKey(model);
-				if (!key) return false;
-				await this.ctx.session.setModel(model);
-				return true;
-			},
+			// Extensions are never a user surface: their model/level changes are
+			// attributed "extension", so an armed ultracode turn re-pins instead of
+			// taking the user-only off-ramp (forget restore + flag false).
+			setModel: model => runExtensionSetModel(this.ctx.session, model),
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
-			setThinkingLevel: level => this.ctx.session.setThinkingLevel(level),
+			setThinkingLevel: level => this.ctx.session.setThinkingLevel(level, false, "extension"),
 			getServiceTiers: () => this.ctx.session.serviceTierByFamily,
 			setServiceTier: (family, tier) => this.ctx.session.setServiceTierFamily(family, tier),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
@@ -441,14 +440,10 @@ export class ExtensionUiController {
 			getActiveTools: () => this.ctx.session.getEnabledToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolInfos(),
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
-			setModel: async model => {
-				const key = await this.ctx.session.modelRegistry.getApiKey(model);
-				if (!key) return false;
-				await this.ctx.session.setModel(model);
-				return true;
-			},
+			// Same attribution as the command context above: extension, never user.
+			setModel: model => runExtensionSetModel(this.ctx.session, model),
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
-			setThinkingLevel: (level, persist) => this.ctx.session.setThinkingLevel(level, persist),
+			setThinkingLevel: (level, persist) => this.ctx.session.setThinkingLevel(level, persist, "extension"),
 			getServiceTiers: () => this.ctx.session.serviceTierByFamily,
 			setServiceTier: (family, tier) => this.ctx.session.setServiceTierFamily(family, tier),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),

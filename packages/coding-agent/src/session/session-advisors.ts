@@ -39,6 +39,7 @@ import type {
 import { isUsageLimitOutcome, resolveModelServiceTier, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { extractHttpStatusFromError, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
@@ -97,6 +98,8 @@ import {
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
 	toReasoningEffort,
+	UltracodeEffortError,
+	ultracodeEffortFor,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ClientBridge } from "./client-bridge";
@@ -130,6 +133,7 @@ import {
 import { cfgCompaction, cfgContextPromotionEnabled } from "./context-settings";
 import { resolveModelCompactionSettings } from "./model-compaction-threshold";
 import { cfgRetry, cfgTierAdvisor } from "./settings";
+import { cfgUltracode } from "../modes/settings";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
 
@@ -1174,11 +1178,34 @@ export class SessionAdvisors {
 			// controllable efforts — for that case we forward `Inherit` so no effort
 			// is sent and reasoning stays enabled (matching the `auto`-path fix for
 			// Devin models via `clampAutoThinkingEffort`). See #4579.
-			const requestedLevel = autoThinking
-				? this.#autoAdvisorThinkingLevel()
-				: (thinkingLevel ?? ThinkingLevel.Medium);
-			const resolvedLevel = resolveThinkingLevelForModel(model, requestedLevel);
-			const advisorThinkingLevel: ThinkingLevel = resolvedLevel ?? ThinkingLevel.Inherit;
+			//
+			// Under an armed ultracode turn the clamp is bypassed on purpose: the
+			// advisor is one of the turn's agents and runs at exactly xhigh, and a
+			// model with no xhigh rung is skipped with a visible notice rather than
+			// rounded onto its own ladder. Resolved here, on every (re)build, so an
+			// advisor attached mid-turn pins too. A non-`auto` advisor's signature
+			// below changes with the arm state; an `auto` one signs its selector.
+			let advisorThinkingLevel: ThinkingLevel;
+			if (cfgUltracode.get(this.#host.settings)) {
+				const pinned = ultracodeEffortFor(model);
+				if (pinned === undefined) {
+					this.#advisorStatuses.set(slug, { name: config.name, status: "error" });
+					if (emitWarnings) {
+						const reason = new UltracodeEffortError(
+							formatModelStringWithRouting(model),
+							getSupportedEfforts(model),
+						);
+						this.#host.emitNotice("warning", `Advisor "${config.name}" skipped: ${reason.message}`, "advisor");
+					}
+					continue;
+				}
+				advisorThinkingLevel = pinned;
+			} else {
+				const requestedLevel = autoThinking
+					? this.#autoAdvisorThinkingLevel()
+					: (thinkingLevel ?? ThinkingLevel.Medium);
+				advisorThinkingLevel = resolveThinkingLevelForModel(model, requestedLevel) ?? ThinkingLevel.Inherit;
+			}
 			// Record the status entry now (in roster order) so the Map's insertion
 			// order matches the configured roster even when earlier advisors were
 			// skipped as paused/no_model. The build loop overwrites this to "running"
@@ -1969,17 +1996,33 @@ export class SessionAdvisors {
 	 * Re-point every `auto` advisor at {@link #autoAdvisorThinkingLevel} — the
 	 * primary turn's level, or the build-time default while the primary is off.
 	 *
+	 * Under an armed ultracode turn the primary's level is NOT copied through
+	 * the clamp: an `auto` advisor is one of the turn's agents, so it runs at
+	 * exactly xhigh (the build/resync predicate), never at the primary's xhigh
+	 * rounded onto a ladder without the rung, and never below xhigh because the
+	 * primary's own pin was refused. A model without the rung is left where
+	 * {@link resyncUltracodeEffort} left it; that resync already warned at the
+	 * arm, and this runs at every primary turn end, so it must not re-warn.
+	 *
 	 * Deliberately not {@link #setAdvisorModel}: the model is unchanged, and that
 	 * path invalidates the append-only context, which would throw away the
 	 * advisor's cached prefix on every turn. Only the effort moves here.
 	 */
 	#retuneAutoThinkingAdvisors(): void {
+		const armed = cfgUltracode.get(this.#host.settings);
 		const requested = this.#autoAdvisorThinkingLevel();
 		for (const advisor of this.#advisors) {
 			// A retry-fallback selector pinned its own effort for the fallback
 			// model; the retune resumes once the configured model is restored.
 			if (!advisor.autoThinking || advisor.runtime.disposed || advisor.retryFallback) continue;
-			const next = resolveThinkingLevelForModel(advisor.model, requested) ?? ThinkingLevel.Inherit;
+			let next: ThinkingLevel;
+			if (armed) {
+				const pinned = ultracodeEffortFor(advisor.model);
+				if (pinned === undefined) continue;
+				next = pinned;
+			} else {
+				next = resolveThinkingLevelForModel(advisor.model, requested) ?? ThinkingLevel.Inherit;
+			}
 			if (next === advisor.thinkingLevel) continue;
 			advisor.agent.setThinkingLevel(toReasoningEffort(next));
 			advisor.agent.setDisableReasoning(shouldDisableReasoning(next));
@@ -1998,6 +2041,71 @@ export class SessionAdvisors {
 	/** Release refusal pins so the next review may retry the configured primary. */
 	#releaseRefusalPin(advisor: ActiveAdvisor): void {
 		if (advisor.retryFallback) advisor.retryFallback.pinned = false;
+	}
+
+	/** Apply `level` to a live advisor's Agent in place, keeping the fallback bookkeeping honest. */
+	#applyAdvisorThinkingLevel(advisor: ActiveAdvisor, level: ThinkingLevel): void {
+		advisor.agent.setThinkingLevel(toReasoningEffort(level));
+		advisor.agent.setDisableReasoning(shouldDisableReasoning(level));
+		advisor.thinkingLevel = level;
+		// The cooldown restore compares `thinkingLevel` against the level the
+		// fallback applied to decide whether to hand the original back; a resync
+		// is not the user picking a level, so it must not look like one.
+		if (advisor.retryFallback) advisor.retryFallback.lastAppliedThinkingLevel = level;
+	}
+
+	/**
+	 * Re-resolve every live advisor's effort after the session's `ultracode`
+	 * flag flips, applying it IN PLACE. Same predicate as the build: exactly
+	 * xhigh while armed, the configured (clamped) level otherwise.
+	 *
+	 * In place rather than a rebuild: the arm state is part of the runtime
+	 * signature, so after a flip {@link #advisorRuntimeMatchesCurrentConfig}
+	 * would report a mismatch and the next role/enable/context refresh would
+	 * tear the advisors down and respawn them, losing their transcript context
+	 * mid-turn. Refreshing the signature here keeps the live roster matching.
+	 *
+	 * An advisor whose LIVE model (possibly a retry fallback) has no xhigh rung
+	 * is left at its current level with a visible notice: ultracode never
+	 * clamps, and a silently under-effort advisor is the failure mode the
+	 * fail-loud policy exists to prevent.
+	 */
+	resyncUltracodeEffort(): void {
+		if (this.#advisors.length === 0 || this.#host.isDisposed()) return;
+		const armed = cfgUltracode.get(this.#host.settings);
+		const descriptorBySlug = new Map<string, AdvisorRuntimeDescriptor>();
+		for (const descriptor of this.#resolveAdvisorRuntimeDescriptors(false)) {
+			descriptorBySlug.set(descriptor.slug, descriptor);
+		}
+		for (const advisor of this.#advisors) {
+			const descriptor = descriptorBySlug.get(advisor.slug);
+			let next: ThinkingLevel;
+			if (armed) {
+				const pinned = ultracodeEffortFor(advisor.model);
+				if (pinned === undefined) {
+					const reason = new UltracodeEffortError(
+						formatModelStringWithRouting(advisor.model),
+						getSupportedEfforts(advisor.model),
+					);
+					this.#host.emitNotice(
+						"warning",
+						`Advisor "${advisor.name}" left at ${advisor.thinkingLevel}: ${reason.message}`,
+						"advisor",
+					);
+					continue;
+				}
+				next = pinned;
+			} else {
+				// Configured level, re-clamped against the live model in case a
+				// retry fallback moved the advisor off the configured one. A
+				// descriptor missing here means the config itself changed, which is
+				// the rebuild path's business, not the flag flip's.
+				if (!descriptor) continue;
+				next = resolveThinkingLevelForModel(advisor.model, descriptor.thinkingLevel) ?? ThinkingLevel.Inherit;
+			}
+			if (descriptor) advisor.signature = descriptor.signature;
+			if (next !== advisor.thinkingLevel) this.#applyAdvisorThinkingLevel(advisor, next);
+		}
 	}
 
 	/** Restore an advisor's configured primary once its fallback cooldown expires. */
@@ -2035,13 +2143,21 @@ export class SessionAdvisors {
 		if (!apiKey) return;
 		signal.throwIfAborted();
 
-		// An `auto` advisor skipped the retune while on the fallback: rejoin the
+		// Same predicate as the build and the fallback pick: while armed the
+		// primary must take exactly xhigh, and a primary that cannot is not
+		// restored (the fallback it is on was picked because it can). Unarmed,
+		// an `auto` advisor skipped the retune while on the fallback: rejoin the
 		// primary's live level now, not the level it had when it fell back.
-		const thinkingToApply = advisor.autoThinking
-			? this.#autoAdvisorThinkingLevel()
-			: advisor.thinkingLevel === fallback.lastAppliedThinkingLevel
-				? fallback.originalThinkingLevel
-				: advisor.thinkingLevel;
+		const armed = cfgUltracode.get(this.#host.settings);
+		const ultracodePin = armed ? ultracodeEffortFor(primaryModel) : undefined;
+		if (armed && ultracodePin === undefined) return;
+		const thinkingToApply =
+			ultracodePin ??
+			(advisor.autoThinking
+				? this.#autoAdvisorThinkingLevel()
+				: advisor.thinkingLevel === fallback.lastAppliedThinkingLevel
+					? fallback.originalThinkingLevel
+					: advisor.thinkingLevel);
 		this.#setAdvisorModel(advisor, primaryModel, thinkingToApply);
 		this.#host.settings.getStorage()?.recordModelUsage(formatModelStringWithRouting(primaryModel));
 		advisor.retryFallback = undefined;
@@ -2183,12 +2299,18 @@ export class SessionAdvisors {
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
+				// Under ultracode the pin is the contract: a candidate that cannot run
+				// at xhigh is skipped (never clamped onto its own ladder), and a
+				// selector's `:level` suffix cannot lower the pin.
+				const armed = cfgUltracode.get(this.#host.settings);
+				const ultracodePin = armed ? ultracodeEffortFor(candidate) : undefined;
+				if (armed && ultracodePin === undefined) continue;
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
 				if (!apiKey) continue;
 				signal.throwIfAborted();
 
 				const originalThinkingLevel = advisor.thinkingLevel;
-				const requestedThinkingLevel = selector.thinkingLevel ?? originalThinkingLevel;
+				const requestedThinkingLevel = ultracodePin ?? selector.thinkingLevel ?? originalThinkingLevel;
 				const nextThinkingLevel = this.#setAdvisorModel(advisor, candidate, requestedThinkingLevel);
 				if (advisor.retryFallback) {
 					advisor.retryFallback.lastAppliedThinkingLevel = nextThinkingLevel;
@@ -2280,6 +2402,16 @@ export class SessionAdvisors {
 		const targetModel = await this.#host.resolveContextPromotionTarget(currentModel, contextWindow, signal);
 		if (!targetModel || !this.#canReplayAdvisorHistory(advisor, targetModel)) return false;
 		signal.throwIfAborted();
+		// A promotion target without an xhigh rung would silently break an armed
+		// ultracode turn's pin; keep the current model and let the overflow
+		// surface through the ordinary path instead.
+		if (cfgUltracode.get(this.#host.settings) && ultracodeEffortFor(targetModel) === undefined) {
+			logger.warn("Advisor context promotion skipped: ultracode requires xhigh", {
+				advisor: advisor.name,
+				to: formatModelStringWithRouting(targetModel),
+			});
+			return false;
+		}
 
 		// Preserve this advisor's own thinking level (a configured `model:...:high`
 		// keeps its suffix across a promotion); only the model changes.

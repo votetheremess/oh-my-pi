@@ -7,6 +7,7 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { CompactionMethod } from "./compaction-methods";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
@@ -269,6 +270,15 @@ export interface SessionInitEntry extends SessionEntryBase {
 	isolated?: boolean;
 	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** True when the subagent was spawned inside an ultracode turn; a cold revive re-pins xhigh from it when the parent's live settings are unavailable. */
+	ultracode?: boolean;
+	/**
+	 * The thinking level the child would have run at WITHOUT ultracode (only
+	 * written next to `ultracode`). A cold revive seeds the child's hand-back
+	 * from it so a later disarm restores this level instead of leaving the
+	 * borrowed xhigh behind as if the user had chosen it.
+	 */
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

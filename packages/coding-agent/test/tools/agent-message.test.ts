@@ -22,6 +22,9 @@ function registerPeer(id: string, status: "running" | "idle" = "running"): void 
 		parentId: "Main",
 		status,
 		session: {
+			// Delivery to an idle/live sub recipient runs the ultracode resume sync,
+			// which reads the recipient's turn flag off its settings.
+			settings: Settings.isolated(),
 			deliverIrcMessage: async (message: IrcMessage) => {
 				messages.push(message);
 				return status === "idle" ? "woken" : "injected";
@@ -112,6 +115,8 @@ describe("write agent:// messaging", () => {
 			displayName: "Main",
 			kind: "main",
 			session: {
+				// A sub recipient's resume sync mirrors this parent's turn flag.
+				settings: Settings.isolated(),
 				deliverIrcMessage: async (message: IrcMessage) => {
 					delivered.push(message);
 					return "injected";

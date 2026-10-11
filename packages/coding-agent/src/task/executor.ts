@@ -9,6 +9,7 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import type { Rule } from "../capability/rule";
@@ -57,7 +58,7 @@ import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
-import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
+import { AgentLifecycleManager, type AgentReviver, syncChildUltracodeAtResume } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import {
@@ -84,6 +85,8 @@ import {
 	prewalkWouldBeNoop,
 	resolveTaskEffortLevel,
 	type TaskEffort,
+	UltracodeEffortError,
+	ultracodeEffortFor,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
@@ -152,6 +155,7 @@ import {
 	cfgCompactionThresholdPercent,
 	cfgCompactionThresholdTokens,
 } from "../session/context-settings";
+import { cfgUltracode } from "../modes/settings";
 
 export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 
@@ -1102,6 +1106,28 @@ export function compactionThresholdSettings(
 			};
 }
 
+/**
+ * A detached-for-ultracode view of `settings`: a live overlay (every other key
+ * reads through to the parent) whose `ultracode` turn flag is stamped BY VALUE
+ * at call time, so a later parent-side arm/disarm does not reach it, and its
+ * own `override()`s (including a disarm) stay on the overlay. Carries NONE of
+ * the subagent policy stamps — no yolo approval, no advisor-off, no tier
+ * rewrite — so surfaces that need "the parent's settings" (an interactive hub
+ * or legacy-shim session the user still drives) start from the parent's exact
+ * policy rather than a headless subagent's.
+ */
+export function createIsolatedSettings(settings: Settings): Settings {
+	return settings.overlay({ ultracode: cfgUltracode.get(settings) });
+}
+
+/**
+ * A headless subagent's settings: a live overlay of `baseSettings` carrying the
+ * subagent policy stamps (approval yolo, advisor off, `tier.subagent`
+ * resolution, root compaction thresholds) and caller overrides. The parent's
+ * `ultracode` turn flag is stamped by value (callers may still override it), so
+ * a running child keeps its pin until its own resume boundary and an unarmed
+ * child never becomes flagged when the parent arms later.
+ */
 export function createSubagentSettings(
 	baseSettings: SubagentChainSettings,
 	overrides?: Readonly<Record<string, unknown>>,
@@ -1131,6 +1157,10 @@ export function createSubagentSettings(
 		// A subagent's thinking level is chosen at spawn (agent definition, `effort`, or this
 		// snapshot of the parent default); a later parent default edit must not re-steer it.
 		defaultThinkingLevel: cfgDefaultThinkingLevel.get(baseSettings),
+		// The ultracode turn flag is stamped by value for the same reason: a running child
+		// keeps the pin it spawned under until its own resume boundary
+		// (syncChildUltracodeAtResume), and a parent arm/disarm must not flip it live.
+		ultracode: cfgUltracode.get(baseSettings),
 		"tier.openai": subagentTiers.openai ?? "none",
 		"tier.anthropic": subagentTiers.anthropic ?? "none",
 		"tier.google": subagentTiers.google ?? "none",
@@ -3539,6 +3569,10 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	resetYieldTurnState(session.getToolByName("yield"));
 	const ref = AgentRegistry.global().get(id);
 	const sessionFile = ref?.sessionFile ?? undefined;
+	// A live (not revived) child still carries its spawn-time ultracode
+	// snapshot; the follow-up runs inside the PARENT's current turn, so mirror
+	// the parent's live flag and re-pin (or fail loudly) before prompting.
+	syncChildUltracodeAtResume(id, session, AgentRegistry.global());
 
 	const monitor = createSubagentRunMonitor({
 		index,
@@ -3826,14 +3860,20 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 		// Account pools are owner policy: take the live exact-name entry, as
 		// dispatch and persisted revival do, never the spawn-time copy.
 		const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
+		const settings = restoreSubagentSettings(capture.settings);
+		// A child spawned under the ultracode pin carries the borrowed xhigh as the spec's
+		// `thinkingLevel`, and an explicit level outranks the transcript. If a resume boundary
+		// disarmed the child before it parked (its own `override(false)` survives in the captured
+		// overlay), reviving at the spec level would leave it at xhigh, unflagged, with no hand-back
+		// seeded (ModelControls seeds one only for an armed session) — so it revives at the level
+		// the pin borrowed from. A still-flagged child keeps the pin; the lifecycle's resume sync
+		// then disarms or re-pins it.
+		const restoreLevel = capture.spec.options.ultracodeRestoreLevel;
+		const disarmedSincePin = restoreLevel !== undefined && !cfgUltracode.get(settings);
 		try {
 			({ session: revived } = await createAgentSession({
-				...buildSubagentSessionOptions(
-					capture.spec,
-					restoreSubagentSettings(capture.settings),
-					reopened,
-					expectedAgentRef,
-				),
+				...buildSubagentSessionOptions(capture.spec, settings, reopened, expectedAgentRef),
+				...(disarmedSincePin ? { thinkingLevel: restoreLevel } : {}),
 				oauthAccountPools: Object.hasOwn(agentAccountPools, capture.agentName)
 					? agentAccountPools[capture.agentName]
 					: undefined,
@@ -3916,6 +3956,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	const settings = options.settings ?? Settings.isolated();
+	// The ultracode turn flag, read ONCE: the child's settings stamp, the effort
+	// pin, prewalk suppression and the persisted session_init all reuse this value,
+	// so a parent disarm landing between the awaits below cannot produce a child
+	// that is flagged but unpinned (or pinned but unflagged).
+	const ultracodeArmed = cfgUltracode.get(settings);
 	// Per-agent advisor: the agent definition's `advisor` frontmatter or the
 	// `task.agentAdvisor` settings override (agent name → "on"/"off"/model
 	// pattern) pairs the spawned session with an advisor. Subagents default to
@@ -3934,6 +3979,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const subagentSettings = createSubagentSettings(
 		settings,
 		{
+			ultracode: ultracodeArmed,
 			...compactionThresholdSettings(options.compactionThresholdOverride),
 			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 			// Isolated runs must not expose roots outside the worktree.
@@ -4195,11 +4241,43 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// through to the normal selectors below.
 			// The ceiling outlives initial resolution: it rides into the session so
 			// retry-fallback recovery can never clamp effort back up past it.
-			const spawnEffortCeiling = options.effort !== undefined ? cfgTaskMaxEffort.get(settings) : undefined;
+			// Ultracode pins every spawn to EXACTLY xhigh while it is active — never
+			// max, never below — deliberately overriding the agent definition's own
+			// pinned effort (scout's `medium`, task's `auto`), any explicit `:level`
+			// suffix, and the caller's `effort`. `ultracodeEffortFor` is the same
+			// helper the session-side pin in `ModelControls.beginUltracodeTurn`
+			// uses, so a subagent and its parent resolve the pin identically.
+			//
+			// A model with no xhigh rung (max-only, topping out at high, or no
+			// controllable effort surface) cannot satisfy ultracode. Silently
+			// clamping it to the nearest rung would spend the user's pinned budget
+			// at a level they did not ask for, so the spawn fails loudly instead —
+			// BEFORE any session or subprocess exists — and the task tool / eval
+			// `agent()` reports the ladder the model actually exposes.
+			//
+			// Under ultracode the ceiling is ALWAYS the pin (not only when the
+			// caller passed `effort`): retry-fallback recovery inside the child
+			// re-clamps against this ceiling, so pinning it means the child can
+			// neither climb above xhigh nor drop below it after a model swap.
+			// `task.maxEffort` is ignored for the ride, since a ceiling below the pin
+			// would drag the pin down. Non-ultracode spawns keep their exact
+			// previous ceiling behaviour.
+			//
+			// `ultracodeArmed` is the flag read once at the top of runSubprocess —
+			// the same value already stamped into `subagentSettings` — so a parent
+			// disarm landing during the awaits above cannot leave this child
+			// flagged but unpinned.
+			const ultracodeEffortLevel = ultracodeArmed ? ultracodeEffortFor(model) : undefined;
+			if (ultracodeArmed && model && ultracodeEffortLevel === undefined) {
+				throw new UltracodeEffortError(formatModelStringWithRouting(model), getSupportedEfforts(model));
+			}
+			const spawnEffortCeiling =
+				ultracodeEffortLevel ?? (options.effort !== undefined ? cfgTaskMaxEffort.get(settings) : undefined);
 			const effortLevel =
-				options.effort !== undefined
+				ultracodeEffortLevel ??
+				(options.effort !== undefined
 					? resolveTaskEffortLevel(model, options.effort, spawnEffortCeiling)
-					: undefined;
+					: undefined);
 			if (model) {
 				const displayLevel = effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : undefined);
 				progress.resolvedModelIdentity = formatModelStringWithRouting(model);
@@ -4209,11 +4287,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						? formatModelSelectorValue(progress.resolvedModelIdentity, displayLevel)
 						: progress.resolvedModelIdentity;
 			}
-			// Precedence: caller `effort` > explicit `:level` suffix on the resolved
-			// model pattern > agent-definition default (e.g. task's `auto`) >
-			// pattern-derived level.
-			const effectiveThinkingLevel =
-				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
+			// Precedence: ultracode floor > caller `effort` > explicit `:level` suffix
+			// on the resolved model pattern > agent-definition default (e.g. task's
+			// `auto`) > pattern-derived level.
+			//
+			// `configuredThinkingLevel` is what the child would run at with NO
+			// ultracode (the caller's `effort` is a per-spawn hint the pin also
+			// overrides, so it sits above it). Under ultracode it rides into the
+			// child as `ultracodeRestoreLevel`: the pin is borrowed, and a disarm
+			// (parent's turn ended, follow-up without the keyword) hands the child
+			// back to this level instead of leaving xhigh behind as its own choice.
+			const configuredThinkingLevel = explicitThinkingLevel
+				? resolvedThinkingLevel
+				: (thinkingLevel ?? resolvedThinkingLevel);
+			const effectiveThinkingLevel = effortLevel ?? configuredThinkingLevel;
+			const ultracodeRestoreLevel = ultracodeEffortLevel !== undefined ? configuredThinkingLevel : undefined;
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManagerPromise = sessionFile
@@ -4232,12 +4320,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// session-level --prewalk. The bundled generic `task` agent has no
 			// frontmatter default; the `task.prewalk` toggle (default off) arms it.
 			// Resolution failures skip prewalk instead of failing the spawn.
+			// Under ultracode the whole hand-off is suppressed: prewalk exists to
+			// cheapen the run at the first edit/write, which is exactly what the pin
+			// forbids — a mid-run switch to a fast/cheap target (with its own lower
+			// thinking level) would step out from under xhigh.
 			let prewalk: Prewalk | undefined;
 			const prewalkPattern = resolveAgentPrewalkPattern({
 				settingsOverride: cfgTaskAgentPrewalk.get(settings)[agent.name],
 				agentPrewalk: resolveAgentPrewalkDefault(agent, cfgTaskPrewalk.get(settings)),
 			});
-			if (prewalkPattern) {
+			if (prewalkPattern && ultracodeArmed) {
+				logger.debug("ultracode pin suppresses prewalk for this spawn", {
+					agent: agent.name,
+					pattern: prewalkPattern,
+				});
+			} else if (prewalkPattern) {
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
 				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
 				const target = resolvedPrewalk.model;
@@ -4322,6 +4419,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
 					thinkingLevel: effectiveThinkingLevel,
 					thinkingLevelCeiling: spawnEffortCeiling,
+					// The spec is reused by createWarmSubagentReviver, so a warm revive
+					// rebuilds the same borrowed-pin hand-back the live spawn had.
+					ultracodeRestoreLevel,
 					// Subagents are short-lived; never schedule background warm requests.
 					cacheWarming: false,
 					toolNames,
@@ -4523,6 +4623,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// stamp the contract so cold revival leaves them transcript-only
 				// even when the workspace was retained for recovery.
 				isolated: worktree !== undefined || undefined,
+				// Persisted (only when armed) so a cold revive — new process, parent's
+				// live settings gone — can still tell the child was spawned inside an
+				// ultracode turn and re-pin it. The restore level rides along so that
+				// revive can rebuild the hand-back the live spawn had.
+				ultracode: ultracodeArmed || undefined,
+				ultracodeRestoreLevel,
 			});
 
 			abortSignal.addEventListener(

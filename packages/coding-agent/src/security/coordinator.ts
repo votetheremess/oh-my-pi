@@ -1,11 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { ModelRegistry } from "../config/model-registry";
+import { formatModelStringWithRouting } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import type { ToolDefinition } from "../extensibility/extensions";
 import securityReviewerPrompt from "../prompts/agents/security-reviewer.md" with { type: "text" };
@@ -16,6 +18,7 @@ import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
+import { UltracodeEffortError, ultracodeEffortFor } from "@oh-my-pi/pi-tui/thinking";
 import { createSecurityAuthResolver, selectSecurityAuth } from "./auth";
 import type {
 	SecurityCoverage,
@@ -44,6 +47,7 @@ import { SecurityStore, writeSecurityBundleToDirectory } from "./store";
 import { cfgRetryFallbackChains, cfgRetryModelFallback, cfgRetryUsageAwareFallback } from "../session/settings";
 import { cfgSecurityEnabled } from "../tools/settings";
 import { cfgTaskAgentModelOverrides, cfgTaskAgentPrewalk } from "../task/settings";
+import { cfgUltracode } from "../modes/settings";
 
 const SECURITY_SESSION_TOOLS = ["read", "grep", "glob", "lsp", "ast_grep", "task", "security_publish"];
 const SECURITY_WORKFLOW_FINGERPRINT = createSecurityWorkflowFingerprint([
@@ -243,12 +247,24 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		"security-reviewer": "off",
 	});
 	const providerSessionId = `security:${input.scanId}`;
+	// The scan session is an agent of the turn that started it: `cloneForCwd`
+	// carries the live `ultracode` override, so an armed turn pins the
+	// coordinator (and, through the floored snapshot, its reviewers) to exactly
+	// xhigh. A scan model without that rung fails the start instead of quietly
+	// reviewing at a lower effort than the turn promised.
+	const ultracodeArmed = cfgUltracode.get(scanSettings);
+	const ultracodeEffortLevel = ultracodeArmed ? ultracodeEffortFor(input.model) : undefined;
+	if (ultracodeArmed && ultracodeEffortLevel === undefined) {
+		throw new UltracodeEffortError(formatModelStringWithRouting(input.model), getSupportedEfforts(input.model));
+	}
 	const { session } = await createAgentSession({
 		cwd: input.executionRoot,
 		authStorage: input.host.authStorage,
 		modelRegistry: input.host.modelRegistry,
 		settings: scanSettings,
 		model: input.model,
+		thinkingLevel: ultracodeEffortLevel,
+		thinkingLevelCeiling: ultracodeEffortLevel,
 		getApiKey: createSecurityAuthResolver({
 			authStorage: input.host.authStorage,
 			auth: input.plan.account,

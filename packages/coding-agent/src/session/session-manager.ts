@@ -24,6 +24,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { ArtifactManager } from "./artifacts";
@@ -3467,6 +3468,8 @@ export class SessionManager {
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 		isolated?: boolean;
 		workPoolYieldItems?: WorkPoolYieldItem[];
+		ultracode?: boolean;
+		ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -4361,6 +4364,8 @@ export interface PersistedSessionInit {
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	isolated?: boolean;
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	ultracode?: boolean;
+	ultracodeRestoreLevel?: ConfiguredThinkingLevel;
 }
 
 /**
@@ -4389,6 +4394,13 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			isolated: entry.isolated,
 			...(entry.compactionThreshold !== undefined ? { compactionThreshold: entry.compactionThreshold } : undefined),
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
+			// Carried on every extract so upstream's session_init re-record (base-prompt or
+			// work-pool change) keeps the persisted ultracode pin and its restore level for
+			// cold revive, which reads the latest entry.
+			...(entry.ultracode !== undefined ? { ultracode: entry.ultracode } : undefined),
+			...(entry.ultracodeRestoreLevel !== undefined
+				? { ultracodeRestoreLevel: entry.ultracodeRestoreLevel }
+				: undefined),
 		};
 	}
 	return init;
